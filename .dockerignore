@@ -1,0 +1,61 @@
+# ═══════════════════════════════════════════════════════════════════════════
+# Контекст сборки образа.
+#
+# Важно: портал собирается из ВСЕГО репозитория — portal/wiki/mkdocs.yml
+# подключает docs/**.md и promtlog.md через pymdownx.snippets (base_path: ../..).
+# Поэтому здесь нельзя вырезать docs/ и promtlog.md, как ни хочется.
+# Вырезаем только то, что заново создаётся внутри образа.
+# ═══════════════════════════════════════════════════════════════════════════
+
+# --- VCS и служебное окружение ---
+.git
+.gitignore
+.github
+.claude
+.vscode
+.idea
+**/*.log
+
+# --- зависимости: ставятся в образе из lock-файлов ---
+node_modules
+prototype/node_modules
+portal/node_modules
+tools/node_modules
+
+# --- результаты сборки: пересобираются в образе ---
+dist
+prototype/dist
+portal/dist
+
+# --- артефакты portal/tools/sync.py: генерируются в образе заново ---
+portal/api/vendor
+portal/api/specs
+portal/api/favicon.svg
+portal/wiki/docs/swagger
+portal/wiki/docs/features/exchange-order.feature
+portal/wiki/docs/assets/javascripts/mermaid.min.js
+
+# --- временные каталоги npm run verify:* (в образе не запускаются) ---
+prototype/.money-check
+prototype/.render-check
+prototype/.flow-check
+
+# --- инкрементальное состояние tsc: устаревший .tsbuildinfo заставил бы
+#     `tsc -b` пропустить проверку типов в образе ---
+**/*.tsbuildinfo
+
+# --- проверялка консистентности документации: нужна в CI, не в образе ---
+tools
+
+# --- сам деплой-обвес, который в контекст не нужен целиком ---
+.dockerignore
+DEPLOY.md
+LICENSE
+README.md
+portal/README.md
+
+# --- прочее ---
+.DS_Store
+.env
+.env.*
+**/*.pem

@@ -1,0 +1,232 @@
+/*
+ * Design tokens — verbatim from `docs/UX-UI-Spec.md` §7.2.
+ *
+ * The spec is authoritative: token names and values here must match it exactly,
+ * so a reviewer can read either artefact and see the same system. Palette and
+ * type scale originate in `docs/Design Brief.md`.
+ *
+ * Rule: no component hardcodes a colour, radius, duration or spacing value.
+ * Everything resolves through a token — that is what keeps a screen assembled
+ * from fifteen components looking like one product.
+ */
+
+:root {
+  /* ---- Raw palette -------------------------------------------------- */
+  --palette-bg: #f8f9fb;
+  --palette-white: #ffffff;
+  --palette-blue-600: #2563eb;
+  --palette-green-600: #16a34a;
+  --palette-red-600: #dc2626;
+  --palette-gray-900: #111827;
+  --palette-gray-500: #6b7280;
+  --palette-gray-200: #e5e7eb;
+
+  --palette-gray-50: #f9fafb;
+  --palette-gray-100: #f3f4f6;
+  --palette-gray-300: #d1d5db;
+  --palette-gray-400: #9ca3af;
+  --palette-gray-600: #4b5563;
+  --palette-gray-700: #374151;
+
+  --palette-blue-50: #eff6ff;
+  --palette-blue-100: #dbeafe;
+  --palette-blue-700: #1d4ed8;
+  --palette-blue-800: #1e40af;
+
+  --palette-green-50: #f0fdf4;
+  --palette-green-200: #bbf7d0;
+  --palette-green-700: #15803d;
+
+  --palette-red-50: #fef2f2;
+  --palette-red-200: #fecaca;
+  --palette-red-700: #b91c1c;
+
+  --palette-amber-50: #fffbeb;
+  --palette-amber-200: #fde68a;
+  --palette-amber-700: #b45309;
+
+  /* ---- Semantic surfaces --------------------------------------------- */
+  --color-bg-page: var(--palette-bg);
+  --color-surface: var(--palette-white);
+  --color-surface-sunken: var(--palette-gray-50);
+  --color-surface-muted: var(--palette-gray-100);
+  --color-surface-accent: var(--palette-blue-50);
+  --color-surface-success: var(--palette-green-50);
+  --color-surface-danger: var(--palette-red-50);
+  --color-surface-warning: var(--palette-amber-50);
+
+  --color-border: var(--palette-gray-200);
+  --color-border-strong: var(--palette-gray-300);
+  --color-border-accent: var(--palette-blue-600);
+  --color-border-danger: var(--palette-red-600);
+  --color-border-warning: var(--palette-amber-200);
+  --color-border-success: var(--palette-green-200);
+
+  /* ---- Semantic text -------------------------------------------------
+   * `--color-text-success` is #15803D, not the brand #16A34A: the brand green
+   * scores 3.30:1 on white, below WCAG AA for text. The brand tone survives as
+   * a fill only, where the 3:1 non-text threshold applies. (UX spec §14.)
+   */
+  --color-text-primary: var(--palette-gray-900);
+  --color-text-secondary: var(--palette-gray-500);
+  --color-text-strong-muted: var(--palette-gray-600);
+  --color-text-disabled: var(--palette-gray-400);
+  --color-text-inverse: var(--palette-white);
+  --color-text-accent: var(--palette-blue-600);
+  --color-text-success: var(--palette-green-700);
+  --color-text-danger: var(--palette-red-600);
+  --color-text-warning: var(--palette-amber-700);
+
+  /* ---- Actions -------------------------------------------------------- */
+  --color-action-primary: var(--palette-blue-600);
+  --color-action-primary-hover: var(--palette-blue-700);
+  --color-action-primary-active: var(--palette-blue-800);
+  --color-action-primary-disabled: var(--palette-gray-300);
+  --color-action-primary-fg: var(--palette-white);
+  --color-action-primary-fg-disabled: var(--palette-gray-500);
+
+  --color-fill-success: var(--palette-green-600);
+  --color-fill-danger: var(--palette-red-600);
+  --color-fill-warning: var(--palette-amber-700);
+
+  --color-focus-ring: var(--palette-blue-600);
+  --color-focus-ring-danger: var(--palette-red-600);
+
+  /* ---- Typography ----------------------------------------------------- */
+  --font-family-base: 'Inter', -apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Segoe UI', 'Manrope',
+    system-ui, sans-serif;
+  --font-family-mono: 'JetBrains Mono', 'SF Mono', ui-monospace, 'Cascadia Mono', monospace;
+
+  --font-size-title: 28px;
+  --font-size-section: 16px;
+  --font-size-text: 14px;
+  --font-size-caption: 12px;
+  --font-size-amount: var(--font-size-title);
+  --font-size-amount-md: 24px;
+  --font-size-amount-sm: 20px;
+
+  --line-height-title: 34px;
+  --line-height-amount: 36px;
+  --line-height-section: 24px;
+  --line-height-text: 20px;
+  --line-height-caption: 16px;
+
+  --font-weight-regular: 400;
+  --font-weight-medium: 500;
+  --font-weight-semibold: 600;
+  --font-weight-bold: 700;
+
+  --letter-spacing-title: -0.02em;
+  --letter-spacing-amount: -0.02em;
+  --letter-spacing-section: -0.01em;
+  --letter-spacing-text: 0em;
+  --letter-spacing-caption: 0.01em;
+  --letter-spacing-overline: 0.04em;
+
+  /* ---- Spacing --------------------------------------------------------- */
+  --space-0: 0px;
+  --space-1: 2px;
+  --space-2: 4px;
+  --space-3: 6px;
+  --space-4: 8px;
+  --space-5: 12px;
+  --space-6: 16px;
+  --space-7: 20px;
+  --space-8: 24px;
+  --space-9: 32px;
+  --space-10: 40px;
+  --space-11: 48px;
+  --space-12: 64px;
+
+  /* ---- Radius ---------------------------------------------------------- */
+  --radius-xs: 6px;
+  --radius-sm: 8px;
+  --radius-md: 10px;
+  --radius-lg: 12px;
+  --radius-xl: 16px;
+  --radius-full: 9999px;
+
+  /* ---- Elevation: light, low contrast (BRD §6) ------------------------- */
+  --shadow-none: none;
+  --shadow-xs: 0 1px 2px 0 rgba(17, 24, 39, 0.04);
+  --shadow-sm: 0 1px 3px 0 rgba(17, 24, 39, 0.06), 0 1px 2px -1px rgba(17, 24, 39, 0.04);
+  --shadow-md: 0 4px 12px -2px rgba(17, 24, 39, 0.08), 0 2px 4px -2px rgba(17, 24, 39, 0.04);
+  --shadow-card: 0 1px 2px 0 rgba(17, 24, 39, 0.04), 0 8px 24px -6px rgba(17, 24, 39, 0.08);
+  --shadow-focus: 0 0 0 3px rgba(37, 99, 235, 0.28);
+  --shadow-focus-danger: 0 0 0 3px rgba(220, 38, 38, 0.24);
+
+  /* ---- Motion ---------------------------------------------------------- */
+  --duration-instant: 100ms;
+  --duration-fast: 150ms;
+  --duration-base: 200ms;
+  --duration-slow: 300ms;
+  --duration-shimmer: 1400ms;
+  --duration-timer-tick: 1000ms;
+
+  --ease-standard: cubic-bezier(0.2, 0, 0, 1);
+  --ease-out: cubic-bezier(0, 0, 0.2, 1);
+  --ease-in: cubic-bezier(0.4, 0, 1, 1);
+  --ease-emphasis: cubic-bezier(0.34, 1.2, 0.64, 1);
+  --ease-linear: linear;
+
+  /* ---- z-index --------------------------------------------------------- */
+  --z-base: 0;
+  --z-raised: 10;
+  --z-sticky: 20;
+  --z-dropdown: 100;
+  --z-banner: 200;
+  --z-overlay: 300;
+
+  /* ---- Layout ---------------------------------------------------------- */
+  --layout-card-width: 440px;
+  --layout-card-padding: var(--space-8);
+  --layout-page-padding-y: var(--space-10);
+  --layout-page-padding-x: var(--space-8);
+  --layout-block-padding: var(--space-6);
+  --layout-block-gap: var(--space-7);
+  --layout-block-gap-tight: var(--space-5);
+
+  /* ---- Controls -------------------------------------------------------- */
+  --control-height-submit: 48px;
+  --control-height-select: 40px;
+  --control-height-chip: 32px;
+  --control-height-swap: 40px;
+  --control-height-option: 44px;
+  --control-hit-area-min: 44px;
+  --control-icon-sm: 16px;
+  --control-icon-md: 20px;
+  --control-icon-asset: 24px;
+  --control-border-width: 1px;
+  --control-border-width-active: 1.5px;
+
+  /* ~7 rows of 44px: the edge of the list stays visible, so the user can see
+     the list is scrollable rather than guessing. */
+  --dropdown-max-height: 320px;
+  /* The sheet must not cover the amount field it belongs to. */
+  --sheet-max-height: 60dvh;
+
+  /* ---- Behavioural constants ------------------------------------------
+   * Duplicated in `src/hooks/useExchangeScreen.ts` and `src/api/exchangeApi.ts`
+   * because CSS cannot be read from JS without a layout read; the canonical
+   * source for all of them is `docs/00-canonical-model.md` §2 and §11.
+   */
+  --quote-ttl-ms: 15000;
+  --quote-warning-ms: 5000;
+  --input-debounce-ms: 300;
+  --submit-freeze-window-ms: 400;
+  --skeleton-delay-ms: 200;
+  --slow-hint-delay-ms: 1200;
+  --rate-retry-interval-ms: 5000;
+  --rate-drift-threshold-pct: 0.2;
+}
+
+/* Motion is decoration here and never the sole carrier of meaning, so removing
+   it costs nothing. */
+@media (prefers-reduced-motion: reduce) {
+  :root {
+    --duration-instant: 0ms;
+    --duration-fast: 0ms;
+    --duration-base: 0ms;
+    --duration-slow: 0ms;
+  }
+}

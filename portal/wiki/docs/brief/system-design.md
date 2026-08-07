@@ -1,0 +1,1 @@
+--8<-- "docs/System Design Brief.md"

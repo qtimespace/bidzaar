@@ -1,0 +1,175 @@
+# ═══════════════════════════════════════════════════════════════════════════
+# Wiki проекта Exchange Order — MkDocs Material.
+#
+# ВАЖНО про источник контента: в docs/ лежат ТОЛЬКО тонкие страницы-обёртки.
+# Текст документов не копируется — он подключается директивой pymdownx.snippets
+# (`--8<-- "docs/SDD.md"`) прямо из репозитория d:\Project\bidzaar.
+# Единственный источник правды — исходные файлы; копий, которые могут разойтись,
+# не существует. Подробности — в ../README.md.
+# ═══════════════════════════════════════════════════════════════════════════
+
+site_name: Exchange Order — документация
+site_description: >-
+  Проектирование процесса создания заявки на обмен валют во внутреннем модуле
+  цифрового кошелька: домен, архитектура, API, интерфейс, приёмочные сценарии.
+site_author: Exchange Order
+copyright: Exchange Order &nbsp;·&nbsp; тестовое задание
+
+# Портал монтируется в подкаталог /docs/ (см. Dockerfile и DEPLOY.md).
+# Обычные страницы MkDocs строит на относительных ссылках и работают на любой
+# глубине, но 404.html — исключение: там ссылки абсолютные и берутся из пути
+# site_url. Без site_url туда попало бы /assets/…, то есть каталог ассетов
+# прототипа, и страница «не найдено» приехала бы сама сломанной.
+# Значение по умолчанию задаёт правильный ПУТЬ при любом домене; хост влияет
+# только на канонические ссылки и sitemap.xml, и переопределяется переменной
+# окружения при сборке:
+#   PORTAL_SITE_URL=https://<app>.up.railway.app/docs/ npm run build
+site_url: !ENV [PORTAL_SITE_URL, 'http://localhost:8080/docs/']
+
+# Собранный сайт кладём в portal/dist — туда же tools/sync.py положит Swagger UI.
+site_dir: ../dist
+docs_dir: docs
+
+# Ссылки на .feature/.yaml/.html — обычные файлы внутри docs_dir, они существуют,
+# поэтому строгая валидация ссылок нам по силам (см. npm run build --strict).
+validation:
+  nav:
+    omitted_files: warn
+  links:
+    absolute_links: warn
+    unrecognized_links: warn
+
+theme:
+  name: material
+  language: ru
+  favicon: assets/favicon.svg
+  logo: assets/logo.svg
+  # Внешние шрифты Google Fonts отключены: портал должен открываться офлайн.
+  font: false
+  features:
+    - content.code.copy
+    - content.code.annotate
+    - content.tooltips
+    - navigation.footer
+    - navigation.indexes
+    - navigation.sections
+    - navigation.tabs
+    - navigation.top
+    - navigation.tracking
+    - search.highlight
+    - search.share
+    - search.suggest
+    - toc.follow
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: custom
+      accent: custom
+      toggle:
+        icon: material/weather-night
+        name: Тёмная тема
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: custom
+      accent: custom
+      toggle:
+        icon: material/weather-sunny
+        name: Светлая тема
+
+extra_css:
+  - assets/stylesheets/extra.css
+
+# Локальная копия Mermaid (кладёт tools/sync.py из node_modules/mermaid).
+# Material сам грузит mermaid с unpkg.com, только если window.mermaid не определён,
+# — вендоринг делает диаграммы работоспособными без интернета.
+extra_javascript:
+  - assets/javascripts/mermaid.min.js
+
+extra:
+  generator: false
+
+plugins:
+  - search:
+      lang:
+        - ru
+        - en
+      separator: '[\s\u200b\-_,:!=\[\]()"`/]+|\.(?!\d)|&[lg]t;|(?!\b)(?=[A-Z][a-z])'
+  - minify:
+      minify_html: true
+
+markdown_extensions:
+  - abbr
+  - admonition
+  - attr_list
+  - def_list
+  - footnotes
+  - md_in_html
+  - tables
+  - toc:
+      permalink: true
+      toc_depth: 3
+  - pymdownx.betterem
+  - pymdownx.caret
+  - pymdownx.details
+  - pymdownx.emoji:
+      emoji_generator: !!python/name:material.extensions.emoji.to_svg
+      emoji_index: !!python/name:material.extensions.emoji.twemoji
+  - pymdownx.highlight:
+      anchor_linenums: true
+      line_spans: __span
+      pygments_lang_class: true
+  - pymdownx.inlinehilite
+  - pymdownx.keys
+  - pymdownx.mark
+  - pymdownx.smartsymbols
+  # Ключевой механизм переиспользования контента: base_path смотрит в корень
+  # репозитория, страницы-обёртки включают исходные .md/.feature как есть.
+  # base_path у snippets считается от текущей рабочей директории, а не от
+  # mkdocs.yml, поэтому перечислены все разумные варианты запуска:
+  #   portal/wiki (штатный, см. npm-скрипты) → ../..
+  #   portal                                 → ..
+  #   корень репозитория                     → .
+  - pymdownx.snippets:
+      base_path:
+        - ../..
+        - ..
+        - .
+      check_paths: true
+      restrict_base_path: false
+  # Кастомный fence для Mermaid — без него 12 диаграмм SDD и диаграмма
+  # UX-спеки отрисовались бы как обычные блоки кода.
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:pymdownx.superfences.fence_code_format
+  - pymdownx.tabbed:
+      alternate_style: true
+      slugify: !!python/object/apply:pymdownx.slugs.slugify
+        kwds:
+          case: lower
+  - pymdownx.tasklist:
+      custom_checkbox: true
+  - pymdownx.tilde
+
+nav:
+  - Обзор:
+      - index.md
+      - Как запустить: run.md
+  - Задание:
+      - Бизнес-требования (BRD): BRD.md
+      - Продуктовый контекст: brief/product-context.md
+      - Бриф — дизайн: brief/design.md
+      - Бриф — системный дизайн: brief/system-design.md
+      - Бриф — API: brief/api.md
+      - Бриф — Gherkin: brief/gherkin.md
+  - Домен: 00-canonical-model.md
+  - Архитектура: sdd.md
+  - API:
+      - api/index.md
+      - Контракты интеграций: api/integrations.md
+  - Интерфейс: ux-ui-spec.md
+  - Приёмка:
+      - features/index.md
+      - Сценарии Gherkin: features/exchange-order.md
+  - Журнал работы: promtlog.md

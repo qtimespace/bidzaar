@@ -1,0 +1,1381 @@
+openapi: 3.1.0
+
+info:
+  title: Users Service API (S1) — Integration Stub
+  version: "1.0.0"
+  summary: Контракт входящих данных от Users Service в Exchange BFF
+  description: |
+    # Users Service (S1) — стаб внешнего контракта
+
+    Документ описывает **входящую к нам** информацию: что Exchange BFF **получает** от
+    Users Service. Это НЕ спецификация на реализацию сервиса — сервис принадлежит другой
+    команде. Наша цель — зафиксировать форму данных, коды ошибок и их маппинг в
+    канонический каталог ошибок (`docs/00-canonical-model.md` §7).
+
+    ## Назначение
+
+    Users Service — источник правды о пользователе: профиль, резидентство, налоговое
+    резидентство, тир обслуживания, статус учётной записи, флаги ограничений и список
+    привязанных кошельков. Exchange BFF читает эти данные, чтобы ответить на два вопроса:
+
+    1. активен ли пользователь и не наложены ли на него ограничения по обмену;
+    2. какие кошельки ему принадлежат и не заморожены ли они.
+
+    ## Место в цепочке валидации (канон §6)
+
+    Используется на **шаге 13** — «Пользователь активен, кошелёк не заморожен»
+    (источники S1 и S6). Провал шага даёт `USER_BLOCKED` или `WALLET_FROZEN`.
+    Шаг 13 выполняется ПОСЛЕ проверок котировки и сумм, но ДО KYC (шаг 14),
+    лимитов (шаг 15), скоринга (шаг 16) и баланса (шаг 17).
+
+    ## Критичность (канон §3)
+
+    **Blocking.** Отказ Users Service означает, что заявка на обмен **не создаётся**,
+    пользователь получает `EXCHANGE_SERVICE_UNAVAILABLE` (503) либо `UPSTREAM_TIMEOUT`
+    (504). Деградация на дефолтных данных запрещена: статус пользователя — это
+    комплаенс-факт, его нельзя «предположить».
+
+    ## Таймауты и ретраи (канон §11)
+
+    * Таймаут вызова: **1 000 мс** (общий бюджет для S1/S2/S3/S4, вызываются параллельно).
+    * Ретраи: только для идемпотентных `GET` — **2 попытки**, экспоненциальный backoff
+      с jitter. Все эндпоинты этого стаба — `GET`, поэтому ретраибельны.
+    * Circuit breaker: порог 50 % ошибок на окне 20 запросов, состояние open 30 с.
+    * Вклад в бюджет latency `POST /v1/exchange-orders`: p95 ≤ 900 мс — вызов S1
+      идёт параллельно с S2/S3/S4 и не должен быть на критическом пути дважды.
+
+    ## Кеширование
+
+    * Профиль пользователя (`GET /v1/users/{userId}`) — TTL **60 с**.
+    * Привязанные кошельки — TTL 60 с (наследует TTL профиля).
+    * Ограничения (`/restrictions`) — TTL 60 с.
+    * **Stale-политика:** при недоступности источника устаревшие данные **не отдаются**
+      для полей `status`, `restrictions`, `flags`. Канон §11 разрешает stale только для
+      списка активов/пар и схемы комиссий. Здесь — блокируем операцию.
+
+    ## Поведение при недоступности
+
+    | Ситуация | Что делает BFF | Код наружу |
+    |----------|----------------|------------|
+    | Таймаут 1 000 мс | 2 ретрая, затем отказ | `UPSTREAM_TIMEOUT` (504) |
+    | 5xx от сервиса | 2 ретрая, затем отказ | `EXCHANGE_SERVICE_UNAVAILABLE` (503) |
+    | Circuit breaker open | немедленный отказ без вызова | `EXCHANGE_SERVICE_UNAVAILABLE` (503) |
+    | 404 на пользователе | отказ, без утечки существования | `VALIDATION_ERROR` (400) |
+    | 429 от сервиса | отказ, retryable | `RATE_LIMITED` (429) |
+
+    ## Ограничения по PII
+
+    Поля `email`, `phone` — **персональные данные**. Правила обязательны:
+
+    * никогда не попадают в логи, трейсы, метрики и сообщения об ошибках;
+    * не передаются на фронтенд из Exchange BFF в рамках сценария создания заявки —
+      BFF читает их только при явной необходимости и не проксирует;
+    * при отладочном логировании тела ответа поля маскируются (`a***@example.com`,
+      `+9715****789`);
+    * `displayName` не является строгим PII, но также не логируется вместе с `userId`.
+
+    Поля `flags.isPep` и `flags.isSanctioned` — чувствительные комплаенс-атрибуты,
+    наружу пользователю никогда не раскрываются; они влияют только на решение.
+
+    ## Безопасность транспорта
+
+    Service-to-service: **mTLS** + `Bearer` JWT (см. `components.securitySchemes`).
+    Прямой доступ фронтенда к этому сервису запрещён — только через Exchange BFF.
+
+servers:
+  - url: https://users.internal.wallet/v1
+    description: Production — внутренняя сеть, доступ только по mTLS
+  - url: https://users.staging.internal.wallet/v1
+    description: Staging — данные обезличены, PII заменены на синтетические
+  - url: https://users.mock.internal.wallet/v1
+    description: Mock — детерминированные фикстуры канона §10.1
+
+tags:
+  - name: Users
+    description: Профиль пользователя, статус учётной записи и тир обслуживания
+  - name: Wallets
+    description: Кошельки, привязанные к пользователю, и их состояние заморозки
+  - name: Restrictions
+    description: Флаги операционных ограничений, наложенных комплаенсом или поддержкой
+
+security:
+  - bearerAuth: []
+
+paths:
+  /v1/users/{userId}:
+    get:
+      tags: [Users]
+      operationId: getUserProfile
+      summary: Get user profile
+      description: |
+        Возвращает профиль пользователя целиком, включая статус, тир, резидентство,
+        флаги ограничений и идентификаторы привязанных кошельков.
+
+        Используется Exchange BFF на **шаге 13** цепочки валидации (канон §6).
+        Кешируется на 60 с. Идемпотентно, допускает 2 ретрая.
+
+        PII-поля `email` и `phone` присутствуют в ответе, но Exchange BFF их не логирует
+        и не проксирует наружу.
+      parameters:
+        - $ref: '#/components/parameters/UserIdPath'
+        - $ref: '#/components/parameters/CorrelationIdHeader'
+        - $ref: '#/components/parameters/RequestIdHeader'
+      responses:
+        '200':
+          description: Профиль успешно получен
+          headers:
+            X-Correlation-Id:
+              $ref: '#/components/headers/CorrelationIdResponse'
+            X-Request-Id:
+              $ref: '#/components/headers/RequestIdResponse'
+            Cache-Control:
+              $ref: '#/components/headers/CacheControlResponse'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UserProfile'
+              examples:
+                activeUser:
+                  $ref: '#/components/examples/UserProfileActive'
+                blockedUser:
+                  $ref: '#/components/examples/UserProfileBlocked'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+        '504':
+          $ref: '#/components/responses/GatewayTimeout'
+
+  /v1/users/{userId}/wallets:
+    get:
+      tags: [Wallets]
+      operationId: listUserWallets
+      summary: List wallets linked to the user
+      description: |
+        Возвращает список кошельков, привязанных к пользователю, с состоянием заморозки
+        и перечнем поддерживаемых активов.
+
+        Exchange BFF использует ответ на **шаге 13** канона §6: если кошелёк, из которого
+        идёт списание, имеет `status = FROZEN`, операция отклоняется с `WALLET_FROZEN` (403).
+
+        Список коротких размеров (обычно 1–3 элемента), пагинация не предусмотрена.
+      parameters:
+        - $ref: '#/components/parameters/UserIdPath'
+        - $ref: '#/components/parameters/WalletStatusQuery'
+        - $ref: '#/components/parameters/CorrelationIdHeader'
+        - $ref: '#/components/parameters/RequestIdHeader'
+      responses:
+        '200':
+          description: Список кошельков получен
+          headers:
+            X-Correlation-Id:
+              $ref: '#/components/headers/CorrelationIdResponse'
+            X-Request-Id:
+              $ref: '#/components/headers/RequestIdResponse'
+            Cache-Control:
+              $ref: '#/components/headers/CacheControlResponse'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LinkedWalletList'
+              examples:
+                activeWallet:
+                  $ref: '#/components/examples/LinkedWalletListActive'
+                frozenWallet:
+                  $ref: '#/components/examples/LinkedWalletListFrozen'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+        '504':
+          $ref: '#/components/responses/GatewayTimeout'
+
+  /v1/users/{userId}/restrictions:
+    get:
+      tags: [Restrictions]
+      operationId: getUserRestrictions
+      summary: Get user operational restrictions
+      description: |
+        Возвращает только блок операционных ограничений — облегчённый ответ для случаев,
+        когда полный профиль не нужен и важна экономия latency в бюджете 1 000 мс.
+
+        Отдельный ресурс сохранён намеренно: он читаем, кешируется независимо и позволяет
+        точечно инвалидировать кеш при наложении ограничения комплаенсом, не сбрасывая
+        весь профиль.
+
+        Если `exchangeDisabled = true`, Exchange BFF отклоняет операцию с `USER_BLOCKED` (403)
+        на **шаге 13** канона §6. Значение `reason` наружу пользователю **не** транслируется —
+        показывается обобщённое `Account is restricted`.
+      parameters:
+        - $ref: '#/components/parameters/UserIdPath'
+        - $ref: '#/components/parameters/CorrelationIdHeader'
+        - $ref: '#/components/parameters/RequestIdHeader'
+      responses:
+        '200':
+          description: Ограничения получены
+          headers:
+            X-Correlation-Id:
+              $ref: '#/components/headers/CorrelationIdResponse'
+            X-Request-Id:
+              $ref: '#/components/headers/RequestIdResponse'
+            Cache-Control:
+              $ref: '#/components/headers/CacheControlResponse'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UserRestrictionsEnvelope'
+              examples:
+                noRestrictions:
+                  $ref: '#/components/examples/RestrictionsClean'
+                exchangeDisabled:
+                  $ref: '#/components/examples/RestrictionsExchangeDisabled'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+        '504':
+          $ref: '#/components/responses/GatewayTimeout'
+
+components:
+
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: |
+        Service-to-service аутентификация.
+
+        **Транспорт:** обязательный **mTLS** — клиентский сертификат Exchange BFF выпущен
+        внутренним CA, CN проверяется сервисом по allow-list. Без валидного клиентского
+        сертификата TLS-handshake обрывается до HTTP-уровня.
+
+        **Токен:** поверх mTLS передаётся короткоживущий JWT (TTL 300 с), подписанный
+        внутренним issuer'ом. Обязательные claims: `iss`, `aud=users-service`, `sub`
+        (идентификатор сервиса-вызывающего, например `exchange-bff`), `exp`, `jti`,
+        `scope` (`users:read`, `users:wallets:read`, `users:restrictions:read`).
+
+        Пользовательский токен сюда **не** пробрасывается — вызов идёт от имени сервиса,
+        `userId` передаётся в пути.
+
+  parameters:
+
+    UserIdPath:
+      name: userId
+      in: path
+      required: true
+      description: |
+        Идентификатор пользователя: префикс `usr_` + ULID в алфавите Crockford Base32
+        (26 символов, без `I`, `L`, `O`, `U`). Устойчиво сортируется по времени создания.
+      schema:
+        type: string
+        pattern: '^usr_[0-9A-HJKMNP-TV-Z]{26}$'
+        minLength: 30
+        maxLength: 30
+        description: Идентификатор пользователя в формате `usr_` + ULID
+        examples:
+          - usr_01J8ZQ4H9K2M3N4P5R6S7T8V9W
+
+    WalletStatusQuery:
+      name: status
+      in: query
+      required: false
+      description: |
+        Необязательный фильтр по статусу кошелька. Если не указан, возвращаются все
+        кошельки пользователя, включая закрытые. Exchange BFF обычно не фильтрует —
+        ему нужно увидеть замороженный кошелёк, чтобы вернуть `WALLET_FROZEN`.
+      schema:
+        type: string
+        enum: [ACTIVE, FROZEN, CLOSED]
+        description: Статус кошелька для фильтрации
+        examples:
+          - ACTIVE
+
+    CorrelationIdHeader:
+      name: X-Correlation-Id
+      in: header
+      required: true
+      description: |
+        Сквозной идентификатор бизнес-операции (ULID, 26 символов Crockford Base32).
+        Генерируется на входе в Exchange BFF или принимается от клиента и передаётся
+        без изменений во все downstream-вызовы. Возвращается в каждом ответе и в каждой
+        ошибке (канон §9).
+      schema:
+        type: string
+        pattern: '^[0-9A-HJKMNP-TV-Z]{26}$'
+        minLength: 26
+        maxLength: 26
+        description: Сквозной ULID корреляции операции
+        examples:
+          - 01J9X2C4K7QF8N3M5T6V7W8Y9Z
+
+    RequestIdHeader:
+      name: X-Request-Id
+      in: header
+      required: false
+      description: |
+        Идентификатор конкретного HTTP-вызова (UUIDv4). В отличие от `X-Correlation-Id`
+        уникален для каждой попытки, включая ретраи. Позволяет отличить повторный вызов
+        от нового в логах обеих сторон.
+      schema:
+        type: string
+        format: uuid
+        minLength: 36
+        maxLength: 36
+        description: Уникальный идентификатор HTTP-вызова, меняется при каждом ретрае
+        examples:
+          - 3f2a9c18-5b6d-4e21-9a77-0c4f8e2b1d33
+
+  headers:
+
+    CorrelationIdResponse:
+      description: Эхо сквозного идентификатора операции, полученного в запросе
+      required: true
+      schema:
+        type: string
+        pattern: '^[0-9A-HJKMNP-TV-Z]{26}$'
+        minLength: 26
+        maxLength: 26
+        description: Сквозной ULID корреляции операции
+        examples:
+          - 01J9X2C4K7QF8N3M5T6V7W8Y9Z
+
+    RequestIdResponse:
+      description: Эхо идентификатора HTTP-вызова; при отсутствии в запросе генерируется сервисом
+      required: false
+      schema:
+        type: string
+        format: uuid
+        minLength: 36
+        maxLength: 36
+        description: Уникальный идентификатор HTTP-вызова
+        examples:
+          - 3f2a9c18-5b6d-4e21-9a77-0c4f8e2b1d33
+
+    CacheControlResponse:
+      description: |
+        Директива кеширования. Профиль пользователя кешируется Exchange BFF на 60 с
+        (канон §11). Значение `no-store` означает запрет кеширования конкретного ответа.
+      required: false
+      schema:
+        type: string
+        maxLength: 128
+        description: Директива кеширования HTTP
+        examples:
+          - private, max-age=60
+
+    RetryAfterHeader:
+      description: Через сколько секунд допустима повторная попытка
+      required: false
+      schema:
+        type: integer
+        minimum: 0
+        maximum: 3600
+        description: Пауза перед повтором в секундах
+        examples:
+          - 30
+
+  schemas:
+
+    AssetRef:
+      type: object
+      title: AssetRef
+      description: |
+        Ссылка на актив. Для крипто-активов уникальность обеспечивается парой
+        `assetId + network` — `USDT@TRON` и `USDT@ETHEREUM` являются **разными** балансами
+        (канон §2).
+      additionalProperties: false
+      required: [assetId]
+      properties:
+        assetId:
+          type: string
+          pattern: '^[A-Z0-9]{2,12}$'
+          minLength: 2
+          maxLength: 12
+          description: Код актива в верхнем регистре
+          examples:
+            - RUB
+            - USDT
+            - BTC
+        network:
+          type: [string, 'null']
+          enum: [TRON, ETHEREUM, BITCOIN, null]
+          description: |
+            Блокчейн-сеть. Обязательна для `type = CRYPTO`, равна `null` для фиата
+            (канон §4.1).
+          examples:
+            - TRON
+            - null
+
+    UserRestrictions:
+      type: object
+      title: UserRestrictions
+      description: |
+        Флаги операционных ограничений, наложенных комплаенсом, риск-командой или
+        поддержкой. Любой из флагов `true` блокирует соответствующую операцию.
+        Наружу пользователю транслируется только факт ограничения, но не `reason`.
+      additionalProperties: false
+      required: [exchangeDisabled, withdrawalDisabled, depositDisabled]
+      properties:
+        exchangeDisabled:
+          type: boolean
+          description: |
+            Обмен запрещён. `true` → Exchange BFF отклоняет операцию на шаге 13
+            канона §6 с кодом `USER_BLOCKED` (403).
+          examples:
+            - false
+        withdrawalDisabled:
+          type: boolean
+          description: |
+            Вывод средств запрещён. Вне скоупа создания заявки, но читается вместе
+            с остальными флагами, чтобы не делать второй вызов.
+          examples:
+            - false
+        depositDisabled:
+          type: boolean
+          description: Пополнение запрещено. Вне скоупа создания заявки обмена.
+          examples:
+            - false
+        reason:
+          type: [string, 'null']
+          minLength: 1
+          maxLength: 512
+          description: |
+            Внутренняя причина ограничения. **Не показывается пользователю** и
+            **не логируется** вместе с идентификатором — может содержать формулировки
+            расследования. `null`, если ограничений нет.
+          examples:
+            - AML review in progress, case AML-2026-004417
+            - null
+        until:
+          type: [string, 'null']
+          format: date-time
+          description: |
+            Момент автоматического снятия ограничения (ISO-8601 UTC, миллисекунды,
+            суффикс `Z`). `null` — ограничение бессрочное, снимается только вручную.
+          examples:
+            - 2026-09-01T00:00:00.000Z
+            - null
+
+    UserFlags:
+      type: object
+      title: UserFlags
+      description: |
+        Комплаенс-флаги пользователя. Чувствительные данные: **никогда** не отдаются
+        на фронтенд и не попадают в текст ошибок. Влияют на решение скоринга (S3)
+        и на политики KYC (S2).
+      additionalProperties: false
+      required: [isPep, isSanctioned, isTestAccount]
+      properties:
+        isPep:
+          type: boolean
+          description: |
+            Публично значимое лицо (Politically Exposed Person). Повышает риск-балл
+            в S3 (фактор `PEP_RELATED`) и обычно требует уровня KYC `ENHANCED`.
+          examples:
+            - false
+        isSanctioned:
+          type: boolean
+          description: |
+            Совпадение по санкционным спискам. `true` фактически всегда приводит к
+            `USER_BLOCKED` (403) независимо от остальных проверок.
+          examples:
+            - false
+        isTestAccount:
+          type: boolean
+          description: |
+            Технический тестовый аккаунт. В production-окружении всегда `false`;
+            если пришёл `true` в prod — это инцидент конфигурации.
+          examples:
+            - false
+
+    UserProfile:
+      type: object
+      title: UserProfile
+      description: |
+        Профиль пользователя — основной объект, который Exchange BFF получает от S1.
+        Содержит PII (`email`, `phone`), обращение с которыми описано в `info.description`.
+      additionalProperties: false
+      required:
+        - userId
+        - displayName
+        - residencyCountry
+        - tier
+        - status
+        - createdAt
+        - updatedAt
+        - restrictions
+        - flags
+        - walletIds
+      properties:
+        userId:
+          type: string
+          pattern: '^usr_[0-9A-HJKMNP-TV-Z]{26}$'
+          minLength: 30
+          maxLength: 30
+          description: Идентификатор пользователя, `usr_` + ULID (Crockford Base32)
+          examples:
+            - usr_01J8ZQ4H9K2M3N4P5R6S7T8V9W
+        displayName:
+          type: string
+          minLength: 1
+          maxLength: 128
+          description: |
+            Отображаемое имя. Не является строгим PII, но не логируется в связке с
+            `userId` и не используется в качестве идентификатора.
+          examples:
+            - Alex Morgan
+        email:
+          type: [string, 'null']
+          format: email
+          minLength: 5
+          maxLength: 254
+          description: |
+            **PII.** Адрес электронной почты. Не логировать, не проксировать на фронтенд,
+            маскировать при отладке (`a***@example.com`). `null`, если email не подтверждён.
+          examples:
+            - alex.morgan@example.com
+            - null
+        phone:
+          type: [string, 'null']
+          pattern: '^\+[1-9]\d{6,14}$'
+          minLength: 8
+          maxLength: 16
+          description: |
+            **PII.** Телефон в формате E.164. Не логировать, маскировать при отладке
+            (`+9715****789`). `null`, если телефон не привязан.
+          examples:
+            - "+971501234567"
+            - null
+        residencyCountry:
+          type: string
+          pattern: '^[A-Z]{2}$'
+          minLength: 2
+          maxLength: 2
+          description: |
+            Страна фактического резидентства, ISO 3166-1 alpha-2. Определяет применимую
+            юрисдикционную политику в S2 (KYC) и вес фактора `HIGH_RISK_JURISDICTION` в S3.
+          examples:
+            - AE
+        citizenshipCountry:
+          type: [string, 'null']
+          pattern: '^[A-Z]{2}$'
+          minLength: 2
+          maxLength: 2
+          description: |
+            Страна гражданства, ISO 3166-1 alpha-2. `null`, если не заполнена
+            (например, до прохождения KYC).
+          examples:
+            - GB
+            - null
+        taxResidency:
+          type: [string, 'null']
+          pattern: '^[A-Z]{2}$'
+          minLength: 2
+          maxLength: 2
+          description: |
+            Страна налогового резидентства, ISO 3166-1 alpha-2. Может отличаться от
+            `residencyCountry`. `null`, если не декларирована.
+          examples:
+            - AE
+            - null
+        tier:
+          type: string
+          enum: [TIER_0, TIER_1, TIER_2, TIER_3]
+          description: |
+            Тир обслуживания. Определяет лимиты оборота, запрашиваемые из S4:
+            `TIER_0` — операции обмена недоступны;
+            `TIER_1` — базовые лимиты;
+            `TIER_2` — стандартные лимиты (канон §10.5: сутки 500 000 RUB, месяц 5 000 000 RUB);
+            `TIER_3` — расширенные лимиты.
+          examples:
+            - TIER_2
+        status:
+          type: string
+          enum: [ACTIVE, SUSPENDED, BLOCKED, CLOSED, PENDING_ACTIVATION]
+          description: |
+            Статус учётной записи:
+            `ACTIVE` — операции разрешены;
+            `SUSPENDED` — временная приостановка → `USER_BLOCKED` (403);
+            `BLOCKED` — постоянная блокировка → `USER_BLOCKED` (403);
+            `CLOSED` — учётная запись закрыта → `USER_BLOCKED` (403);
+            `PENDING_ACTIVATION` — регистрация не завершена → `USER_BLOCKED` (403).
+            Только `ACTIVE` проходит шаг 13 канона §6.
+          examples:
+            - ACTIVE
+        statusReason:
+          type: [string, 'null']
+          minLength: 1
+          maxLength: 512
+          description: |
+            Внутреннее пояснение к статусу. **Не транслируется пользователю** — наружу
+            уходит обобщённое `Account is restricted`. `null` для `ACTIVE`.
+          examples:
+            - Suspended by compliance pending document re-verification
+            - null
+        createdAt:
+          type: string
+          format: date-time
+          description: Момент создания учётной записи, ISO-8601 UTC с миллисекундами и `Z`
+          examples:
+            - 2024-11-03T08:12:45.221Z
+        updatedAt:
+          type: string
+          format: date-time
+          description: |
+            Момент последнего изменения профиля, ISO-8601 UTC. Используется Exchange BFF
+            для оценки свежести закешированной копии (TTL 60 с).
+          examples:
+            - 2026-08-07T09:58:11.004Z
+        locale:
+          type: string
+          pattern: '^[a-z]{2}(-[A-Z]{2})?$'
+          minLength: 2
+          maxLength: 5
+          description: |
+            Языковая метка BCP-47 (упрощённая форма). Влияет на локализацию уведомлений
+            в S9; на бизнес-логику обмена не влияет.
+          examples:
+            - en-GB
+        timezone:
+          type: string
+          pattern: '^[A-Za-z_]+/[A-Za-z_+\-0-9]+$'
+          minLength: 3
+          maxLength: 64
+          description: |
+            Часовой пояс в формате IANA. Важен для расчёта суточных лимитов оборота (S4):
+            граница «суток» определяется таймзоной пользователя, а не UTC.
+          examples:
+            - Asia/Dubai
+        restrictions:
+          $ref: '#/components/schemas/UserRestrictions'
+        flags:
+          $ref: '#/components/schemas/UserFlags'
+        walletIds:
+          type: array
+          minItems: 0
+          maxItems: 50
+          uniqueItems: true
+          description: |
+            Идентификаторы привязанных кошельков. Детали (статус, активы) читаются
+            отдельным вызовом `GET /v1/users/{userId}/wallets`.
+          items:
+            type: string
+            pattern: '^wlt_[0-9A-HJKMNP-TV-Z]{26}$'
+            minLength: 30
+            maxLength: 30
+            description: Идентификатор кошелька, `wlt_` + ULID
+            examples:
+              - wlt_01J8ZQ5M2P7R9T3V5X7Z9B1D3F
+          examples:
+            - [wlt_01J8ZQ5M2P7R9T3V5X7Z9B1D3F]
+
+    LinkedWallet:
+      type: object
+      title: LinkedWallet
+      description: |
+        Кошелёк, привязанный к пользователю. Exchange BFF проверяет `status`: значение,
+        отличное от `ACTIVE`, приводит к `WALLET_FROZEN` (403) на шаге 13 канона §6.
+      additionalProperties: false
+      required: [walletId, userId, status, baseCurrency, supportedAssets, createdAt]
+      properties:
+        walletId:
+          type: string
+          pattern: '^wlt_[0-9A-HJKMNP-TV-Z]{26}$'
+          minLength: 30
+          maxLength: 30
+          description: Идентификатор кошелька, `wlt_` + ULID (Crockford Base32)
+          examples:
+            - wlt_01J8ZQ5M2P7R9T3V5X7Z9B1D3F
+        userId:
+          type: string
+          pattern: '^usr_[0-9A-HJKMNP-TV-Z]{26}$'
+          minLength: 30
+          maxLength: 30
+          description: Владелец кошелька; всегда совпадает с `userId` в пути запроса
+          examples:
+            - usr_01J8ZQ4H9K2M3N4P5R6S7T8V9W
+        status:
+          type: string
+          enum: [ACTIVE, FROZEN, CLOSED]
+          description: |
+            Состояние кошелька:
+            `ACTIVE` — операции разрешены;
+            `FROZEN` — временная заморозка → `WALLET_FROZEN` (403);
+            `CLOSED` — кошелёк закрыт → `WALLET_FROZEN` (403).
+          examples:
+            - ACTIVE
+        frozenReason:
+          type: [string, 'null']
+          minLength: 1
+          maxLength: 512
+          description: |
+            Внутренняя причина заморозки. Пользователю показывается только обобщённое
+            `Wallet is temporarily frozen`. `null` для `ACTIVE`.
+          examples:
+            - Chargeback investigation
+            - null
+        frozenAt:
+          type: [string, 'null']
+          format: date-time
+          description: |
+            Момент заморозки, ISO-8601 UTC с миллисекундами и `Z`. `null`, если кошелёк
+            не заморожен.
+          examples:
+            - 2026-08-01T14:22:03.508Z
+            - null
+        baseCurrency:
+          type: string
+          pattern: '^[A-Z]{3}$'
+          minLength: 3
+          maxLength: 3
+          description: |
+            Базовая (учётная) валюта кошелька, ISO 4217. Используется для отображения
+            агрегированного эквивалента; на расчёт обмена не влияет.
+          examples:
+            - RUB
+        supportedAssets:
+          type: array
+          minItems: 0
+          maxItems: 200
+          uniqueItems: true
+          description: |
+            Активы, поддерживаемые кошельком. Пересекается с каталогом активов из S4:
+            актив, отсутствующий здесь, не может участвовать в обмене
+            (`ASSET_NOT_SUPPORTED`, шаг 3 канона §6).
+          items:
+            $ref: '#/components/schemas/AssetRef'
+        createdAt:
+          type: string
+          format: date-time
+          description: Момент создания кошелька, ISO-8601 UTC с миллисекундами и `Z`
+          examples:
+            - 2024-11-03T08:13:02.117Z
+
+    LinkedWalletList:
+      type: object
+      title: LinkedWalletList
+      description: |
+        Обёртка списка кошельков. Обёртка (а не «голый» массив) выбрана намеренно:
+        позволяет добавить метаданные без ломающего изменения контракта.
+      additionalProperties: false
+      required: [userId, items, total]
+      properties:
+        userId:
+          type: string
+          pattern: '^usr_[0-9A-HJKMNP-TV-Z]{26}$'
+          minLength: 30
+          maxLength: 30
+          description: Пользователь, которому принадлежат кошельки
+          examples:
+            - usr_01J8ZQ4H9K2M3N4P5R6S7T8V9W
+        items:
+          type: array
+          minItems: 0
+          maxItems: 50
+          description: Кошельки пользователя
+          items:
+            $ref: '#/components/schemas/LinkedWallet'
+        total:
+          type: integer
+          minimum: 0
+          maximum: 50
+          description: Общее количество кошельков; равно длине `items` (пагинации нет)
+          examples:
+            - 1
+        retrievedAt:
+          type: string
+          format: date-time
+          description: |
+            Момент формирования ответа, ISO-8601 UTC. Exchange BFF использует значение
+            для контроля возраста закешированной копии (TTL 60 с).
+          examples:
+            - 2026-08-07T10:15:31.882Z
+
+    UserRestrictionsEnvelope:
+      type: object
+      title: UserRestrictionsEnvelope
+      description: Облегчённый ответ ресурса `/restrictions` — только флаги ограничений и метаданные свежести
+      additionalProperties: false
+      required: [userId, status, restrictions, retrievedAt]
+      properties:
+        userId:
+          type: string
+          pattern: '^usr_[0-9A-HJKMNP-TV-Z]{26}$'
+          minLength: 30
+          maxLength: 30
+          description: Пользователь, к которому относятся ограничения
+          examples:
+            - usr_01J8ZQ4H9K2M3N4P5R6S7T8V9W
+        status:
+          type: string
+          enum: [ACTIVE, SUSPENDED, BLOCKED, CLOSED, PENDING_ACTIVATION]
+          description: |
+            Статус учётной записи, дублируется здесь, чтобы избежать второго вызова
+            за полным профилем при проверке шага 13 канона §6.
+          examples:
+            - ACTIVE
+        restrictions:
+          $ref: '#/components/schemas/UserRestrictions'
+        retrievedAt:
+          type: string
+          format: date-time
+          description: Момент формирования ответа, ISO-8601 UTC с миллисекундами и `Z`
+          examples:
+            - 2026-08-07T10:15:31.902Z
+
+    UsersServiceErrorDetail:
+      type: object
+      title: UsersServiceErrorDetail
+      description: |
+        Элемент диагностики ошибки. Никогда не содержит PII: значения полей `email`
+        и `phone` в диагностику не попадают.
+      additionalProperties: false
+      required: [field, issue]
+      properties:
+        field:
+          type: string
+          minLength: 1
+          maxLength: 128
+          description: Путь к проблемному полю в нотации JSON Pointer или dot-notation
+          examples:
+            - userId
+        issue:
+          type: string
+          minLength: 1
+          maxLength: 256
+          description: Краткое машинно-ориентированное описание проблемы
+          examples:
+            - does not match pattern ^usr_[0-9A-HJKMNP-TV-Z]{26}$
+
+    UsersServiceError:
+      type: object
+      title: UsersServiceError
+      description: |
+        Собственный конверт ошибки Users Service. Отличается от нашего RFC 9457
+        Problem Details (канон §7) — Exchange BFF **транслирует** его в канонический
+        формат по маппингу, указанному в описании поля `error`.
+      additionalProperties: false
+      required: [error, message, traceId, timestamp]
+      properties:
+        error:
+          type: string
+          enum:
+            - USER_NOT_FOUND
+            - USER_SUSPENDED
+            - USER_BLOCKED
+            - WALLET_FROZEN
+            - INVALID_USER_ID
+            - UNAUTHORIZED
+            - FORBIDDEN
+            - RATE_LIMITED
+            - INTERNAL_ERROR
+            - SERVICE_UNAVAILABLE
+            - UPSTREAM_TIMEOUT
+          description: |
+            Машинный код ошибки Users Service и его маппинг в каталог ошибок канона §7:
+
+            * `USER_NOT_FOUND` (404) — пользователь не существует.
+              → `VALIDATION_ERROR` (400). Наружу намеренно **не** возвращается 404:
+              различие «нет пользователя» / «есть, но нельзя» — утечка информации и
+              вектор перебора (принцип Compliance First, канон §6, замечание к шагам 13–17).
+            * `INVALID_USER_ID` (400) — идентификатор не соответствует формату.
+              → `VALIDATION_ERROR` (400).
+            * `USER_SUSPENDED` (403) — учётная запись временно приостановлена.
+              → `USER_BLOCKED` (403).
+            * `USER_BLOCKED` (403) — учётная запись заблокирована или закрыта.
+              → `USER_BLOCKED` (403).
+            * `WALLET_FROZEN` (403) — кошелёк заморожен или закрыт.
+              → `WALLET_FROZEN` (403).
+            * `UNAUTHORIZED` (401) — невалидный или истёкший service JWT.
+              → `EXCHANGE_SERVICE_UNAVAILABLE` (503); это наш дефект конфигурации,
+              пользователь не должен видеть 401 чужого сервиса.
+            * `FORBIDDEN` (403) — у сервиса-вызывающего нет нужного scope.
+              → `EXCHANGE_SERVICE_UNAVAILABLE` (503), по той же причине.
+            * `RATE_LIMITED` (429) — превышен лимит обращений Exchange BFF к S1.
+              → `RATE_LIMITED` (429), retryable.
+            * `INTERNAL_ERROR` (500) — внутренняя ошибка сервиса.
+              → `EXCHANGE_SERVICE_UNAVAILABLE` (503), retryable.
+            * `SERVICE_UNAVAILABLE` (503) — сервис недоступен или перегружен.
+              → `EXCHANGE_SERVICE_UNAVAILABLE` (503), retryable.
+            * `UPSTREAM_TIMEOUT` (504) — истёк таймаут 1 000 мс (канон §11) либо
+              собственный upstream сервиса не ответил.
+              → `UPSTREAM_TIMEOUT` (504), retryable.
+          examples:
+            - USER_BLOCKED
+        message:
+          type: string
+          minLength: 1
+          maxLength: 1024
+          description: |
+            Человекочитаемое пояснение на английском для инженеров. **Не показывается
+            конечному пользователю** — фронтенд ветвится только по каноническому `code`
+            (канон §7).
+          examples:
+            - User account is blocked by compliance
+        traceId:
+          type: string
+          minLength: 8
+          maxLength: 64
+          description: |
+            Внутренний идентификатор трассировки Users Service. Логируется Exchange BFF
+            рядом с нашим `correlationId`, чтобы связать инциденты между командами.
+          examples:
+            - 4f9c2ab7e1d34c6f
+        timestamp:
+          type: string
+          format: date-time
+          description: Момент возникновения ошибки, ISO-8601 UTC с миллисекундами и `Z`
+          examples:
+            - 2026-08-07T10:15:32.117Z
+        correlationId:
+          type: [string, 'null']
+          pattern: '^[0-9A-HJKMNP-TV-Z]{26}$'
+          minLength: 26
+          maxLength: 26
+          description: |
+            Эхо `X-Correlation-Id` из запроса. `null`, если заголовок не был передан
+            (нарушение контракта со стороны вызывающего).
+          examples:
+            - 01J9X2C4K7QF8N3M5T6V7W8Y9Z
+            - null
+        retryable:
+          type: boolean
+          description: |
+            Признак осмысленности повтора. `true` для `INTERNAL_ERROR`,
+            `SERVICE_UNAVAILABLE`, `UPSTREAM_TIMEOUT`, `RATE_LIMITED`.
+          examples:
+            - false
+        details:
+          type: array
+          minItems: 0
+          maxItems: 20
+          description: Дополнительная диагностика; пустой массив, если детализации нет
+          items:
+            $ref: '#/components/schemas/UsersServiceErrorDetail'
+
+  responses:
+
+    BadRequest:
+      description: |
+        Некорректный запрос: невалидный формат `userId` или отсутствует обязательный
+        заголовок трассировки. → `VALIDATION_ERROR` (400) в каноне §7.
+      headers:
+        X-Correlation-Id:
+          $ref: '#/components/headers/CorrelationIdResponse'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/UsersServiceError'
+          examples:
+            invalidUserId:
+              $ref: '#/components/examples/ErrorInvalidUserId'
+
+    Unauthorized:
+      description: |
+        Невалидный, истёкший или отсутствующий service JWT. → `EXCHANGE_SERVICE_UNAVAILABLE`
+        (503): это наш дефект конфигурации, пользователю чужой 401 не показывается.
+      headers:
+        X-Correlation-Id:
+          $ref: '#/components/headers/CorrelationIdResponse'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/UsersServiceError'
+          examples:
+            unauthorized:
+              $ref: '#/components/examples/ErrorUnauthorized'
+
+    Forbidden:
+      description: |
+        Пользователь заблокирован/приостановлен либо кошелёк заморожен, либо у
+        сервиса-вызывающего нет нужного scope. → `USER_BLOCKED` (403) /
+        `WALLET_FROZEN` (403) / `EXCHANGE_SERVICE_UNAVAILABLE` (503) соответственно.
+      headers:
+        X-Correlation-Id:
+          $ref: '#/components/headers/CorrelationIdResponse'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/UsersServiceError'
+          examples:
+            userBlocked:
+              $ref: '#/components/examples/ErrorUserBlocked'
+            userSuspended:
+              $ref: '#/components/examples/ErrorUserSuspended'
+            walletFrozen:
+              $ref: '#/components/examples/ErrorWalletFrozen'
+
+    NotFound:
+      description: |
+        Пользователь не найден. → `VALIDATION_ERROR` (400) наружу: факт существования
+        учётной записи не раскрывается (Compliance First, канон §6).
+      headers:
+        X-Correlation-Id:
+          $ref: '#/components/headers/CorrelationIdResponse'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/UsersServiceError'
+          examples:
+            userNotFound:
+              $ref: '#/components/examples/ErrorUserNotFound'
+
+    TooManyRequests:
+      description: Превышен лимит обращений Exchange BFF к Users Service. → `RATE_LIMITED` (429), retryable.
+      headers:
+        X-Correlation-Id:
+          $ref: '#/components/headers/CorrelationIdResponse'
+        Retry-After:
+          $ref: '#/components/headers/RetryAfterHeader'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/UsersServiceError'
+          examples:
+            rateLimited:
+              $ref: '#/components/examples/ErrorRateLimited'
+
+    InternalError:
+      description: Внутренняя ошибка Users Service. → `EXCHANGE_SERVICE_UNAVAILABLE` (503), retryable.
+      headers:
+        X-Correlation-Id:
+          $ref: '#/components/headers/CorrelationIdResponse'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/UsersServiceError'
+          examples:
+            internalError:
+              $ref: '#/components/examples/ErrorInternal'
+
+    ServiceUnavailable:
+      description: |
+        Сервис недоступен или перегружен. → `EXCHANGE_SERVICE_UNAVAILABLE` (503).
+        Критичность S1 — Blocking (канон §3): заявка не создаётся, деградация запрещена.
+      headers:
+        X-Correlation-Id:
+          $ref: '#/components/headers/CorrelationIdResponse'
+        Retry-After:
+          $ref: '#/components/headers/RetryAfterHeader'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/UsersServiceError'
+          examples:
+            serviceUnavailable:
+              $ref: '#/components/examples/ErrorServiceUnavailable'
+
+    GatewayTimeout:
+      description: |
+        Истёк таймаут 1 000 мс (канон §11) или не ответил upstream сервиса.
+        → `UPSTREAM_TIMEOUT` (504), retryable.
+      headers:
+        X-Correlation-Id:
+          $ref: '#/components/headers/CorrelationIdResponse'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/UsersServiceError'
+          examples:
+            upstreamTimeout:
+              $ref: '#/components/examples/ErrorUpstreamTimeout'
+
+  examples:
+
+    UserProfileActive:
+      summary: Активный пользователь (фикстура канона §10.1)
+      description: |
+        Эталонный ответ happy-path. Соответствует хардкод-фикстуре прототипа:
+        `Alex Morgan`, резидентство `AE`, тир `TIER_2`, статус `ACTIVE`.
+      value:
+        userId: usr_01J8ZQ4H9K2M3N4P5R6S7T8V9W
+        displayName: Alex Morgan
+        email: alex.morgan@example.com
+        phone: "+971501234567"
+        residencyCountry: AE
+        citizenshipCountry: GB
+        taxResidency: AE
+        tier: TIER_2
+        status: ACTIVE
+        statusReason: null
+        createdAt: 2024-11-03T08:12:45.221Z
+        updatedAt: 2026-08-07T09:58:11.004Z
+        locale: en-GB
+        timezone: Asia/Dubai
+        restrictions:
+          exchangeDisabled: false
+          withdrawalDisabled: false
+          depositDisabled: false
+          reason: null
+          until: null
+        flags:
+          isPep: false
+          isSanctioned: false
+          isTestAccount: false
+        walletIds:
+          - wlt_01J8ZQ5M2P7R9T3V5X7Z9B1D3F
+
+    UserProfileBlocked:
+      summary: Заблокированный пользователь
+      description: |
+        Негативный путь шага 13 канона §6. Exchange BFF транслирует это в
+        `USER_BLOCKED` (403) с сообщением `Account is restricted`;
+        значения `statusReason` и `restrictions.reason` наружу не уходят.
+      value:
+        userId: usr_01J8ZQ4H9K2M3N4P5R6S7T8V9W
+        displayName: Alex Morgan
+        email: alex.morgan@example.com
+        phone: "+971501234567"
+        residencyCountry: AE
+        citizenshipCountry: GB
+        taxResidency: AE
+        tier: TIER_2
+        status: BLOCKED
+        statusReason: Blocked by compliance after sanctions list match review
+        createdAt: 2024-11-03T08:12:45.221Z
+        updatedAt: 2026-08-06T17:40:02.900Z
+        locale: en-GB
+        timezone: Asia/Dubai
+        restrictions:
+          exchangeDisabled: true
+          withdrawalDisabled: true
+          depositDisabled: true
+          reason: AML review in progress, case AML-2026-004417
+          until: null
+        flags:
+          isPep: false
+          isSanctioned: true
+          isTestAccount: false
+        walletIds:
+          - wlt_01J8ZQ5M2P7R9T3V5X7Z9B1D3F
+
+    LinkedWalletListActive:
+      summary: Один активный кошелёк со всеми активами фикстуры §10.2
+      description: |
+        Набор поддерживаемых активов совпадает с таблицей балансов канона §10.2:
+        `RUB`, `USDT@TRON`, `BTC@BITCOIN`, `ETH@ETHEREUM`, `EUR`.
+      value:
+        userId: usr_01J8ZQ4H9K2M3N4P5R6S7T8V9W
+        total: 1
+        retrievedAt: 2026-08-07T10:15:31.882Z
+        items:
+          - walletId: wlt_01J8ZQ5M2P7R9T3V5X7Z9B1D3F
+            userId: usr_01J8ZQ4H9K2M3N4P5R6S7T8V9W
+            status: ACTIVE
+            frozenReason: null
+            frozenAt: null
+            baseCurrency: RUB
+            createdAt: 2024-11-03T08:13:02.117Z
+            supportedAssets:
+              - assetId: RUB
+                network: null
+              - assetId: USDT
+                network: TRON
+              - assetId: BTC
+                network: BITCOIN
+              - assetId: ETH
+                network: ETHEREUM
+              - assetId: EUR
+                network: null
+
+    LinkedWalletListFrozen:
+      summary: Замороженный кошелёк
+      description: |
+        Exchange BFF транслирует это в `WALLET_FROZEN` (403) на шаге 13 канона §6.
+        Пользователю показывается `Wallet is temporarily frozen`; `frozenReason` скрыт.
+      value:
+        userId: usr_01J8ZQ4H9K2M3N4P5R6S7T8V9W
+        total: 1
+        retrievedAt: 2026-08-07T10:15:31.882Z
+        items:
+          - walletId: wlt_01J8ZQ5M2P7R9T3V5X7Z9B1D3F
+            userId: usr_01J8ZQ4H9K2M3N4P5R6S7T8V9W
+            status: FROZEN
+            frozenReason: Chargeback investigation
+            frozenAt: 2026-08-01T14:22:03.508Z
+            baseCurrency: RUB
+            createdAt: 2024-11-03T08:13:02.117Z
+            supportedAssets:
+              - assetId: RUB
+                network: null
+              - assetId: USDT
+                network: TRON
+
+    RestrictionsClean:
+      summary: Ограничений нет
+      description: Happy-path шага 13 канона §6 — проверка пройдена, идём к шагу 14 (KYC).
+      value:
+        userId: usr_01J8ZQ4H9K2M3N4P5R6S7T8V9W
+        status: ACTIVE
+        retrievedAt: 2026-08-07T10:15:31.902Z
+        restrictions:
+          exchangeDisabled: false
+          withdrawalDisabled: false
+          depositDisabled: false
+          reason: null
+          until: null
+
+    RestrictionsExchangeDisabled:
+      summary: Обмен запрещён до конкретной даты
+      description: |
+        `exchangeDisabled = true` → `USER_BLOCKED` (403). Поле `until` показывает
+        момент автоматического снятия ограничения; наружу оно не транслируется.
+      value:
+        userId: usr_01J8ZQ4H9K2M3N4P5R6S7T8V9W
+        status: SUSPENDED
+        retrievedAt: 2026-08-07T10:15:31.902Z
+        restrictions:
+          exchangeDisabled: true
+          withdrawalDisabled: false
+          depositDisabled: false
+          reason: Temporary restriction pending document re-verification
+          until: 2026-09-01T00:00:00.000Z
+
+    ErrorInvalidUserId:
+      summary: Невалидный формат userId → VALIDATION_ERROR (400)
+      value:
+        error: INVALID_USER_ID
+        message: Path parameter userId does not match the required ULID format
+        traceId: 4f9c2ab7e1d34c6f
+        timestamp: 2026-08-07T10:15:32.117Z
+        correlationId: 01J9X2C4K7QF8N3M5T6V7W8Y9Z
+        retryable: false
+        details:
+          - field: userId
+            issue: does not match pattern ^usr_[0-9A-HJKMNP-TV-Z]{26}$
+
+    ErrorUnauthorized:
+      summary: Невалидный service JWT → EXCHANGE_SERVICE_UNAVAILABLE (503)
+      value:
+        error: UNAUTHORIZED
+        message: Service token is expired or signature verification failed
+        traceId: 8b1e07c4aa9f42d1
+        timestamp: 2026-08-07T10:15:32.117Z
+        correlationId: 01J9X2C4K7QF8N3M5T6V7W8Y9Z
+        retryable: false
+        details: []
+
+    ErrorUserBlocked:
+      summary: Пользователь заблокирован → USER_BLOCKED (403)
+      value:
+        error: USER_BLOCKED
+        message: User account is blocked by compliance
+        traceId: 2c7d51ea3b8f4906
+        timestamp: 2026-08-07T10:15:32.117Z
+        correlationId: 01J9X2C4K7QF8N3M5T6V7W8Y9Z
+        retryable: false
+        details:
+          - field: status
+            issue: account status is BLOCKED
+
+    ErrorUserSuspended:
+      summary: Учётная запись приостановлена → USER_BLOCKED (403)
+      value:
+        error: USER_SUSPENDED
+        message: User account is temporarily suspended
+        traceId: 6a4b9f21ce7d4835
+        timestamp: 2026-08-07T10:15:32.117Z
+        correlationId: 01J9X2C4K7QF8N3M5T6V7W8Y9Z
+        retryable: false
+        details:
+          - field: status
+            issue: account status is SUSPENDED
+
+    ErrorWalletFrozen:
+      summary: Кошелёк заморожен → WALLET_FROZEN (403)
+      value:
+        error: WALLET_FROZEN
+        message: Wallet is frozen and cannot participate in exchange operations
+        traceId: 9e3f18d0b5c74a62
+        timestamp: 2026-08-07T10:15:32.117Z
+        correlationId: 01J9X2C4K7QF8N3M5T6V7W8Y9Z
+        retryable: false
+        details:
+          - field: walletId
+            issue: wlt_01J8ZQ5M2P7R9T3V5X7Z9B1D3F status is FROZEN
+
+    ErrorUserNotFound:
+      summary: Пользователь не найден → VALIDATION_ERROR (400) наружу
+      value:
+        error: USER_NOT_FOUND
+        message: User does not exist
+        traceId: 1d5c73b9f0a24e88
+        timestamp: 2026-08-07T10:15:32.117Z
+        correlationId: 01J9X2C4K7QF8N3M5T6V7W8Y9Z
+        retryable: false
+        details: []
+
+    ErrorRateLimited:
+      summary: Превышен лимит обращений → RATE_LIMITED (429)
+      value:
+        error: RATE_LIMITED
+        message: Too many requests from exchange-bff, quota exceeded for the current window
+        traceId: 7f2a4c6e8d0b1359
+        timestamp: 2026-08-07T10:15:32.117Z
+        correlationId: 01J9X2C4K7QF8N3M5T6V7W8Y9Z
+        retryable: true
+        details: []
+
+    ErrorInternal:
+      summary: Внутренняя ошибка → EXCHANGE_SERVICE_UNAVAILABLE (503)
+      value:
+        error: INTERNAL_ERROR
+        message: Unexpected internal error while reading user profile
+        traceId: 0a9b8c7d6e5f4321
+        timestamp: 2026-08-07T10:15:32.117Z
+        correlationId: 01J9X2C4K7QF8N3M5T6V7W8Y9Z
+        retryable: true
+        details: []
+
+    ErrorServiceUnavailable:
+      summary: Сервис недоступен → EXCHANGE_SERVICE_UNAVAILABLE (503)
+      value:
+        error: SERVICE_UNAVAILABLE
+        message: Users Service is temporarily unavailable, dependency degraded
+        traceId: 5e6f7a8b9c0d1e2f
+        timestamp: 2026-08-07T10:15:32.117Z
+        correlationId: 01J9X2C4K7QF8N3M5T6V7W8Y9Z
+        retryable: true
+        details: []
+
+    ErrorUpstreamTimeout:
+      summary: Таймаут 1000 мс → UPSTREAM_TIMEOUT (504)
+      value:
+        error: UPSTREAM_TIMEOUT
+        message: Upstream data store did not respond within the configured deadline
+        traceId: 3b2a1908f7e6d5c4
+        timestamp: 2026-08-07T10:15:32.117Z
+        correlationId: 01J9X2C4K7QF8N3M5T6V7W8Y9Z
+        retryable: true
+        details: []

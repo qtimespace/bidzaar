@@ -1,0 +1,1 @@
+--8<-- "docs/00-canonical-model.md"

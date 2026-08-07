@@ -1,0 +1,48 @@
+# ═══════════════════════════════════════════════════════════════════════════
+# Python-зависимости портала документации (MkDocs Material).
+#
+# Версии зафиксированы по составу окружения, на котором портал реально
+# собирается (`npm run build` → `python -m mkdocs build --strict`).
+# Прямые зависимости и весь значимый транзитив закреплены точно: строгая
+# сборка (--strict) падает от любого предупреждения, поэтому «поедет минорка
+# markdown — поедет вёрстка» здесь не абстрактный риск.
+#
+# Минимальная версия Python — 3.10 (её требуют pymdown-extensions, markdown,
+# backrefs, platformdirs, click, requests). Debian bookworm даёт 3.11 — годится.
+#
+# Установка:  python -m pip install -r requirements.txt
+# ═══════════════════════════════════════════════════════════════════════════
+
+# --- прямые зависимости (их перечисляет mkdocs.yml) ---
+mkdocs==1.6.1
+mkdocs-material==9.7.6
+mkdocs-material-extensions==1.3.1
+mkdocs-minify-plugin==0.8.0
+pymdown-extensions==11.0
+
+# --- транзитив, влияющий на выходной HTML ---
+Markdown==3.10.2
+Pygments==2.20.0
+Jinja2==3.1.6
+MarkupSafe==3.0.3
+babel==2.18.0
+backrefs==7.0
+paginate==0.5.7
+
+# --- транзитив плагина minify ---
+csscompressor==0.9.5
+htmlmin2==0.1.13
+jsmin==3.0.1
+
+# --- транзитив ядра mkdocs ---
+click==8.4.2
+colorama==0.4.6
+ghp-import==2.1.0
+mergedeep==1.3.4
+mkdocs-get-deps==0.2.2
+pathspec==1.1.1
+platformdirs==4.10.0
+PyYAML==6.0.3
+pyyaml_env_tag==1.1
+requests==2.34.2
+watchdog==6.0.0

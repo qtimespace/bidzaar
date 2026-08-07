@@ -1,0 +1,12 @@
+# Зависимости и собранный сайт
+node_modules/
+dist/
+
+# Всё, что создаёт tools/sync.py, — генерируемое, в git не хранится:
+# единственный источник правды остаётся в d:\Project\bidzaar\docs\
+api/specs/
+api/vendor/
+api/favicon.svg
+wiki/docs/swagger/
+wiki/docs/features/exchange-order.feature
+wiki/docs/assets/javascripts/mermaid.min.js

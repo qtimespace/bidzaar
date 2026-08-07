@@ -1,0 +1,31 @@
+{
+  "name": "bidzaar-exchange-prototype",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "description": "Concept UX/UI prototype of the currency exchange screen for the internal wallet module. Hardcoded data, no authentication.",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc -b && vite build",
+    "preview": "vite preview",
+    "typecheck": "tsc -b --noEmit",
+    "verify:money": "tsc src/domain/money.ts --outDir .money-check --module esnext --target es2022 --moduleResolution bundler --skipLibCheck && node scripts/verify-money.mjs",
+    "verify:render": "vite build --ssr scripts/render-smoke.tsx --outDir .render-check --logLevel warn && node .render-check/render-smoke.js",
+    "verify:flow": "vite build --ssr scripts/verify-flow.tsx --outDir .flow-check --logLevel warn && node .flow-check/verify-flow.js",
+    "verify": "npm run typecheck && npm run verify:money && npm run verify:render && npm run verify:flow"
+  },
+  "dependencies": {
+    "decimal.js": "^10.4.3",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^26.1.2",
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "@vitejs/plugin-react": "^4.3.4",
+    "jsdom": "^26.1.0",
+    "typescript": "~5.7.2",
+    "vite": "^6.0.5"
+  }
+}

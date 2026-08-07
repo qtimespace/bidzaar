@@ -1,0 +1,128 @@
+/* =========================================================================
+   Exchange Order — палитра портала.
+   Фирменный синий #2563EB задаётся как схема `custom` (mkdocs.yml → palette),
+   тот же цвет использует страница Swagger UI (portal/api/index.html),
+   чтобы вики и API-консоль выглядели одним продуктом.
+   Внешних @import нет: портал должен открываться офлайн.
+   ========================================================================= */
+
+/* Фирменный цвет отдельной переменной: в тёмной теме шапка становится
+   графитовой, а акцент — светлее, поэтому опираться на --md-primary-fg-color
+   в декоре нельзя. */
+:root { --eo-brand: #2563EB; }
+[data-md-color-scheme="slate"] { --eo-brand: #60A5FA; }
+
+/* --- Светлая тема ------------------------------------------------------- */
+[data-md-color-primary="custom"] {
+  --md-primary-fg-color:          #2563EB;
+  --md-primary-fg-color--light:   #3B82F6;
+  --md-primary-fg-color--dark:    #1D4ED8;
+  --md-primary-bg-color:          #FFFFFF;
+  --md-primary-bg-color--light:   rgba(255, 255, 255, 0.7);
+}
+
+[data-md-color-accent="custom"] {
+  --md-accent-fg-color:             #1D4ED8;
+  --md-accent-fg-color--transparent: rgba(29, 78, 216, 0.1);
+  --md-accent-bg-color:             #FFFFFF;
+  --md-accent-bg-color--light:      rgba(255, 255, 255, 0.7);
+}
+
+/* --- Тёмная тема: шапка тёмная, ссылки — светлее синий для контраста ----- */
+[data-md-color-scheme="slate"][data-md-color-primary="custom"] {
+  --md-primary-fg-color:        #1E293B;
+  --md-primary-fg-color--light: #334155;
+  --md-primary-fg-color--dark:  #0F172A;
+  --md-typeset-a-color:         #60A5FA;
+}
+
+[data-md-color-scheme="slate"][data-md-color-accent="custom"] {
+  --md-accent-fg-color:              #93C5FD;
+  --md-accent-fg-color--transparent: rgba(147, 197, 253, 0.1);
+}
+
+/* Ссылки в тексте светлой темы — фирменный синий, а не дефолтный индиго */
+[data-md-color-scheme="default"] {
+  --md-typeset-a-color: #2563EB;
+}
+
+/* -------------------------------------------------------------------------
+   Таблицы. В документах проекта их много и они широкие (каталог ошибок,
+   матрица проверок, реестр интеграций) — уменьшаем кегль и включаем
+   горизонтальный скролл вместо переноса.
+   ------------------------------------------------------------------------- */
+.md-typeset table:not([class]) {
+  font-size: 0.72rem;
+}
+
+.md-typeset table:not([class]) th {
+  font-weight: 600;
+  background-color: var(--md-default-fg-color--lightest);
+}
+
+.md-typeset table:not([class]) tr:nth-child(even) > td {
+  background-color: var(--md-default-fg-color--lightest);
+}
+
+@media screen and (max-width: 44.9375em) {
+  .md-typeset__scrollwrap { overflow-x: auto; }
+  .md-typeset table:not([class]) { white-space: nowrap; }
+}
+
+/* -------------------------------------------------------------------------
+   Mermaid. Диаграмм 13 штук, часть из них широкие C4/sequence — даём им
+   всю ширину контента и горизонтальный скролл, чтобы не сжимались в кашу.
+   ------------------------------------------------------------------------- */
+.md-typeset .mermaid {
+  overflow-x: auto;
+  text-align: center;
+  margin: 1.2em 0;
+  padding: 0.6em 0;
+  border: 1px solid var(--md-default-fg-color--lightest);
+  border-radius: 0.3rem;
+  background-color: var(--md-default-bg-color);
+}
+
+/* -------------------------------------------------------------------------
+   Плашка `!!! tip` перекрашена в фирменный синий: ею отмечена ссылка на
+   Swagger UI, и бирюзовый по умолчанию выбивался из палитры продукта.
+   ------------------------------------------------------------------------- */
+.md-typeset .admonition.tip,
+.md-typeset details.tip {
+  border-color: var(--eo-brand);
+}
+
+.md-typeset .tip > .admonition-title,
+.md-typeset .tip > summary {
+  background-color: color-mix(in srgb, var(--eo-brand) 10%, transparent);
+}
+
+.md-typeset .tip > .admonition-title::before,
+.md-typeset .tip > summary::before {
+  background-color: var(--eo-brand);
+}
+
+/* -------------------------------------------------------------------------
+   Карточки на главной.
+   ------------------------------------------------------------------------- */
+.md-typeset .grid.cards > ul > li {
+  border-radius: 0.4rem;
+  transition: border-color 125ms, box-shadow 125ms;
+}
+
+.md-typeset .grid.cards > ul > li:hover {
+  border-color: var(--eo-brand);
+  box-shadow: 0 0 0.4rem color-mix(in srgb, var(--eo-brand) 25%, transparent);
+}
+
+/* -------------------------------------------------------------------------
+   Длинные страницы (SDD, UX-спека, журнал) — оглавление справа плотнее.
+   ------------------------------------------------------------------------- */
+.md-nav--secondary .md-nav__list {
+  font-size: 0.68rem;
+}
+
+/* Якорные ссылки заголовков не должны прыгать под липкую шапку */
+.md-typeset :target {
+  scroll-margin-top: 3.6rem;
+}

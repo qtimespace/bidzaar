@@ -1,0 +1,2091 @@
+openapi: 3.1.0
+
+info:
+  title: S7 Crypto Provider API (inbound contract stub)
+  version: "1.0.0"
+  summary: Контракт входящих данных о ликвидности, проскальзывании и состоянии блокчейн-сетей.
+  description: |
+    # S7 — Crypto Provider
+
+    ## Что это за документ
+
+    Это **стаб контракта ВХОДЯЩЕЙ информации**. Он описывает не то, что мы реализуем,
+    а то, что наше приложение — **Exchange BFF** — *получает* от внешнего криптопровайдера.
+    Реализация сервиса вне нашего скоупа; здесь зафиксированы форма ответа, семантика полей,
+    коды ошибок и правила деградации, на которые BFF имеет право опираться.
+
+    ## Назначение
+
+    Провайдер отдаёт рыночные данные с торговых площадок и телеметрию блокчейн-сетей:
+
+    * сводку ордербука по паре (`bestBid`, `bestAsk`, `midPrice`, спред, глубина);
+    * агрегированную ликвидность по площадкам;
+    * оценку проскальзывания для конкретной суммы;
+    * статус сетей `TRON` / `ETHEREUM` / `BITCOIN` и оценки сетевых комиссий;
+    * перечень сетей, поддерживаемых конкретным активом.
+
+    ## Критичность: Degradable (канон §3)
+
+    S7 — **единственная система класса `Degradable`** во всей карте внешних систем.
+    Правило класса из §3 канона: «Отказ → работаем на закешированных/дефолтных данных,
+    помечаем котировку `degraded: true`».
+
+    Практическое следствие, которое обязано соблюдаться реализацией BFF:
+
+    > **При недоступности S7 котировка строится БЕЗ проверки проскальзывания,
+    > помечается `degraded: true`, и заявка при этом СОЗДАЁТСЯ.**
+    > Ни одна ошибка S7 не превращается в `503` для пользователя.
+
+    ## Как данные S7 используются
+
+    Обмен в нашем продукте **внутренний** (канон §5.5): активы перемещаются между балансами
+    одного кошелька, ончейн-транзакции не выполняются, поэтому `networkFee = "0"` всегда.
+    Данные S7 нужны не для расчёта сетевой комиссии, а для двух вещей:
+
+    1. **(а) Оценка исполнимости** — понять, хватит ли на рынке ликвидности, чтобы наш
+       внутренний обмен был обеспечен, и не окажется ли проскальзывание неприемлемым.
+       Результат влияет только на предупреждение в котировке, но **не блокирует** заявку.
+    2. **(б) Информирование пользователя о сети получения** — строка `Network` в Exchange
+       Summary (`USDT@TRON`). Канон §5.5: пользователь должен осознавать выбор сети уже
+       на этапе обмена, потому что при последующем выводе средств сеть определяет реальную
+       стоимость.
+
+    ## Место в цепочке валидации (канон §6)
+
+    S7 **не является источником данных ни для одного из 19 нормативных шагов** цепочки
+    валидации. Это осознанно: `Degradable`-система не может стоять на пути fail-fast-проверок.
+    Вызовы S7 идут **параллельно** блокирующим проверкам и обогащают котировку:
+
+    * рядом с шагом 5 (`PAIR_NOT_SUPPORTED`, источник S4) — S7 даёт справку о наличии рынка,
+      но решение о поддержке пары принимает **S4**, а не S7;
+    * рядом с шагом 10 (`RATE_CHANGED`, источник S5) — S7 даёт спред и глубину как контекст;
+      сам курс и порог дрейфа 0.20 % берутся из **S5**.
+
+    ## Таймауты и ретраи (канон §11)
+
+    | Параметр | Значение |
+    |---|---|
+    | Таймаут запроса | **800–1000 мс** (нижняя граница для `orderbook-summary` и `slippage-estimate`, лежащих в бюджете котировки `p95 ≤ 300 мс`; верхняя — для справочных `GET /v1/networks`, `GET /v1/assets/{assetId}/networks`) |
+    | Ретраи | только для идемпотентных `GET`: **2 попытки**, экспоненциальный backoff + jitter |
+    | Circuit breaker | порог **50 % ошибок на скользящем окне 20 запросов**, состояние `open` — **30 с** |
+
+    ### Поведение circuit breaker
+
+    * **closed** — запросы идут в S7 нормально; счётчик считает ошибки (5xx, таймаут,
+      сетевой сбой) на окне из последних 20 запросов.
+    * **open** — при достижении 50 % ошибок на окне брейкер размыкается на 30 с. В течение
+      этих 30 с BFF **вообще не ходит в S7**: мгновенно берёт кеш или дефолты и ставит
+      `degraded: true`. Это защита от каскадного отказа (канон §11) — время ответа BFF
+      не деградирует на величину таймаута S7.
+    * **half-open** — по истечении 30 с пропускается один пробный запрос; успех закрывает
+      брейкер, ошибка снова открывает его на 30 с.
+
+    ## Кеш и допустимость stale
+
+    | Данные | TTL | Допустимость stale |
+    |---|---|---|
+    | `orderbook-summary` | 1 с | **да**, до 10 с; дальше — работаем на дефолтах с `degraded: true` |
+    | `liquidity` | 5 с | **да**, до 60 с |
+    | `slippage-estimate` | 2 с (ключ кеша: `pairId` + `amount` + `side`) | **да**, до 30 с |
+    | `networks`, `networks/{network}` | 30 с | **да**, до 15 мин — статус сети меняется медленно |
+    | `assets/{assetId}/networks` | 5 мин (справочник, ср. §11 «Список активов и пар») | **да**, stale-while-revalidate, без ограничения по возрасту |
+
+    Правило §11 «Курсы: отдаём с `degraded: true` до 10 с, дальше `503`» к S7 **не применяется**:
+    оно относится к S5 (`Blocking`). У S7 нет исхода `503` наружу вообще.
+
+    ## Поведение при недоступности
+
+    | Ситуация | Реакция BFF | Что видит пользователь |
+    |---|---|---|
+    | Таймаут / 5xx / брейкер `open` | берём кеш; если кеша нет — дефолты (`slippagePercent = "0"`, `confidence = LOW`) | котировку с `degraded: true`, заявка **создаётся** |
+    | `404 MARKET_NOT_FOUND` при живом кеше | кеш, деградация | котировку с `degraded: true` |
+    | `404 MARKET_NOT_FOUND` без кеша | сигнал в оркестратор как справочный; решение о паре остаётся за **S4** (шаг 5, `PAIR_NOT_SUPPORTED`) | либо нормальную котировку, либо `PAIR_NOT_SUPPORTED` от S4 |
+    | `409 INSUFFICIENT_LIQUIDITY` | **не блокирует**; в котировку добавляется warning | предупреждение, кнопка подтверждения активна |
+    | `429 RATE_LIMITED` | как таймаут — деградация | котировку с `degraded: true` |
+
+    ## PII
+
+    **Персональных данных нет.** Все запросы обезличены: в S7 уходят только идентификаторы
+    рынка/актива/сети и суммы. `userId`, `walletId`, идентификаторы устройств и любые
+    контактные данные в S7 **не передаются и передаваться не должны** — суммы в связке
+    с идентификатором пользователя у внешнего рыночного провайдера создают профиль торговой
+    активности. Единственные сквозные заголовки — технические `X-Correlation-Id`
+    и `X-Request-Id`, они не содержат PII.
+
+  contact:
+    name: Exchange BFF Team
+    email: exchange-bff@wallet.internal
+  license:
+    name: Proprietary (internal use only)
+    identifier: LicenseRef-Wallet-Internal
+
+servers:
+  - url: https://crypto.internal.wallet
+    description: |
+      Продакшн-инстанс криптопровайдера. Полный базовый путь с учётом версии —
+      `https://crypto.internal.wallet/v1`. Доступ только из внутреннего периметра, mTLS обязателен.
+  - url: https://crypto.staging.internal.wallet
+    description: |
+      Staging. Полный базовый путь — `https://crypto.staging.internal.wallet/v1`.
+      Данные ордербука синтетические, статусы сетей переключаются вручную для негативных сценариев.
+  - url: https://crypto.mock.internal.wallet
+    description: |
+      Mock-инстанс для контрактных тестов и локальной разработки. Полный базовый путь —
+      `https://crypto.mock.internal.wallet/v1`. Отдаёт строго фикстуры канона §10.
+
+security:
+  - bearerAuth: []
+
+tags:
+  - name: markets
+    description: |
+      Рыночные данные по торговой паре: сводка ордербука, агрегированная ликвидность
+      по площадкам и оценка проскальзывания для заданной суммы.
+  - name: networks
+    description: |
+      Состояние блокчейн-сетей: загруженность, время подтверждения, высота блока
+      и оценки сетевых комиссий. Используется только для информирования пользователя
+      о сети получения (канон §5.5), не для расчёта комиссии.
+  - name: assets
+    description: |
+      Справочник сетей, поддерживаемых активом: адрес контракта, точность,
+      лимиты ввода-вывода, требование memo.
+
+paths:
+
+  /v1/markets/{pairId}/orderbook-summary:
+    get:
+      operationId: getOrderBookSummary
+      summary: Order book summary for a market
+      tags: [markets]
+      description: |
+        Возвращает сжатую сводку биржевого стакана по паре: лучшие цены, середину рынка,
+        спред в базисных пунктах и агрегированную глубину по нескольким ценовым уровням.
+
+        **Зачем нужно.** Спред и глубина — вход для оценки исполнимости (пункт «а» в описании
+        сервиса). Если ликвидность на верхних уровнях мала, BFF добавляет в котировку warning,
+        но заявку **не блокирует** — S7 класса `Degradable`.
+
+        **Идемпотентность и ретраи.** Чистое чтение без побочных эффектов. Разрешены
+        **2 ретрая** с экспоненциальным backoff + jitter (канон §11).
+
+        **Кеш.** TTL 1 с; допустим stale до 10 с. При недоступности или открытом брейкере
+        BFF использует последний известный снимок и помечает котировку `degraded: true`.
+
+        **Признак `stale` в ответе.** Сам провайдер помечает снимок как устаревший, если
+        соединение с площадкой прервано и данные не обновлялись. `stale: true` **не является
+        ошибкой**: BFF принимает такой ответ, но обязан выставить `degraded: true` в котировке.
+      parameters:
+        - $ref: '#/components/parameters/PairIdPath'
+        - $ref: '#/components/parameters/DepthLevelsQuery'
+        - $ref: '#/components/parameters/VenueQuery'
+        - $ref: '#/components/parameters/CorrelationIdHeader'
+        - $ref: '#/components/parameters/RequestIdHeader'
+      responses:
+        '200':
+          description: Сводка ордербука получена.
+          headers:
+            X-Correlation-Id:
+              $ref: '#/components/headers/XCorrelationId'
+            X-Request-Id:
+              $ref: '#/components/headers/XRequestId'
+            X-RateLimit-Remaining:
+              $ref: '#/components/headers/XRateLimitRemaining'
+            Cache-Control:
+              $ref: '#/components/headers/CacheControl'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OrderBookSummary'
+              examples:
+                fresh:
+                  $ref: '#/components/examples/OrderBookSummaryFresh'
+                staleSnapshot:
+                  $ref: '#/components/examples/OrderBookSummaryStale'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/MarketNotFound'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/UpstreamVenueUnavailable'
+        '504':
+          $ref: '#/components/responses/GatewayTimeout'
+
+  /v1/markets/{pairId}/liquidity:
+    get:
+      operationId: getMarketLiquidity
+      summary: Aggregated liquidity across venues
+      tags: [markets]
+      description: |
+        Возвращает агрегированную по торговым площадкам ликвидность для пары: сколько
+        доступно на каждой площадке, какую долю она даёт, какова латентность и статус
+        подключения к ней.
+
+        **Зачем нужно.** Позволяет BFF отличить «рынка нет вообще» от «рынок есть, но одна
+        площадка отвалилась». Во втором случае деградация мягкая: агрегат остаётся валидным,
+        просто уже́, и котировка строится по нему.
+
+        **Кеш.** TTL 5 с; допустим stale до 60 с. Ликвидность меняется медленнее ордербука,
+        поэтому окно допустимого устаревания шире.
+
+        **Никогда не блокирует.** Даже пустой массив `venues` не приводит к отказу в создании
+        заявки — только к `degraded: true` и предупреждению в котировке.
+      parameters:
+        - $ref: '#/components/parameters/PairIdPath'
+        - $ref: '#/components/parameters/CorrelationIdHeader'
+        - $ref: '#/components/parameters/RequestIdHeader'
+      responses:
+        '200':
+          description: Агрегированная ликвидность получена.
+          headers:
+            X-Correlation-Id:
+              $ref: '#/components/headers/XCorrelationId'
+            X-Request-Id:
+              $ref: '#/components/headers/XRequestId'
+            Cache-Control:
+              $ref: '#/components/headers/CacheControl'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MarketLiquidity'
+              examples:
+                healthy:
+                  $ref: '#/components/examples/MarketLiquidityHealthy'
+                degradedVenue:
+                  $ref: '#/components/examples/MarketLiquidityDegraded'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/MarketNotFound'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/UpstreamVenueUnavailable'
+        '504':
+          $ref: '#/components/responses/GatewayTimeout'
+
+  /v1/markets/{pairId}/slippage-estimate:
+    get:
+      operationId: getSlippageEstimate
+      summary: Slippage estimate for a given amount
+      tags: [markets]
+      description: |
+        Возвращает оценку проскальзывания при исполнении заданной суммы на заданной стороне
+        рынка: ожидаемую цену исполнения, отклонение от референсной цены, худший сценарий,
+        вероятность полного заполнения и рекомендованный максимум.
+
+        ## Почему это `GET`, а не `POST`
+
+        Вопрос закономерный: у ресурса есть параметры (`amount`, `side`), и рефлекс подсказывает
+        «раз есть входные данные — значит `POST`». Здесь `GET` выбран сознательно, по четырём
+        причинам:
+
+        1. **Побочных эффектов нет.** Расчёт ничего не создаёт, не резервирует и не меняет
+           состояние ни у нас, ни у провайдера. Это чистая функция от снимка ордербука.
+           `POST` в REST означает «создай ресурс или выполни небезопасное действие» —
+           здесь не происходит ни того, ни другого. Ресурсность соблюдена: `slippage-estimate` —
+           это *производный ресурс рынка*, а не действие (`/calculate-slippage` было бы RPC).
+        2. **Идемпотентность и безопасность → ретраи разрешены.** Канон §11 разрешает
+           **2 ретрая с backoff + jitter «только для идемпотентных `GET`»**. Сделав этот вызов
+           `POST`, мы бы своими руками лишили себя ретраев на пути, где они безопасны
+           и полезны — в бюджете котировки `p95 ≤ 300 мс` (§11) второй шанс за счёт jitter
+           часто спасает от деградации.
+        3. **Кешируемость.** Ответ кешируется по URL: ключ `pairId + amount + side` виден
+           прокси, CDN и HTTP-кешу BFF без разбора тела. TTL 2 с, допустим stale до 30 с.
+           Тело `POST` по умолчанию не кешируется, и весь механизм пришлось бы строить руками.
+        4. **Наблюдаемость.** Параметры видны в логах, трассировках и метриках как часть URL,
+           что критично при разборе инцидентов деградации.
+
+        **Ограничение подхода** (честно фиксируем): длина URL конечна, и очень большие наборы
+        параметров в `GET` не помещаются. Здесь параметров три, все короткие — ограничение
+        неактуально.
+
+        ## Как результат влияет на заявку
+
+        Никак не блокирует. `confidence: LOW`, `partialFillRisk: true` или высокий
+        `slippageBps` дают **предупреждение** в котировке. Отсутствие ответа S7 даёт
+        `degraded: true`. В обоих случаях заявка создаётся.
+
+        **Формат сумм.** `amount` — строка по канону §5.1, `^(0|[1-9]\d{0,18})(\.\d{1,18})?$`.
+        Передача `amount` числом с плавающей точкой — дефект (канон §5.1: «двоичные
+        `float`/`double` запрещены на всём пути»).
+      parameters:
+        - $ref: '#/components/parameters/PairIdPath'
+        - $ref: '#/components/parameters/AmountQuery'
+        - $ref: '#/components/parameters/SideQuery'
+        - $ref: '#/components/parameters/CorrelationIdHeader'
+        - $ref: '#/components/parameters/RequestIdHeader'
+      responses:
+        '200':
+          description: Оценка проскальзывания рассчитана.
+          headers:
+            X-Correlation-Id:
+              $ref: '#/components/headers/XCorrelationId'
+            X-Request-Id:
+              $ref: '#/components/headers/XRequestId'
+            Cache-Control:
+              $ref: '#/components/headers/CacheControl'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SlippageEstimate'
+              examples:
+                smallAmountHighConfidence:
+                  $ref: '#/components/examples/SlippageEstimateSmall'
+                largeAmountLowConfidence:
+                  $ref: '#/components/examples/SlippageEstimateLarge'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/MarketNotFound'
+        '409':
+          $ref: '#/components/responses/InsufficientLiquidity'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/UpstreamVenueUnavailable'
+        '504':
+          $ref: '#/components/responses/GatewayTimeout'
+
+  /v1/networks:
+    get:
+      operationId: listNetworks
+      summary: List blockchain network statuses
+      tags: [networks]
+      description: |
+        Возвращает список всех известных провайдеру блокчейн-сетей с их текущим состоянием.
+
+        **Зачем нужно.** Пункт «б» назначения сервиса: показать пользователю, в какой сети
+        он получит крипто-актив, и предупредить, если сеть перегружена. Обмен внутренний
+        (канон §5.5), `networkFee = "0"`, поэтому `feeEstimates` носит **справочный**
+        характер — это ориентир будущей стоимости вывода, а не часть расчёта текущей заявки.
+
+        **Кеш.** TTL 30 с; допустим stale до 15 мин. Статус сети — медленно меняющаяся
+        величина, устаревшие данные здесь безопаснее, чем отсутствие данных.
+
+        **Статус `HALTED` не блокирует обмен.** Внутренний обмен не требует ончейн-транзакции,
+        поэтому остановка сети не мешает создать заявку. Пользователю показывается
+        предупреждение о том, что вывод в эту сеть может быть недоступен.
+      parameters:
+        - $ref: '#/components/parameters/NetworkStatusFilterQuery'
+        - $ref: '#/components/parameters/CorrelationIdHeader'
+        - $ref: '#/components/parameters/RequestIdHeader'
+      responses:
+        '200':
+          description: Список сетей получен.
+          headers:
+            X-Correlation-Id:
+              $ref: '#/components/headers/XCorrelationId'
+            X-Request-Id:
+              $ref: '#/components/headers/XRequestId'
+            Cache-Control:
+              $ref: '#/components/headers/CacheControl'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/NetworkStatusList'
+              examples:
+                allNetworks:
+                  $ref: '#/components/examples/NetworkStatusListAll'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/UpstreamVenueUnavailable'
+        '504':
+          $ref: '#/components/responses/GatewayTimeout'
+
+  /v1/networks/{network}:
+    get:
+      operationId: getNetwork
+      summary: Blockchain network status
+      tags: [networks]
+      description: |
+        Возвращает состояние одной блокчейн-сети. Используется, когда пользователь выбрал
+        конкретный крипто-актив и BFF показывает строку `Network` в Exchange Summary
+        (`USDT@TRON`) вместе с индикатором загруженности.
+
+        **Кеш и деградация** — как у `GET /v1/networks`: TTL 30 с, stale до 15 мин.
+        При отсутствии данных строка `Network` показывается без индикатора загруженности;
+        это не повод отказывать в заявке.
+      parameters:
+        - $ref: '#/components/parameters/NetworkPath'
+        - $ref: '#/components/parameters/CorrelationIdHeader'
+        - $ref: '#/components/parameters/RequestIdHeader'
+      responses:
+        '200':
+          description: Состояние сети получено.
+          headers:
+            X-Correlation-Id:
+              $ref: '#/components/headers/XCorrelationId'
+            X-Request-Id:
+              $ref: '#/components/headers/XRequestId'
+            Cache-Control:
+              $ref: '#/components/headers/CacheControl'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/NetworkStatus'
+              examples:
+                tronOperational:
+                  $ref: '#/components/examples/NetworkStatusTron'
+                ethereumCongested:
+                  $ref: '#/components/examples/NetworkStatusEthereum'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NetworkNotFound'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/UpstreamVenueUnavailable'
+        '504':
+          $ref: '#/components/responses/GatewayTimeout'
+
+  /v1/assets/{assetId}/networks:
+    get:
+      operationId: listAssetNetworks
+      summary: Networks supported by an asset
+      tags: [assets]
+      description: |
+        Возвращает список сетей, в которых существует данный крипто-актив, с параметрами
+        каждой сети: адрес контракта, точность, лимиты и признаки доступности ввода-вывода.
+
+        **Зачем нужно.** Канон §2: `USDT@TRON` и `USDT@ETHEREUM` — **разные балансы**.
+        Этот справочник подтверждает, какие связки «актив + сеть» вообще существуют, и питает
+        строку `Network` в Exchange Summary (канон §5.5, пункт 2: «при последующем выводе
+        средств сеть определяет реальную стоимость — пользователь должен осознавать выбор
+        уже на этапе обмена»).
+
+        **Важно про `minWithdrawal` / `maxWithdrawal` / `withdrawalFee`.** Это параметры
+        **вывода**, а не обмена. К текущей заявке они **не применяются**: обмен внутренний,
+        ончейн-транзакции нет, `networkFee = "0"` (канон §5.5). Лимиты суммы обмена берутся
+        из **S4** (шаги 11–12 цепочки §6, коды `AMOUNT_BELOW_MINIMUM` / `AMOUNT_ABOVE_MAXIMUM`).
+        Смешивать эти два набора лимитов — дефект.
+
+        **Для фиатных активов** (`RUB`, `EUR`) ответ содержит пустой массив `networks`:
+        у фиата сети нет (канон §4.1: `network` обязателен только для `CRYPTO`).
+
+        **Кеш.** TTL 5 мин, stale-while-revalidate без ограничения по возрасту — согласовано
+        с §11 («Список активов и пар: 5 мин, отдаём устаревший»).
+      parameters:
+        - $ref: '#/components/parameters/AssetIdPath'
+        - $ref: '#/components/parameters/EnabledOnlyQuery'
+        - $ref: '#/components/parameters/CorrelationIdHeader'
+        - $ref: '#/components/parameters/RequestIdHeader'
+      responses:
+        '200':
+          description: Список сетей актива получен.
+          headers:
+            X-Correlation-Id:
+              $ref: '#/components/headers/XCorrelationId'
+            X-Request-Id:
+              $ref: '#/components/headers/XRequestId'
+            Cache-Control:
+              $ref: '#/components/headers/CacheControl'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AssetNetworkList'
+              examples:
+                usdtNetworks:
+                  $ref: '#/components/examples/AssetNetworkListUsdt'
+                fiatNoNetworks:
+                  $ref: '#/components/examples/AssetNetworkListFiat'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/AssetNotFound'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/UpstreamVenueUnavailable'
+        '504':
+          $ref: '#/components/responses/GatewayTimeout'
+
+components:
+
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: |
+        **Service-to-service JWT.** BFF предъявляет короткоживущий машинный токен
+        (`Authorization: Bearer <jwt>`), выпущенный внутренним сервисом идентификации.
+        Токен подписан `RS256`, живёт 300 с, обязательные клеймы: `iss` (издатель),
+        `sub` (`svc:exchange-bff`), `aud` (`svc:crypto-provider`), `exp`, `iat`, `jti`.
+        Токен пользователя (`X-User-Id`, пользовательский JWT) в S7 **не передаётся** —
+        см. раздел PII в `info.description`.
+
+        **mTLS.** Поверх JWT канал защищён взаимным TLS: обе стороны предъявляют
+        сертификаты внутреннего PKI, TLS 1.3, проверка SAN по имени сервиса. JWT отвечает
+        за «кто вызывает», mTLS — за «откуда вызывают»; ни один из механизмов не заменяет
+        другой. Запрос без валидного клиентского сертификата отбрасывается на границе
+        периметра и до приложения не доходит.
+
+  headers:
+    XCorrelationId:
+      description: |
+        Сквозной идентификатор бизнес-операции (канон §9). Провайдер обязан вернуть
+        то же значение, которое пришло в запросе.
+      required: true
+      schema:
+        $ref: '#/components/schemas/CorrelationId'
+    XRequestId:
+      description: |
+        Идентификатор конкретного HTTP-вызова. В отличие от `X-Correlation-Id`
+        меняется на каждой попытке, включая ретраи, — по нему различают повторы.
+      required: true
+      schema:
+        $ref: '#/components/schemas/Uuid'
+    XRateLimitRemaining:
+      description: Сколько запросов осталось в текущем окне лимитирования.
+      required: false
+      schema:
+        type: integer
+        minimum: 0
+        maximum: 100000
+        description: Остаток квоты запросов.
+        examples: [4871]
+    RetryAfter:
+      description: |
+        Через сколько секунд имеет смысл повторить запрос. BFF использует значение как
+        нижнюю границу backoff, но **не блокирует** на нём пользовательский путь —
+        S7 деградируемый.
+      required: false
+      schema:
+        type: integer
+        minimum: 0
+        maximum: 3600
+        description: Задержка перед повтором, секунды.
+        examples: [2]
+    CacheControl:
+      description: |
+        Директивы кеширования ответа. Провайдер отдаёт `max-age`, согласованный
+        с таблицей кеша в `info.description`.
+      required: false
+      schema:
+        type: string
+        minLength: 1
+        maxLength: 128
+        description: Значение заголовка `Cache-Control`.
+        examples: ["public, max-age=1, stale-while-revalidate=9"]
+
+  parameters:
+
+    PairIdPath:
+      name: pairId
+      in: path
+      required: true
+      description: |
+        Идентификатор направленной рыночной пары в формате `FROM-TO` (канон §2:
+        пары односторонние, `RUB→USDT` и `USDT→RUB` конфигурируются отдельно).
+        Для крипто-активов сеть в `pairId` не кодируется: рынок общий для всех сетей
+        актива, различие сетей относится к балансам (канон §2), а не к рынку.
+      schema:
+        type: string
+        pattern: '^[A-Z0-9]{2,10}-[A-Z0-9]{2,10}$'
+        minLength: 5
+        maxLength: 21
+        description: Пара в формате `FROM-TO`, оба кода — заглавные латинские буквы и цифры.
+        examples: ["USDT-RUB", "RUB-USDT", "BTC-USDT", "ETH-USDT"]
+
+    NetworkPath:
+      name: network
+      in: path
+      required: true
+      description: Код блокчейн-сети (канон §2, §4.1).
+      schema:
+        $ref: '#/components/schemas/Network'
+
+    AssetIdPath:
+      name: assetId
+      in: path
+      required: true
+      description: |
+        Код актива (канон §4.1). Для фиатных активов (`RUB`, `EUR`) вызов валиден
+        и возвращает пустой список сетей.
+      schema:
+        $ref: '#/components/schemas/AssetId'
+
+    DepthLevelsQuery:
+      name: depthLevels
+      in: query
+      required: false
+      description: |
+        Сколько ценовых уровней вернуть в `bidDepth` и `askDepth`. Значение по умолчанию — 5.
+        Больше уровней — точнее оценка глубины, но выше вес ответа и латентность.
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 50
+        default: 5
+        description: Количество ценовых уровней в каждой стороне стакана.
+        examples: [3, 5, 20]
+
+    VenueQuery:
+      name: venue
+      in: query
+      required: false
+      description: |
+        Ограничить сводку одной торговой площадкой. По умолчанию (параметр опущен)
+        возвращается агрегат по всем подключённым площадкам с `venue: "AGGREGATED"`.
+      schema:
+        $ref: '#/components/schemas/Venue'
+
+    AmountQuery:
+      name: amount
+      in: query
+      required: true
+      description: |
+        Сумма, для которой оценивается проскальзывание, в единицах базового актива пары
+        (`FROM` из `pairId`). **Строка** по канону §5.1 — не число: двоичные `float`/`double`
+        запрещены на всём пути, включая query-параметры.
+      schema:
+        $ref: '#/components/schemas/DecimalString'
+
+    SideQuery:
+      name: side
+      in: query
+      required: true
+      description: |
+        Сторона рынка. `SELL` — мы отдаём базовый актив (движемся по бидам),
+        `BUY` — мы получаем базовый актив (движемся по аскам). Сторона определяет,
+        по какой половине стакана считается заполнение.
+      schema:
+        type: string
+        enum: [BUY, SELL]
+        description: Сторона исполнения относительно базового актива пары.
+        examples: ["SELL", "BUY"]
+
+    NetworkStatusFilterQuery:
+      name: status
+      in: query
+      required: false
+      description: |
+        Отфильтровать список сетей по статусу. Параметр опущен — возвращаются все сети.
+      schema:
+        $ref: '#/components/schemas/NetworkOperationalStatus'
+
+    EnabledOnlyQuery:
+      name: enabledOnly
+      in: query
+      required: false
+      description: |
+        Вернуть только включённые сети (`enabled: true`). По умолчанию `false` —
+        отдаются все, включая выключенные, чтобы BFF мог показать причину недоступности.
+      schema:
+        type: boolean
+        default: false
+        description: Флаг фильтрации по признаку включённости сети.
+        examples: [true, false]
+
+    CorrelationIdHeader:
+      name: X-Correlation-Id
+      in: header
+      required: true
+      description: |
+        Сквозной идентификатор бизнес-операции (канон §9). Один и тот же для всех вызовов
+        в рамках одной попытки создать заявку. Провайдер обязан вернуть его в ответе
+        и во всех ошибках.
+      schema:
+        $ref: '#/components/schemas/CorrelationId'
+
+    RequestIdHeader:
+      name: X-Request-Id
+      in: header
+      required: false
+      description: |
+        Идентификатор конкретной HTTP-попытки. Меняется на каждом ретрае (в отличие
+        от `X-Correlation-Id`), что позволяет провайдеру и нам различать повторы
+        в логах при разборе деградации.
+      schema:
+        $ref: '#/components/schemas/Uuid'
+
+  schemas:
+
+    DecimalString:
+      type: string
+      pattern: '^(0|[1-9]\d{0,18})(\.\d{1,18})?$'
+      minLength: 1
+      maxLength: 40
+      description: |
+        Неотрицательная десятичная величина в строковом виде (канон §5.1). Двоичные
+        `float`/`double` запрещены на всём пути: API, BFF, состояние фронтенда, отображение.
+        Ведущие нули запрещены, кроме единственного `0` в целой части.
+      examples: ["93.60", "94.00", "0.010638297872", "135.270000", "0"]
+
+    Timestamp:
+      type: string
+      format: date-time
+      pattern: '^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$'
+      minLength: 24
+      maxLength: 24
+      description: |
+        Момент времени в ISO-8601 UTC с миллисекундами и суффиксом `Z` (канон §9).
+        Смещения, отличные от `Z`, и запись без миллисекунд запрещены.
+      examples: ["2026-08-07T10:15:32.117Z"]
+
+    Uuid:
+      type: string
+      format: uuid
+      pattern: '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+      minLength: 36
+      maxLength: 36
+      description: Идентификатор в формате UUID (нижний регистр, каноническая запись).
+      examples: ["6f1a1c2e-9b3d-4a5f-8c7e-1d2b3a4c5d6e"]
+
+    CorrelationId:
+      type: string
+      pattern: '^[0-9A-HJKMNP-TV-Z]{26}$'
+      minLength: 26
+      maxLength: 26
+      description: |
+        Сквозной идентификатор операции в формате ULID (канон §7: пример
+        `"01J9X2C4K7QF8N3M5T6V7W8Y9Z"`). Кодировка Crockford Base32: нет символов `I`, `L`,
+        `O`, `U`.
+      examples: ["01J9X2C4K7QF8N3M5T6V7W8Y9Z"]
+
+    AssetId:
+      type: string
+      pattern: '^[A-Z0-9]{2,10}$'
+      minLength: 2
+      maxLength: 10
+      description: |
+        Код актива (канон §4.1). Уникален в пределах кошелька в связке с `network`.
+      examples: ["USDT", "BTC", "ETH", "RUB", "EUR"]
+
+    Network:
+      type: string
+      enum: [TRON, ETHEREUM, BITCOIN]
+      description: |
+        Блокчейн-сеть крипто-актива (канон §2, §4.1). Перечень закрыт: расширение
+        требует изменения канона.
+      examples: ["TRON", "ETHEREUM", "BITCOIN"]
+
+    Venue:
+      type: string
+      enum: [AGGREGATED, BINANCE, OKX, BYBIT, KRAKEN, INTERNAL]
+      description: |
+        Торговая площадка — источник данных. `AGGREGATED` — сводка по всем подключённым
+        площадкам. `INTERNAL` — наша внутренняя книга заявок.
+      examples: ["AGGREGATED", "BINANCE", "INTERNAL"]
+
+    Percent:
+      type: string
+      pattern: '^(0|[1-9]\d{0,18})(\.\d{1,18})?$'
+      minLength: 1
+      maxLength: 24
+      description: |
+        Процентная величина в строковом виде: `"0.35"` означает 0.35 %. Строка, а не число,
+        по тем же правилам канона §5.1 — процент участвует в денежных расчётах
+        (канон §5.3, шаг 2: `feeRaw = fromAmount × percent / 100`).
+      examples: ["0.35", "42.5", "100", "0"]
+
+    Probability:
+      type: string
+      pattern: '^(0(\.\d{1,6})?|1(\.0{1,6})?)$'
+      minLength: 1
+      maxLength: 8
+      description: |
+        Вероятность в диапазоне 0..1 включительно, строкой. Строковое представление выбрано
+        для единообразия с денежными величинами и чтобы избежать двоичного округления
+        при сравнении с порогом.
+      examples: ["0.99", "0.735", "1", "0"]
+
+    # ---------- markets ----------
+
+    OrderBookLevel:
+      type: object
+      description: |
+        Один ценовой уровень биржевого стакана. Уровни в массиве упорядочены от лучшей цены
+        к худшей: биды — по убыванию цены, аски — по возрастанию.
+      additionalProperties: false
+      required: [price, quantity, cumulativeQuantity]
+      properties:
+        price:
+          $ref: '#/components/schemas/DecimalString'
+          description: |
+            Цена уровня — сколько единиц котируемого актива (`TO`) за одну единицу
+            базового (`FROM`). Направление совпадает с определением `rate` в каноне §5.2.
+          examples: ["93.60", "93.55"]
+        quantity:
+          $ref: '#/components/schemas/DecimalString'
+          description: Объём на этом уровне, в единицах базового актива.
+          examples: ["5000.000000", "12000.000000"]
+        cumulativeQuantity:
+          $ref: '#/components/schemas/DecimalString'
+          description: |
+            Накопленный объём от лучшей цены до этого уровня включительно.
+            Монотонно не убывает вдоль массива.
+          examples: ["5000.000000", "17000.000000"]
+
+    OrderBookSummary:
+      type: object
+      description: |
+        Сводка биржевого стакана по паре на момент `snapshotAt`. Все цены — строки
+        (канон §5.1).
+      additionalProperties: false
+      required:
+        [pairId, venue, bestBid, bestAsk, midPrice, spreadBps, depthLevels,
+         bidDepth, askDepth, totalBidVolume, totalAskVolume, snapshotAt, sequence, stale]
+      properties:
+        pairId:
+          type: string
+          pattern: '^[A-Z0-9]{2,10}-[A-Z0-9]{2,10}$'
+          minLength: 5
+          maxLength: 21
+          description: Пара, к которой относится сводка. Эхо параметра пути.
+          examples: ["USDT-RUB"]
+        venue:
+          $ref: '#/components/schemas/Venue'
+          description: |
+            Источник снимка. `AGGREGATED`, если параметр `venue` в запросе не задавался.
+          examples: ["AGGREGATED"]
+        bestBid:
+          $ref: '#/components/schemas/DecimalString'
+          description: |
+            Лучшая цена покупки — столько котируемого актива дадут за 1 единицу базового
+            при продаже прямо сейчас. Соответствует фикстуре канона §10.3: для `USDT→RUB`
+            это `"93.60"`.
+          examples: ["93.60"]
+        bestAsk:
+          $ref: '#/components/schemas/DecimalString'
+          description: |
+            Лучшая цена продажи — столько котируемого актива придётся отдать за 1 единицу
+            базового при покупке. Фикстура §10.3: `RUB→USDT` = `0.010638297872` = `1/94.00`,
+            то есть ask по `USDT-RUB` равен `"94.00"`.
+          examples: ["94.00"]
+        midPrice:
+          $ref: '#/components/schemas/DecimalString'
+          description: |
+            Середина рынка, `(bestBid + bestAsk) / 2`. Справочная величина: курс заявки
+            приходит из **S5**, а не отсюда (канон §6, шаг 10).
+          examples: ["93.80"]
+        spreadBps:
+          type: integer
+          minimum: 0
+          maximum: 100000
+          description: |
+            Спред в базисных пунктах: `(bestAsk − bestBid) / midPrice × 10000`, округление
+            до целого. Целое число, а не строка, — это не денежная величина, а метрика
+            (канон §5.1 допускает `Number` для не-денежных значений). Для фикстуры §10.3:
+            `(94.00 − 93.60) / 93.80 × 10000 ≈ 43`.
+          examples: [43, 9, 250]
+        depthLevels:
+          type: integer
+          minimum: 0
+          maximum: 50
+          description: |
+            Фактическое количество ценовых уровней в каждой стороне. Может быть меньше
+            запрошенного `depthLevels`, если стакан тоньше.
+          examples: [3, 5]
+        bidDepth:
+          type: array
+          minItems: 0
+          maxItems: 50
+          description: |
+            Уровни на стороне покупки, от лучшей цены (наибольшей) к худшей.
+          items:
+            $ref: '#/components/schemas/OrderBookLevel'
+        askDepth:
+          type: array
+          minItems: 0
+          maxItems: 50
+          description: |
+            Уровни на стороне продажи, от лучшей цены (наименьшей) к худшей.
+          items:
+            $ref: '#/components/schemas/OrderBookLevel'
+        totalBidVolume:
+          $ref: '#/components/schemas/DecimalString'
+          description: |
+            Суммарный объём по всем возвращённым бидам — равен `cumulativeQuantity`
+            последнего элемента `bidDepth`.
+          examples: ["47000.000000"]
+        totalAskVolume:
+          $ref: '#/components/schemas/DecimalString'
+          description: |
+            Суммарный объём по всем возвращённым аскам — равен `cumulativeQuantity`
+            последнего элемента `askDepth`.
+          examples: ["41800.000000"]
+        snapshotAt:
+          $ref: '#/components/schemas/Timestamp'
+          description: |
+            Момент, на который сделан снимок стакана. BFF сравнивает его с текущим временем:
+            возраст свыше 10 с → котировка помечается `degraded: true`.
+          examples: ["2026-08-07T10:15:32.117Z"]
+        sequence:
+          type: integer
+          format: int64
+          minimum: 0
+          maximum: 9223372036854775807
+          description: |
+            Монотонно возрастающий номер снимка у площадки. Позволяет отбросить
+            пришедший не по порядку ответ: снимок с меньшим `sequence`, чем уже
+            обработанный, игнорируется.
+          examples: [918273645]
+        stale:
+          type: boolean
+          description: |
+            Признак того, что провайдер отдал устаревший снимок: соединение с площадкой
+            прервано и данные не обновлялись. **Не ошибка** — ответ принимается,
+            но BFF обязан выставить `degraded: true` в котировке.
+          examples: [false, true]
+
+    LiquidityVenue:
+      type: object
+      description: Ликвидность и состояние подключения одной торговой площадки.
+      additionalProperties: false
+      required: [venue, available, share, latencyMs, status]
+      properties:
+        venue:
+          $ref: '#/components/schemas/Venue'
+          description: Площадка, к которой относится строка.
+          examples: ["BINANCE"]
+        available:
+          $ref: '#/components/schemas/DecimalString'
+          description: |
+            Доступный объём на площадке, в единицах базового актива пары.
+          examples: ["28000.000000"]
+        share:
+          $ref: '#/components/schemas/Percent'
+          description: |
+            Доля площадки в агрегированной ликвидности, в процентах, строкой
+            (`"59.57"` = 59.57 %). Сумма `share` по всем площадкам со статусом
+            `CONNECTED` равна `"100"` с точностью до округления последнего знака.
+          examples: ["59.57", "25.53"]
+        latencyMs:
+          type: integer
+          minimum: 0
+          maximum: 60000
+          description: |
+            Наблюдаемая провайдером задержка до площадки, миллисекунды. Не денежная
+            величина — допустимо целое число.
+          examples: [42, 187]
+        status:
+          type: string
+          enum: [CONNECTED, DEGRADED, DISCONNECTED]
+          description: |
+            Состояние подключения к площадке. `DEGRADED` — данные приходят с задержкой
+            или частично; `DISCONNECTED` — площадка исключена из агрегата, её `available`
+            равен `"0"`, а `share` — `"0"`.
+          examples: ["CONNECTED", "DEGRADED", "DISCONNECTED"]
+
+    MarketLiquidity:
+      type: object
+      description: |
+        Агрегированная по площадкам ликвидность пары. Пустой `venues` — валидный ответ,
+        означающий полное отсутствие подключённых источников; заявку он **не блокирует**,
+        только приводит к `degraded: true`.
+      additionalProperties: false
+      required: [pairId, venues, aggregatedDepth, updatedAt]
+      properties:
+        pairId:
+          type: string
+          pattern: '^[A-Z0-9]{2,10}-[A-Z0-9]{2,10}$'
+          minLength: 5
+          maxLength: 21
+          description: Пара, к которой относится агрегат. Эхо параметра пути.
+          examples: ["USDT-RUB"]
+        venues:
+          type: array
+          minItems: 0
+          maxItems: 32
+          description: |
+            Построчная разбивка по площадкам, отсортированная по убыванию `share`.
+          items:
+            $ref: '#/components/schemas/LiquidityVenue'
+        aggregatedDepth:
+          $ref: '#/components/schemas/DecimalString'
+          description: |
+            Суммарная доступная глубина по всем площадкам со статусом `CONNECTED`
+            и `DEGRADED`, в единицах базового актива. Площадки в статусе `DISCONNECTED`
+            в сумму не входят.
+          examples: ["47000.000000"]
+        updatedAt:
+          $ref: '#/components/schemas/Timestamp'
+          description: |
+            Момент последнего пересчёта агрегата. Возраст свыше 60 с → BFF считает данные
+            непригодными и переходит на дефолты с `degraded: true`.
+          examples: ["2026-08-07T10:15:31.980Z"]
+
+    SlippageEstimate:
+      type: object
+      description: |
+        Оценка проскальзывания для конкретной суммы и стороны рынка. Результат носит
+        **информационный** характер: он не блокирует создание заявки ни при каком значении
+        полей (S7 — `Degradable`, канон §3).
+      additionalProperties: false
+      required:
+        [pairId, side, requestedAmount, expectedFillPrice, referencePrice, slippagePercent,
+         slippageBps, worstCasePrice, fillProbability, partialFillRisk, recommendedMaxAmount,
+         confidence, calculatedAt]
+      properties:
+        pairId:
+          type: string
+          pattern: '^[A-Z0-9]{2,10}-[A-Z0-9]{2,10}$'
+          minLength: 5
+          maxLength: 21
+          description: Пара, для которой выполнен расчёт. Эхо параметра пути.
+          examples: ["USDT-RUB"]
+        side:
+          type: string
+          enum: [BUY, SELL]
+          description: Сторона рынка. Эхо query-параметра `side`.
+          examples: ["SELL"]
+        requestedAmount:
+          $ref: '#/components/schemas/DecimalString'
+          description: |
+            Сумма из запроса, эхом. Позволяет сопоставить ответ с запросом при разборе
+            логов и убедиться, что кеш не подменил параметры.
+          examples: ["135.270000"]
+        expectedFillPrice:
+          $ref: '#/components/schemas/DecimalString'
+          description: |
+            Средневзвешенная цена, по которой ожидается исполнение всей суммы —
+            результат «прохода» по уровням стакана.
+          examples: ["93.58"]
+        referencePrice:
+          $ref: '#/components/schemas/DecimalString'
+          description: |
+            Референсная цена, относительно которой считается проскальзывание: для `SELL` —
+            `bestBid`, для `BUY` — `bestAsk`. Фикстура §10.3: `USDT→RUB` = `"93.60"`.
+          examples: ["93.60"]
+        slippagePercent:
+          $ref: '#/components/schemas/Percent'
+          description: |
+            Проскальзывание в процентах: `|referencePrice − expectedFillPrice| /
+            referencePrice × 100`. Строка (канон §5.1) — величина участвует в сравнениях
+            с денежными порогами.
+          examples: ["0.021368", "1.240000"]
+        slippageBps:
+          type: integer
+          minimum: 0
+          maximum: 100000
+          description: |
+            То же проскальзывание в базисных пунктах, округление до целого. Целое, а не
+            строка: метрика для порогов и алертов, не денежная величина.
+          examples: [2, 124]
+        worstCasePrice:
+          $ref: '#/components/schemas/DecimalString'
+          description: |
+            Цена последнего затронутого уровня — худшая цена, по которой пройдёт хвост
+            объёма. Разрыв между `expectedFillPrice` и `worstCasePrice` показывает,
+            насколько «рваный» стакан.
+          examples: ["93.55"]
+        fillProbability:
+          $ref: '#/components/schemas/Probability'
+          description: |
+            Оценка вероятности полного заполнения суммы в пределах видимой глубины,
+            значение 0..1 строкой.
+          examples: ["0.99", "0.62"]
+        partialFillRisk:
+          type: boolean
+          description: |
+            `true`, если видимой глубины не хватает на всю сумму и вероятно частичное
+            исполнение. Порождает предупреждение в котировке, но **не блокирует** заявку.
+          examples: [false, true]
+        recommendedMaxAmount:
+          $ref: '#/components/schemas/DecimalString'
+          description: |
+            Сумма, при которой проскальзывание остаётся в комфортных пределах.
+            **Не является лимитом заявки**: лимиты суммы приходят из S4 (канон §6,
+            шаги 11–12). Использовать это поле как `maxAmount` — дефект.
+          examples: ["5000.000000"]
+        confidence:
+          type: string
+          enum: [HIGH, MEDIUM, LOW]
+          description: |
+            Достоверность оценки. `HIGH` — свежий полный стакан; `MEDIUM` — часть площадок
+            недоступна; `LOW` — расчёт на устаревших или дефолтных данных. При деградации
+            S7 BFF подставляет собственный дефолт именно с `confidence: LOW`.
+          examples: ["HIGH", "MEDIUM", "LOW"]
+        calculatedAt:
+          $ref: '#/components/schemas/Timestamp'
+          description: Момент расчёта оценки.
+          examples: ["2026-08-07T10:15:32.201Z"]
+
+    # ---------- networks ----------
+
+    NetworkOperationalStatus:
+      type: string
+      enum: [OPERATIONAL, DEGRADED, CONGESTED, HALTED]
+      description: |
+        Операционный статус блокчейн-сети. `OPERATIONAL` — норма; `DEGRADED` — сбои
+        у части нод; `CONGESTED` — сеть работает, но подтверждения замедлены;
+        `HALTED` — сеть остановлена. **Ни один из статусов не блокирует создание заявки**:
+        обмен внутренний (канон §5.5), ончейн-транзакции не выполняются.
+      examples: ["OPERATIONAL", "CONGESTED", "HALTED"]
+
+    CongestionLevel:
+      type: string
+      enum: [LOW, MEDIUM, HIGH, CRITICAL]
+      description: |
+        Уровень загруженности сети — количественная градация внутри статуса.
+        Питает индикатор рядом со строкой `Network` в Exchange Summary.
+      examples: ["LOW", "MEDIUM", "HIGH", "CRITICAL"]
+
+    FeeEstimate:
+      type: object
+      description: |
+        Оценка сетевой комиссии для одного класса скорости. **Справочная величина.**
+        К текущей заявке не применяется: канон §5.5 — обмен внутренний, `networkFee = "0"`.
+        Показывается пользователю как ориентир будущей стоимости вывода.
+      additionalProperties: false
+      required: [speed, feeAmount, feeAsset, estimatedSeconds]
+      properties:
+        speed:
+          type: string
+          enum: [SLOW, STANDARD, FAST]
+          description: Класс скорости подтверждения, за который берётся комиссия.
+          examples: ["STANDARD"]
+        feeAmount:
+          $ref: '#/components/schemas/DecimalString'
+          description: |
+            Размер комиссии в единицах `feeAsset`, строкой (канон §5.1).
+          examples: ["1.100000", "0.00021000"]
+        feeAsset:
+          $ref: '#/components/schemas/AssetId'
+          description: |
+            Актив, в котором взимается комиссия сети — как правило, нативный актив сети
+            (`TRX` для `TRON`, `ETH` для `ETHEREUM`, `BTC` для `BITCOIN`).
+          examples: ["TRX", "ETH", "BTC"]
+        estimatedSeconds:
+          type: integer
+          minimum: 0
+          maximum: 86400
+          description: Ожидаемое время подтверждения при этой комиссии, секунды.
+          examples: [60, 180, 1800]
+
+    NetworkStatus:
+      type: object
+      description: Текущее состояние одной блокчейн-сети.
+      additionalProperties: false
+      required:
+        [network, status, congestionLevel, avgConfirmationSeconds, pendingTxCount,
+         blockHeight, lastBlockAt, feeEstimates, updatedAt]
+      properties:
+        network:
+          $ref: '#/components/schemas/Network'
+          description: Код сети.
+          examples: ["TRON"]
+        status:
+          $ref: '#/components/schemas/NetworkOperationalStatus'
+          description: Операционный статус сети.
+          examples: ["OPERATIONAL"]
+        congestionLevel:
+          $ref: '#/components/schemas/CongestionLevel'
+          description: Уровень загруженности.
+          examples: ["LOW"]
+        avgConfirmationSeconds:
+          type: integer
+          minimum: 0
+          maximum: 86400
+          description: |
+            Среднее наблюдаемое время подтверждения транзакции за последнее окно
+            наблюдения, секунды.
+          examples: [58, 195]
+        pendingTxCount:
+          type: integer
+          format: int64
+          minimum: 0
+          maximum: 9223372036854775807
+          description: Количество транзакций в мемпуле сети.
+          examples: [12480, 184203]
+        blockHeight:
+          type: integer
+          format: int64
+          minimum: 0
+          maximum: 9223372036854775807
+          description: Высота последнего известного провайдеру блока.
+          examples: [67421905]
+        lastBlockAt:
+          $ref: '#/components/schemas/Timestamp'
+          description: |
+            Время последнего блока. Большой разрыв с `updatedAt` — косвенный признак
+            остановки сети даже при `status: OPERATIONAL`.
+          examples: ["2026-08-07T10:15:29.000Z"]
+        feeEstimates:
+          type: array
+          minItems: 0
+          maxItems: 3
+          description: |
+            Оценки комиссии по классам скорости. Справочные (см. `FeeEstimate`).
+            Пустой массив допустим, если провайдер не смог оценить комиссию.
+          items:
+            $ref: '#/components/schemas/FeeEstimate'
+        updatedAt:
+          $ref: '#/components/schemas/Timestamp'
+          description: Момент последнего обновления телеметрии сети у провайдера.
+          examples: ["2026-08-07T10:15:30.412Z"]
+
+    NetworkStatusList:
+      type: object
+      description: Список состояний блокчейн-сетей.
+      additionalProperties: false
+      required: [networks, updatedAt]
+      properties:
+        networks:
+          type: array
+          minItems: 0
+          maxItems: 64
+          description: Состояния сетей, отсортированные по коду сети.
+          items:
+            $ref: '#/components/schemas/NetworkStatus'
+        updatedAt:
+          $ref: '#/components/schemas/Timestamp'
+          description: Момент формирования списка.
+          examples: ["2026-08-07T10:15:30.412Z"]
+
+    # ---------- assets ----------
+
+    AssetNetwork:
+      type: object
+      description: |
+        Параметры одного крипто-актива в одной сети. Канон §2: `USDT@TRON`
+        и `USDT@ETHEREUM` — разные балансы, поэтому у каждой связки свои параметры.
+      additionalProperties: false
+      required:
+        [network, enabled, contractAddress, decimals, minWithdrawal, maxWithdrawal,
+         withdrawalFee, depositEnabled, withdrawalEnabled, requiredConfirmations, memoRequired]
+      properties:
+        network:
+          $ref: '#/components/schemas/Network'
+          description: Сеть, в которой существует актив.
+          examples: ["TRON"]
+        enabled:
+          type: boolean
+          description: |
+            Включена ли связка «актив + сеть» у провайдера в принципе. `false` означает,
+            что связка известна, но выключена — например, на время миграции контракта.
+          examples: [true, false]
+        contractAddress:
+          type: [string, 'null']
+          minLength: 26
+          maxLength: 128
+          description: |
+            Адрес смарт-контракта токена в этой сети. `null` для нативных активов сети
+            (`BTC` в `BITCOIN`, `ETH` в `ETHEREUM`), у которых контракта не существует.
+            Обратите внимание: это `type: [string, 'null']`, а не `nullable` — в OpenAPI
+            3.1 ключевое слово `nullable` отменено (JSON Schema 2020-12).
+          examples: ["TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t", null]
+        decimals:
+          type: integer
+          minimum: 0
+          maximum: 18
+          description: |
+            Точность актива в этой сети (канон §4.1: `RUB`=2, `EUR`=2, `USDT`=6, `BTC`=8,
+            `ETH`=8). Используется для инварианта I5 канона §5.4:
+            `decimals(value) ≤ decimals(asset)`.
+          examples: [6, 8]
+        minWithdrawal:
+          $ref: '#/components/schemas/DecimalString'
+          description: |
+            Минимальная сумма **вывода** в этой сети. **К обмену не применяется**:
+            лимиты суммы обмена приходят из S4 (канон §6, шаг 11, `AMOUNT_BELOW_MINIMUM`).
+          examples: ["10.000000"]
+        maxWithdrawal:
+          $ref: '#/components/schemas/DecimalString'
+          description: |
+            Максимальная сумма **вывода** в этой сети. **К обмену не применяется**:
+            см. S4 и шаг 12 канона §6 (`AMOUNT_ABOVE_MAXIMUM`).
+          examples: ["1000000.000000"]
+        withdrawalFee:
+          $ref: '#/components/schemas/DecimalString'
+          description: |
+            Комиссия за вывод в этой сети. **Не является `networkFee` заявки**: канон §5.5
+            фиксирует `networkFee = "0"` для внутреннего обмена. Поле показывается
+            пользователю как ориентир будущей стоимости вывода.
+          examples: ["1.000000", "0.00020000"]
+        depositEnabled:
+          type: boolean
+          description: Доступен ли ввод средств в этой сети прямо сейчас.
+          examples: [true]
+        withdrawalEnabled:
+          type: boolean
+          description: |
+            Доступен ли вывод средств в этой сети прямо сейчас. `false` **не блокирует**
+            обмен — только вывод.
+          examples: [true, false]
+        requiredConfirmations:
+          type: integer
+          minimum: 0
+          maximum: 1000
+          description: |
+            Число подтверждений сети, после которого провайдер считает транзакцию
+            окончательной.
+          examples: [19, 12, 2]
+        memoRequired:
+          type: boolean
+          description: |
+            Требуется ли memo/tag при переводе в этой сети. Для `TRON`, `ETHEREUM`
+            и `BITCOIN` — `false`; поле сохранено ради совместимости с сетями,
+            где memo обязателен.
+          examples: [false]
+
+    AssetNetworkList:
+      type: object
+      description: |
+        Сети, поддерживаемые активом. Для фиатных активов (`RUB`, `EUR`) массив `networks`
+        пуст: канон §4.1 — `network` обязателен только для `type: CRYPTO`.
+      additionalProperties: false
+      required: [assetId, assetType, networks, updatedAt]
+      properties:
+        assetId:
+          $ref: '#/components/schemas/AssetId'
+          description: Код актива. Эхо параметра пути.
+          examples: ["USDT"]
+        assetType:
+          type: string
+          enum: [FIAT, CRYPTO]
+          description: Тип актива (канон §4.1).
+          examples: ["CRYPTO", "FIAT"]
+        networks:
+          type: array
+          minItems: 0
+          maxItems: 32
+          description: Параметры актива по сетям.
+          items:
+            $ref: '#/components/schemas/AssetNetwork'
+        updatedAt:
+          $ref: '#/components/schemas/Timestamp'
+          description: Момент последнего обновления справочника.
+          examples: ["2026-08-07T09:50:00.000Z"]
+
+    # ---------- errors ----------
+
+    CryptoProviderErrorCode:
+      type: string
+      enum:
+        - MARKET_NOT_FOUND
+        - ASSET_NOT_FOUND
+        - NETWORK_NOT_FOUND
+        - INSUFFICIENT_LIQUIDITY
+        - INVALID_PARAMETER
+        - UNAUTHORIZED
+        - RATE_LIMITED
+        - UPSTREAM_VENUE_ERROR
+        - INTERNAL_ERROR
+      description: |
+        Машиночитаемый код ошибки провайдера. **Маппинг в каталог ошибок канона §7**
+        — ключевая часть контракта. Общее правило класса `Degradable` (канон §3):
+        **ни один код S7 не превращается в отказ пользователю**, если есть кеш или дефолты.
+
+        | Код S7 | HTTP | Маппинг в §7 | Реальное поведение BFF |
+        |---|---|---|---|
+        | `MARKET_NOT_FOUND` | 404 | → `PAIR_NOT_SUPPORTED` (422) | **Но S7 деградируемый: при наличии кеша НЕ пробрасываем.** Решение о поддержке пары принимает S4 на шаге 5 канона §6. Код S7 может лишь подтвердить вердикт S4, но не заменить его. |
+        | `ASSET_NOT_FOUND` | 404 | → `ASSET_NOT_SUPPORTED` (422) | Аналогично: авторитет — S4/конфиг (шаг 3 §6). При кеше не пробрасываем. |
+        | `NETWORK_NOT_FOUND` | 404 | маппинга нет | Строка `Network` показывается без индикатора состояния. Заявка создаётся. |
+        | `INSUFFICIENT_LIQUIDITY` | 409 | **не маппится, НЕ блокирует** | Только warning в котировке. Пользователь видит предупреждение, кнопка подтверждения активна. Отдельного кода §7 нет и не нужно. |
+        | `INVALID_PARAMETER` | 400 | → `VALIDATION_ERROR` (400) | Дефект интеграции на нашей стороне (например, `amount` не по паттерну §5.1). Логируется как ошибка BFF, пользователю — деградация. |
+        | `UNAUTHORIZED` | 401 | маппинга нет | Инфраструктурный сбой (истёк service-JWT, отозван сертификат). Алерт дежурному, пользователю — `degraded: true`. |
+        | `RATE_LIMITED` | 429 | → `RATE_LIMITED` (429), **но не пробрасывается** | Обрабатывается как таймаут: деградация. Наружу 429 от S7 не отдаётся — пользователь не превышал наш лимит. |
+        | `UPSTREAM_VENUE_ERROR` | 503 | **НЕ `503` наружу** | Деградация. Счётчик circuit breaker увеличивается. |
+        | `INTERNAL_ERROR` | 500 | **НЕ `500` наружу** | Деградация. Счётчик circuit breaker увеличивается. |
+
+        Отдельно: **таймаут S7 (800–1000 мс) не даёт `UPSTREAM_TIMEOUT` (504)**. Этот код
+        §7 зарезервирован за блокирующими системами (прежде всего S8). Таймаут S7 =
+        деградация.
+      examples: ["MARKET_NOT_FOUND", "INSUFFICIENT_LIQUIDITY", "UPSTREAM_VENUE_ERROR"]
+
+    CryptoProviderError:
+      type: object
+      description: |
+        Собственный конверт ошибки криптопровайдера. Отличается от нашего внешнего конверта
+        (RFC 9457 Problem Details, канон §7): у каждого внешнего сервиса свой формат,
+        а перевод в `code` каталога §7 выполняет BFF — по таблице в описании
+        `CryptoProviderErrorCode`.
+      additionalProperties: false
+      required: [error, message, traceId, timestamp]
+      properties:
+        error:
+          $ref: '#/components/schemas/CryptoProviderErrorCode'
+          description: Машиночитаемый код. Единственное, по чему допустимо ветвиться.
+          examples: ["MARKET_NOT_FOUND"]
+        message:
+          type: string
+          minLength: 1
+          maxLength: 512
+          description: |
+            Человекочитаемое пояснение на английском. Для логов и разбора инцидентов.
+            Пользователю **никогда** не показывается: он видит только сообщения
+            из каталога §7 либо деградированную котировку.
+          examples: ["Market 'EUR-USDT' is not configured at any connected venue"]
+        traceId:
+          type: string
+          pattern: '^[0-9a-f]{32}$'
+          minLength: 32
+          maxLength: 32
+          description: |
+            Идентификатор трассировки на стороне провайдера (W3C Trace Context, `trace-id`).
+            Логируется рядом с нашим `X-Correlation-Id` для сквозного разбора.
+          examples: ["4bf92f3577b34da6a3ce929d0e0e4736"]
+        timestamp:
+          $ref: '#/components/schemas/Timestamp'
+          description: Момент возникновения ошибки на стороне провайдера.
+          examples: ["2026-08-07T10:15:32.117Z"]
+        details:
+          type: object
+          description: |
+            Структурированный контекст ошибки. Состав зависит от кода: для
+            `INSUFFICIENT_LIQUIDITY` — `requestedAmount` и `availableDepth`, для
+            `INVALID_PARAMETER` — имя параметра. PII не содержит и содержать не должен.
+          additionalProperties: true
+          examples:
+            - { "pairId": "EUR-USDT" }
+            - { "requestedAmount": "500000.000000", "availableDepth": "47000.000000" }
+        retryable:
+          type: boolean
+          description: |
+            Подсказка провайдера, имеет ли смысл повтор. Учитывается вместе с политикой
+            §11 (2 ретрая только для `GET`), но не отменяет её.
+          examples: [false, true]
+
+  responses:
+
+    BadRequest:
+      description: |
+        Некорректные параметры запроса. → `VALIDATION_ERROR` (400) каталога §7, но наружу
+        не пробрасывается: для пользователя это деградация, а для нас — дефект интеграции,
+        требующий алерта.
+      headers:
+        X-Correlation-Id:
+          $ref: '#/components/headers/XCorrelationId'
+        X-Request-Id:
+          $ref: '#/components/headers/XRequestId'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/CryptoProviderError'
+          examples:
+            invalidAmountFormat:
+              $ref: '#/components/examples/ErrorInvalidParameter'
+
+    Unauthorized:
+      description: |
+        Service-JWT отсутствует, просрочен или не проходит проверку `aud`. Маппинга
+        в каталог §7 **нет**: это инфраструктурный сбой, а не бизнес-исход. Реакция —
+        алерт дежурному, для пользователя — `degraded: true`.
+      headers:
+        X-Correlation-Id:
+          $ref: '#/components/headers/XCorrelationId'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/CryptoProviderError'
+          examples:
+            expiredServiceToken:
+              $ref: '#/components/examples/ErrorUnauthorized'
+
+    MarketNotFound:
+      description: |
+        Рынок по указанной паре не найден ни на одной подключённой площадке.
+        → `PAIR_NOT_SUPPORTED` (422) каталога §7 — **но S7 деградируемый**: при наличии
+        кеша ошибка не пробрасывается. Авторитетное решение о поддержке пары принимает
+        S4 на шаге 5 цепочки §6.
+      headers:
+        X-Correlation-Id:
+          $ref: '#/components/headers/XCorrelationId'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/CryptoProviderError'
+          examples:
+            unsupportedPair:
+              $ref: '#/components/examples/ErrorMarketNotFound'
+
+    AssetNotFound:
+      description: |
+        Актив неизвестен провайдеру. → `ASSET_NOT_SUPPORTED` (422) каталога §7, но авторитет
+        по шагу 3 цепочки §6 — S4/конфиг. При наличии кеша не пробрасывается.
+      headers:
+        X-Correlation-Id:
+          $ref: '#/components/headers/XCorrelationId'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/CryptoProviderError'
+          examples:
+            unknownAsset:
+              $ref: '#/components/examples/ErrorAssetNotFound'
+
+    NetworkNotFound:
+      description: |
+        Сеть неизвестна провайдеру. Маппинга в каталог §7 **нет**: строка `Network`
+        показывается без индикатора состояния, заявка создаётся.
+      headers:
+        X-Correlation-Id:
+          $ref: '#/components/headers/XCorrelationId'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/CryptoProviderError'
+          examples:
+            unknownNetwork:
+              $ref: '#/components/examples/ErrorNetworkNotFound'
+
+    InsufficientLiquidity:
+      description: |
+        Видимой глубины не хватает для оценки запрошенной суммы.
+        **НЕ блокирует создание заявки и не маппится ни в один код каталога §7** —
+        превращается в warning внутри котировки. Это прямое следствие класса `Degradable`
+        (канон §3): S7 не стоит ни на одном из 19 шагов цепочки §6.
+      headers:
+        X-Correlation-Id:
+          $ref: '#/components/headers/XCorrelationId'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/CryptoProviderError'
+          examples:
+            thinBook:
+              $ref: '#/components/examples/ErrorInsufficientLiquidity'
+
+    TooManyRequests:
+      description: |
+        Превышен лимит запросов к провайдеру. → формально `RATE_LIMITED` (429) каталога §7,
+        **но наружу не пробрасывается**: лимит превысили мы, а не пользователь. Обрабатывается
+        как таймаут — деградация, `degraded: true`.
+      headers:
+        X-Correlation-Id:
+          $ref: '#/components/headers/XCorrelationId'
+        Retry-After:
+          $ref: '#/components/headers/RetryAfter'
+        X-RateLimit-Remaining:
+          $ref: '#/components/headers/XRateLimitRemaining'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/CryptoProviderError'
+          examples:
+            quotaExceeded:
+              $ref: '#/components/examples/ErrorRateLimited'
+
+    InternalError:
+      description: |
+        Внутренний сбой провайдера. **Наружу `500` НЕ отдаётся.** BFF деградирует:
+        кеш или дефолты, `degraded: true`, заявка создаётся. Счётчик circuit breaker
+        увеличивается (§11: 50 % ошибок на окне 20 запросов → `open` на 30 с).
+      headers:
+        X-Correlation-Id:
+          $ref: '#/components/headers/XCorrelationId'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/CryptoProviderError'
+          examples:
+            providerFailure:
+              $ref: '#/components/examples/ErrorInternal'
+
+    UpstreamVenueUnavailable:
+      description: |
+        Провайдер потерял связь со всеми торговыми площадками. **Наружу `503` НЕ отдаётся** —
+        код `EXCHANGE_SERVICE_UNAVAILABLE` каталога §7 зарезервирован за блокирующими
+        системами. Здесь — деградация: кеш или дефолты, `degraded: true`, заявка создаётся.
+        Счётчик circuit breaker увеличивается.
+      headers:
+        X-Correlation-Id:
+          $ref: '#/components/headers/XCorrelationId'
+        Retry-After:
+          $ref: '#/components/headers/RetryAfter'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/CryptoProviderError'
+          examples:
+            allVenuesDown:
+              $ref: '#/components/examples/ErrorUpstreamVenue'
+
+    GatewayTimeout:
+      description: |
+        Провайдер не ответил в срок на своей стороне. **Наружу `UPSTREAM_TIMEOUT` (504)
+        НЕ отдаётся** — этот код §7 зарезервирован за блокирующими системами (S8).
+        Здесь — деградация, `degraded: true`, заявка создаётся. Счётчик circuit breaker
+        увеличивается.
+      headers:
+        X-Correlation-Id:
+          $ref: '#/components/headers/XCorrelationId'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/CryptoProviderError'
+          examples:
+            venueTimeout:
+              $ref: '#/components/examples/ErrorTimeout'
+
+  examples:
+
+    OrderBookSummaryFresh:
+      summary: Свежий стакан USDT-RUB (фикстуры канона §10.3)
+      description: |
+        Цены выведены из §10.3: `USDT→RUB = 93.60` даёт `bestBid`, а `RUB→USDT =
+        0.010638297872 = 1/94.00` даёт `bestAsk = 94.00`. Спред 0.40 RUB на mid 93.80 —
+        это 43 базисных пункта. Канон §10.3 отмечает, что спред заложен намеренно:
+        он показывает, что курсы приходят из реального источника с bid/ask.
+      value:
+        pairId: "USDT-RUB"
+        venue: "AGGREGATED"
+        bestBid: "93.60"
+        bestAsk: "94.00"
+        midPrice: "93.80"
+        spreadBps: 43
+        depthLevels: 3
+        bidDepth:
+          - price: "93.60"
+            quantity: "5000.000000"
+            cumulativeQuantity: "5000.000000"
+          - price: "93.55"
+            quantity: "12000.000000"
+            cumulativeQuantity: "17000.000000"
+          - price: "93.50"
+            quantity: "30000.000000"
+            cumulativeQuantity: "47000.000000"
+        askDepth:
+          - price: "94.00"
+            quantity: "4800.000000"
+            cumulativeQuantity: "4800.000000"
+          - price: "94.05"
+            quantity: "11000.000000"
+            cumulativeQuantity: "15800.000000"
+          - price: "94.10"
+            quantity: "26000.000000"
+            cumulativeQuantity: "41800.000000"
+        totalBidVolume: "47000.000000"
+        totalAskVolume: "41800.000000"
+        snapshotAt: "2026-08-07T10:15:32.117Z"
+        sequence: 918273645
+        stale: false
+
+    OrderBookSummaryStale:
+      summary: Устаревший снимок — повод для degraded, но не для отказа
+      description: |
+        Провайдер потерял связь с площадками и отдал последний известный снимок с
+        `stale: true`. Возраст `snapshotAt` относительно `updatedAt`-времени BFF превышает
+        10 с. Ответ **принимается**, котировка помечается `degraded: true`, заявка создаётся.
+      value:
+        pairId: "USDT-RUB"
+        venue: "AGGREGATED"
+        bestBid: "93.60"
+        bestAsk: "94.00"
+        midPrice: "93.80"
+        spreadBps: 43
+        depthLevels: 1
+        bidDepth:
+          - price: "93.60"
+            quantity: "5000.000000"
+            cumulativeQuantity: "5000.000000"
+        askDepth:
+          - price: "94.00"
+            quantity: "4800.000000"
+            cumulativeQuantity: "4800.000000"
+        totalBidVolume: "5000.000000"
+        totalAskVolume: "4800.000000"
+        snapshotAt: "2026-08-07T10:14:58.004Z"
+        sequence: 918270011
+        stale: true
+
+    MarketLiquidityHealthy:
+      summary: Все площадки подключены
+      description: |
+        Доли площадок в сумме дают `"100"`. `aggregatedDepth` совпадает с `totalBidVolume`
+        свежего стакана из примера `OrderBookSummaryFresh`.
+      value:
+        pairId: "USDT-RUB"
+        venues:
+          - venue: "BINANCE"
+            available: "28000.000000"
+            share: "59.57"
+            latencyMs: 42
+            status: "CONNECTED"
+          - venue: "OKX"
+            available: "12000.000000"
+            share: "25.53"
+            latencyMs: 68
+            status: "CONNECTED"
+          - venue: "INTERNAL"
+            available: "7000.000000"
+            share: "14.90"
+            latencyMs: 8
+            status: "CONNECTED"
+        aggregatedDepth: "47000.000000"
+        updatedAt: "2026-08-07T10:15:31.980Z"
+
+    MarketLiquidityDegraded:
+      summary: Одна площадка отвалилась — мягкая деградация
+      description: |
+        `OKX` в статусе `DISCONNECTED`: её `available` и `share` обнулены, в `aggregatedDepth`
+        она не входит. Агрегат остался валидным, просто уже́. Заявка создаётся; BFF ставит
+        `degraded: true` из-за сужения ликвидности.
+      value:
+        pairId: "USDT-RUB"
+        venues:
+          - venue: "BINANCE"
+            available: "28000.000000"
+            share: "80.00"
+            latencyMs: 51
+            status: "CONNECTED"
+          - venue: "INTERNAL"
+            available: "7000.000000"
+            share: "20.00"
+            latencyMs: 8
+            status: "DEGRADED"
+          - venue: "OKX"
+            available: "0"
+            share: "0"
+            latencyMs: 0
+            status: "DISCONNECTED"
+        aggregatedDepth: "35000.000000"
+        updatedAt: "2026-08-07T10:15:31.980Z"
+
+    SlippageEstimateSmall:
+      summary: Продажа всего доступного USDT из фикстуры §10.2
+      description: |
+        Сумма `135.270000` — полный доступный баланс `USDT@TRON` из фикстуры канона §10.2.
+        На стакане из `OrderBookSummaryFresh` она полностью помещается в первый уровень
+        (`5000.000000` по `93.60`), поэтому проскальзывание близко к нулю, а уверенность
+        высокая.
+      value:
+        pairId: "USDT-RUB"
+        side: "SELL"
+        requestedAmount: "135.270000"
+        expectedFillPrice: "93.60"
+        referencePrice: "93.60"
+        slippagePercent: "0"
+        slippageBps: 0
+        worstCasePrice: "93.60"
+        fillProbability: "1"
+        partialFillRisk: false
+        recommendedMaxAmount: "5000.000000"
+        confidence: "HIGH"
+        calculatedAt: "2026-08-07T10:15:32.201Z"
+
+    SlippageEstimateLarge:
+      summary: Сумма больше видимой глубины — warning, но не отказ
+      description: |
+        Запрошено `10000.000000` USDT (верхняя граница пары `USDT→RUB` по фикстуре §10.4).
+        Объём выходит за первый уровень стакана: средняя цена исполнения падает до `93.56`,
+        появляется риск частичного заполнения. Заявка при этом **создаётся** — S7
+        класса `Degradable`, пользователь видит предупреждение.
+      value:
+        pairId: "USDT-RUB"
+        side: "SELL"
+        requestedAmount: "10000.000000"
+        expectedFillPrice: "93.56"
+        referencePrice: "93.60"
+        slippagePercent: "0.042735"
+        slippageBps: 4
+        worstCasePrice: "93.50"
+        fillProbability: "0.86"
+        partialFillRisk: true
+        recommendedMaxAmount: "5000.000000"
+        confidence: "MEDIUM"
+        calculatedAt: "2026-08-07T10:15:32.208Z"
+
+    NetworkStatusListAll:
+      summary: Все три сети канона §2
+      description: |
+        Перечень ограничен сетями из канона §2 и §4.1: `TRON`, `ETHEREUM`, `BITCOIN`.
+        `ETHEREUM` показан перегруженным — это не мешает создать заявку на обмен
+        (канон §5.5: обмен внутренний, ончейн-транзакции нет).
+      value:
+        networks:
+          - network: "BITCOIN"
+            status: "OPERATIONAL"
+            congestionLevel: "MEDIUM"
+            avgConfirmationSeconds: 1740
+            pendingTxCount: 24810
+            blockHeight: 921455
+            lastBlockAt: "2026-08-07T10:07:11.000Z"
+            feeEstimates:
+              - speed: "SLOW"
+                feeAmount: "0.00004000"
+                feeAsset: "BTC"
+                estimatedSeconds: 3600
+              - speed: "STANDARD"
+                feeAmount: "0.00008000"
+                feeAsset: "BTC"
+                estimatedSeconds: 1800
+              - speed: "FAST"
+                feeAmount: "0.00021000"
+                feeAsset: "BTC"
+                estimatedSeconds: 600
+            updatedAt: "2026-08-07T10:15:30.412Z"
+          - network: "ETHEREUM"
+            status: "CONGESTED"
+            congestionLevel: "HIGH"
+            avgConfirmationSeconds: 195
+            pendingTxCount: 184203
+            blockHeight: 24118907
+            lastBlockAt: "2026-08-07T10:15:19.000Z"
+            feeEstimates:
+              - speed: "SLOW"
+                feeAmount: "0.00042000"
+                feeAsset: "ETH"
+                estimatedSeconds: 900
+              - speed: "STANDARD"
+                feeAmount: "0.00110000"
+                feeAsset: "ETH"
+                estimatedSeconds: 180
+              - speed: "FAST"
+                feeAmount: "0.00280000"
+                feeAsset: "ETH"
+                estimatedSeconds: 45
+            updatedAt: "2026-08-07T10:15:30.412Z"
+          - network: "TRON"
+            status: "OPERATIONAL"
+            congestionLevel: "LOW"
+            avgConfirmationSeconds: 58
+            pendingTxCount: 12480
+            blockHeight: 67421905
+            lastBlockAt: "2026-08-07T10:15:29.000Z"
+            feeEstimates:
+              - speed: "SLOW"
+                feeAmount: "1.100000"
+                feeAsset: "TRX"
+                estimatedSeconds: 180
+              - speed: "STANDARD"
+                feeAmount: "3.400000"
+                feeAsset: "TRX"
+                estimatedSeconds: 60
+              - speed: "FAST"
+                feeAmount: "8.900000"
+                feeAsset: "TRX"
+                estimatedSeconds: 20
+            updatedAt: "2026-08-07T10:15:30.412Z"
+        updatedAt: "2026-08-07T10:15:30.412Z"
+
+    NetworkStatusTron:
+      summary: TRON в норме — сеть получения USDT по умолчанию
+      description: |
+        Фикстура §10.2 закрепляет за `USDT` сеть `TRON`. Это состояние показывается
+        в строке `Network` Exchange Summary (канон §5.5).
+      value:
+        network: "TRON"
+        status: "OPERATIONAL"
+        congestionLevel: "LOW"
+        avgConfirmationSeconds: 58
+        pendingTxCount: 12480
+        blockHeight: 67421905
+        lastBlockAt: "2026-08-07T10:15:29.000Z"
+        feeEstimates:
+          - speed: "STANDARD"
+            feeAmount: "3.400000"
+            feeAsset: "TRX"
+            estimatedSeconds: 60
+        updatedAt: "2026-08-07T10:15:30.412Z"
+
+    NetworkStatusEthereum:
+      summary: ETHEREUM перегружен — предупреждение, но не блокировка
+      description: |
+        `status: CONGESTED` даёт предупреждение в интерфейсе. Заявку на обмен это
+        не блокирует: канон §5.5, обмен внутренний, `networkFee = "0"`.
+      value:
+        network: "ETHEREUM"
+        status: "CONGESTED"
+        congestionLevel: "HIGH"
+        avgConfirmationSeconds: 195
+        pendingTxCount: 184203
+        blockHeight: 24118907
+        lastBlockAt: "2026-08-07T10:15:19.000Z"
+        feeEstimates:
+          - speed: "STANDARD"
+            feeAmount: "0.00110000"
+            feeAsset: "ETH"
+            estimatedSeconds: 180
+        updatedAt: "2026-08-07T10:15:30.412Z"
+
+    AssetNetworkListUsdt:
+      summary: USDT в двух сетях — разные балансы (канон §2)
+      description: |
+        `USDT@TRON` и `USDT@ETHEREUM` — разные балансы. Фикстура §10.2 держит баланс
+        только в `TRON`; связка с `ETHEREUM` существует и включена, но баланса по ней нет.
+        `decimals: 6` соответствует канону §4.1.
+      value:
+        assetId: "USDT"
+        assetType: "CRYPTO"
+        networks:
+          - network: "TRON"
+            enabled: true
+            contractAddress: "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t"
+            decimals: 6
+            minWithdrawal: "10.000000"
+            maxWithdrawal: "1000000.000000"
+            withdrawalFee: "1.000000"
+            depositEnabled: true
+            withdrawalEnabled: true
+            requiredConfirmations: 19
+            memoRequired: false
+          - network: "ETHEREUM"
+            enabled: true
+            contractAddress: "0xdAC17F958D2ee523a2206206994597C13D831ec7"
+            decimals: 6
+            minWithdrawal: "20.000000"
+            maxWithdrawal: "1000000.000000"
+            withdrawalFee: "9.000000"
+            depositEnabled: true
+            withdrawalEnabled: false
+            requiredConfirmations: 12
+            memoRequired: false
+        updatedAt: "2026-08-07T09:50:00.000Z"
+
+    AssetNetworkListFiat:
+      summary: Фиат — сетей нет
+      description: |
+        Канон §4.1: `network` обязателен только для активов типа `CRYPTO`. Для `RUB`
+        массив `networks` пуст, и это **успешный** ответ, а не `404`.
+      value:
+        assetId: "RUB"
+        assetType: "FIAT"
+        networks: []
+        updatedAt: "2026-08-07T09:50:00.000Z"
+
+    ErrorMarketNotFound:
+      summary: Рынка нет ни на одной площадке → PAIR_NOT_SUPPORTED, но при кеше не пробрасываем
+      description: |
+        Пара `EUR→*` намеренно не поддерживается (канон §10.4). Формальный маппинг —
+        `PAIR_NOT_SUPPORTED` (422), однако авторитетное решение принимает S4 на шаге 5
+        цепочки §6; при наличии кеша S7 эта ошибка не пробрасывается.
+      value:
+        error: "MARKET_NOT_FOUND"
+        message: "Market 'EUR-USDT' is not configured at any connected venue"
+        traceId: "4bf92f3577b34da6a3ce929d0e0e4736"
+        timestamp: "2026-08-07T10:15:32.117Z"
+        details:
+          pairId: "EUR-USDT"
+        retryable: false
+
+    ErrorAssetNotFound:
+      summary: Неизвестный актив → ASSET_NOT_SUPPORTED (авторитет — S4)
+      value:
+        error: "ASSET_NOT_FOUND"
+        message: "Asset 'DOGE' is unknown to the provider"
+        traceId: "a1b2c3d4e5f60718293a4b5c6d7e8f90"
+        timestamp: "2026-08-07T10:15:32.117Z"
+        details:
+          assetId: "DOGE"
+        retryable: false
+
+    ErrorNetworkNotFound:
+      summary: Неизвестная сеть → маппинга в §7 нет
+      value:
+        error: "NETWORK_NOT_FOUND"
+        message: "Network 'SOLANA' is not tracked by the provider"
+        traceId: "b2c3d4e5f60718293a4b5c6d7e8f9012"
+        timestamp: "2026-08-07T10:15:32.117Z"
+        details:
+          network: "SOLANA"
+        retryable: false
+
+    ErrorInsufficientLiquidity:
+      summary: Тонкий стакан → НЕ блокирует, только warning
+      description: |
+        Запрошено больше, чем есть в видимой глубине. Кода каталога §7 для этого нет
+        и не требуется: заявка создаётся, пользователь видит предупреждение.
+      value:
+        error: "INSUFFICIENT_LIQUIDITY"
+        message: "Requested amount exceeds visible depth across all venues"
+        traceId: "c3d4e5f60718293a4b5c6d7e8f901234"
+        timestamp: "2026-08-07T10:15:32.117Z"
+        details:
+          requestedAmount: "500000.000000"
+          availableDepth: "47000.000000"
+        retryable: true
+
+    ErrorInvalidParameter:
+      summary: Сумма передана не по паттерну §5.1 → VALIDATION_ERROR, дефект интеграции
+      value:
+        error: "INVALID_PARAMETER"
+        message: "Query parameter 'amount' must match ^(0|[1-9]\\d{0,18})(\\.\\d{1,18})?$"
+        traceId: "d4e5f60718293a4b5c6d7e8f90123456"
+        timestamp: "2026-08-07T10:15:32.117Z"
+        details:
+          parameter: "amount"
+          received: "1.0e3"
+        retryable: false
+
+    ErrorUnauthorized:
+      summary: Просрочен service-JWT → маппинга нет, алерт дежурному
+      value:
+        error: "UNAUTHORIZED"
+        message: "Service token expired"
+        traceId: "e5f60718293a4b5c6d7e8f9012345678"
+        timestamp: "2026-08-07T10:15:32.117Z"
+        details:
+          reason: "exp_in_past"
+        retryable: false
+
+    ErrorRateLimited:
+      summary: Квота исчерпана → 429 наружу НЕ отдаём, деградируем
+      value:
+        error: "RATE_LIMITED"
+        message: "Rate limit exceeded for client 'svc:exchange-bff'"
+        traceId: "f60718293a4b5c6d7e8f901234567890"
+        timestamp: "2026-08-07T10:15:32.117Z"
+        details:
+          limit: 5000
+          windowSeconds: 60
+        retryable: true
+
+    ErrorInternal:
+      summary: Сбой провайдера → 500 наружу НЕ отдаём, деградация + счётчик брейкера
+      value:
+        error: "INTERNAL_ERROR"
+        message: "Unexpected error while aggregating order books"
+        traceId: "0718293a4b5c6d7e8f90123456789012"
+        timestamp: "2026-08-07T10:15:32.117Z"
+        details: {}
+        retryable: true
+
+    ErrorUpstreamVenue:
+      summary: Все площадки недоступны → 503 наружу НЕ отдаём
+      description: |
+        Код `EXCHANGE_SERVICE_UNAVAILABLE` (503) каталога §7 зарезервирован за блокирующими
+        системами. S7 деградирует молча: кеш или дефолты, `degraded: true`.
+      value:
+        error: "UPSTREAM_VENUE_ERROR"
+        message: "All connected venues are unreachable"
+        traceId: "18293a4b5c6d7e8f9012345678901234"
+        timestamp: "2026-08-07T10:15:32.117Z"
+        details:
+          disconnectedVenues: ["BINANCE", "OKX", "BYBIT"]
+        retryable: true
+
+    ErrorTimeout:
+      summary: Таймаут на стороне провайдера → UPSTREAM_TIMEOUT наружу НЕ отдаём
+      value:
+        error: "UPSTREAM_VENUE_ERROR"
+        message: "Upstream venue did not respond within the provider deadline"
+        traceId: "293a4b5c6d7e8f901234567890123456"
+        timestamp: "2026-08-07T10:15:32.917Z"
+        details:
+          venue: "BINANCE"
+          deadlineMs: 700
+        retryable: true

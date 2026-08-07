@@ -1,0 +1,2438 @@
+openapi: 3.1.0
+
+info:
+  title: Limits & Fees Service (S4) — Inbound Contract Stub
+  version: "1.0.0"
+  summary: Справочник активов, направленных пар, лимитов оборота и схем комиссий.
+  description: |
+    # Назначение
+
+    Это **стаб внешнего сервиса S4 «Limits & Fees Service»**. Контракт описывает **входящую
+    к нам информацию**: что именно наше приложение (**Exchange BFF**) получает от этого сервиса.
+    Сам сервис мы **не реализуем** — он принадлежит смежной команде. Файл нужен, чтобы
+    зафиксировать форму данных, коды ошибок и правила деградации, на которые опирается BFF.
+
+    Источник истины по доменным именам, деньгам, порядку валидации, каталогу ошибок и фикстурам —
+    `docs/00-canonical-model.md` (далее «канон»). Любое расхождение с каноном = дефект контракта.
+
+    # Что мы получаем
+
+    * **Справочник активов** (`GET /v1/assets`) — `assetId`, `type`, `network`, `decimals`,
+      `symbol`, `displayName`, признак включённости и причина отключения (канон §4.1).
+    * **Направленные пары** (`GET /v1/pairs`, `GET /v1/pairs/{pairId}`) — мин/макс суммы,
+      шаг суммы, точности, политика комиссии, режим расчётов (канон §10.4).
+    * **Снимок лимитов оборота пользователя** (`GET /v1/users/{userId}/limits`) — окна
+      per-transaction / сутки / месяц / год, лимит, использовано, остаток (канон §10.5).
+    * **Персональная схема комиссий** (`GET /v1/users/{userId}/fee-schedule`) — тир, промо,
+      переопределения по парам.
+
+    Сервис **только читающий**: BFF никогда не мутирует состояние S4. Поэтому все
+    эндпоинты — идемпотентные `GET`, и на них разрешены ретраи.
+
+    # Критичность (канон §3)
+
+    Класс критичности — **Blocking**. Отказ S4 означает, что заявка на обмен **не создаётся**
+    и пользователю возвращается ошибка сервиса. Единственное смягчение — кеш (см. ниже):
+    пока в кеше есть данные, пусть и устаревшие, BFF продолжает работать.
+
+    # Таймауты и ретраи (канон §11)
+
+    | Параметр | Значение |
+    |---|---|
+    | Таймаут одного вызова | **1 000 мс** (строка «Таймаут S1/S2/S3/S4») |
+    | Ретраи | **2 попытки**, экспоненциальный backoff + jitter (разрешено, т.к. все вызовы — `GET`) |
+    | Circuit breaker | порог 50 % ошибок на окне 20 запросов, open 30 с |
+    | Параллелизм | вызовы S1/S2/S3/S4 выполняются BFF **параллельно**, общий бюджет ограничен |
+    |  | бюджетом `POST /v1/exchange-orders` (p95 ≤ 900 мс, p99 ≤ 2 000 мс) |
+
+    Таймаут отсчитывается от отправки запроса до получения полного тела ответа.
+    Исчерпание таймаута и всех ретраев транслируется в наш `UPSTREAM_TIMEOUT` (504).
+
+    # Кеширование и допустимость stale (канон §11 «Кеширование»)
+
+    | Данные | TTL | При недоступности источника |
+    |---|---|---|
+    | Список активов (`/v1/assets`) | **5 мин** | **stale-ok** — отдаём устаревшее (stale-while-revalidate) |
+    | Список и карточки пар (`/v1/pairs*`) | **5 мин** | **stale-ok** |
+    | Схема комиссий (`/v1/users/{userId}/fee-schedule`) | **60 с** | **stale-ok** |
+    | Лимиты оборота (`/v1/users/{userId}/limits`) | **60 с** | **stale-ok**, но с осторожностью: остаток лимита |
+    |  |  | мог измениться, поэтому финальная проверка шага 15 всё равно идёт в S4 |
+
+    Ключ кеша активов и пар — глобальный (данные не персональные). Ключ кеша комиссий и
+    лимитов — `userId` (данные персональные, см. раздел PII). Ответы, отданные из
+    устаревшего кеша, помечаются BFF внутренним флагом `degraded: true`, который затем
+    попадает в котировку (канон §4.3).
+
+    # Поведение при недоступности
+
+    1. **Таймаут / сетевой отказ / 5xx** → попытка отдать данные из кеша (в т.ч. stale).
+    2. **Кеш пуст** → заявка не создаётся:
+       * таймаут → `UPSTREAM_TIMEOUT` (504);
+       * 5xx / отказ соединения / open circuit → `EXCHANGE_SERVICE_UNAVAILABLE` (503).
+    3. **4xx** → это доменный ответ, а не отказ инфраструктуры: код сервиса отображается
+       в наш код каталога (канон §7) по таблице маппинга в описании схемы `LimitsFeesError`.
+    4. Circuit breaker в состоянии `open` не делает исходящих вызовов — сразу шаг 1.
+
+    # Где используется в цепочке валидации (канон §6)
+
+    | Шаг | Проверка | Что берём из S4 |
+    |---|---|---|
+    | **3** | Активы существуют и включены → `ASSET_NOT_SUPPORTED` | `GET /v1/assets` (`enabled`, `disabledReason`) |
+    | **5** | Пара разрешена к обмену → `PAIR_NOT_SUPPORTED` | `GET /v1/pairs/{pairId}` (`enabled`) |
+    | **11** | `fromAmount ≥ minAmount(pair)` → `AMOUNT_BELOW_MINIMUM` | `PairConfig.minAmount` |
+    | **12** | `fromAmount ≤ maxAmount(pair)` → `AMOUNT_ABOVE_MAXIMUM` | `PairConfig.maxAmount` |
+    | **15** | Лимиты оборота день/месяц → `LIMIT_EXCEEDED_DAILY` / `LIMIT_EXCEEDED_MONTHLY` | `GET /v1/users/{userId}/limits` |
+
+    Дополнительно `FeePolicy` из `PairConfig` и `FeeSchedule` используется на построении
+    котировки (канон §5.3): `feeRaw = fromAmount × percent / 100`,
+    `feeAmount = clamp(feeRaw, minFee, maxFee)` с округлением **вверх** до `decimals(fromAsset)`.
+
+    # Деньги, курсы и проценты
+
+    Все денежные величины, суммы, комиссии, лимиты и проценты передаются **строками**
+    с десятичной записью (канон §5.1). Двоичные `float`/`double` запрещены на всём пути.
+    Регулярное выражение валидации: `^(0|[1-9]\d{0,18})(\.\d{1,18})?$` (неотрицательное).
+    Процент комиссии — тоже строка: `"0.35"` означает **0.35 %**, а не 35 %.
+
+    # Время
+
+    Все временные метки — ISO-8601 UTC с миллисекундами и суффиксом `Z`
+    (например `2026-08-07T10:15:32.117Z`), канон §9.
+
+    # PII и приватность
+
+    * `GET /v1/assets` и `GET /v1/pairs*` — **не содержат PII**, кешируются глобально,
+      могут логироваться целиком.
+    * `GET /v1/users/{userId}/limits` и `GET /v1/users/{userId}/fee-schedule` — **содержат
+      персональные данные**: идентификатор пользователя, тир обслуживания и агрегаты его
+      финансового поведения (использованный оборот за сутки/месяц/год). Это косвенно
+      раскрывает объём операций клиента.
+      * `userId` в логах — только в псевдонимизированном виде (`usr_…`, уже непрямой идентификатор);
+      * значения `used` / `remaining` **запрещено** писать в общие журналы приложения,
+        допускается только в аудит-лог с ограниченным доступом;
+      * кеш лимитов и комиссий обязан быть партиционирован по `userId` — межпользовательское
+        переиспользование записей кеша является инцидентом безопасности;
+      * ответы этих эндпоинтов не должны попадать в клиентские трассировки и в тело ошибок,
+        отдаваемых наружу; наружу уходит только производный `remaining` в сообщении
+        `Daily limit reached. Available today: {remaining}` (канон §7).
+    * Сервис не возвращает имя, e-mail, телефон, документы — эти данные живут в S1/S2.
+
+    # Безопасность транспорта
+
+    Взаимодействие service-to-service: **mTLS** на уровне транспорта плюс **Bearer JWT**
+    сервисного аккаунта в заголовке `Authorization` (см. `components.securitySchemes`).
+
+  contact:
+    name: Wallet Platform / Limits & Fees Team
+    email: limits-fees@wallet.internal
+  license:
+    name: Proprietary — internal use only
+    identifier: LicenseRef-Wallet-Internal
+
+servers:
+  - url: https://limits.internal.wallet
+    description: |
+      Production. Внутренний контур, доступ только из service mesh, обязателен mTLS.
+      Версия API входит в путь (`/v1/...`), поэтому базовый URL версии не содержит.
+  - url: https://limits.staging.internal.wallet
+    description: Staging. Данные обезличены, набор пар совпадает с продовым.
+  - url: https://limits.mock.internal.wallet
+    description: |
+      Mock. Детерминированные фикстуры из канона §10.4 и §10.5 — те же, что использует
+      прототип. Ошибки воспроизводятся сценарными переключателями канона §10.6.
+
+security:
+  - bearerAuth: []
+
+tags:
+  - name: Assets
+    description: |
+      Справочник учётных единиц баланса (канон §4.1). Фиат и крипто, точности, признак
+      включённости. Кешируется 5 минут, допускается отдача устаревших данных.
+  - name: Pairs
+    description: |
+      Направленные пары обмена `FROM → TO` с лимитами суммы и политикой комиссии
+      (канон §10.4). Пары односторонние: `RUB→USDT` и `USDT→RUB` конфигурируются
+      независимо. Кешируется 5 минут, stale-ok.
+  - name: Limits
+    description: |
+      Снимок лимитов оборота пользователя по окнам (за транзакцию / сутки / месяц / год),
+      нормализованный в валюту `RUB`. Используется на шаге 15 цепочки валидации.
+      Содержит PII, кеш партиционируется по `userId`.
+  - name: Fees
+    description: |
+      Персональная схема комиссий: базовая политика тира, переопределения по парам,
+      активные промо. Кешируется 60 секунд, stale-ok. Содержит PII.
+
+paths:
+
+  /v1/assets:
+    get:
+      operationId: listAssets
+      summary: Справочник активов
+      description: |
+        Возвращает полный справочник учётных единиц баланса. Используется BFF на **шаге 3**
+        цепочки валидации (канон §6): актив должен существовать и быть включён, иначе
+        `ASSET_NOT_SUPPORTED`.
+
+        Ответ **не содержит PII** и кешируется глобально на **5 минут**; при недоступности
+        сервиса допускается отдача устаревшей копии (stale-while-revalidate).
+
+        Пагинация не предусмотрена: справочник заведомо мал (единицы—десятки записей).
+      tags: [Assets]
+      parameters:
+        - $ref: '#/components/parameters/CorrelationId'
+        - $ref: '#/components/parameters/RequestId'
+        - $ref: '#/components/parameters/EnabledQuery'
+        - $ref: '#/components/parameters/AssetTypeQuery'
+      responses:
+        '200':
+          description: Справочник активов получен.
+          headers:
+            X-Correlation-Id:
+              $ref: '#/components/headers/XCorrelationId'
+            X-Request-Id:
+              $ref: '#/components/headers/XRequestId'
+            Cache-Control:
+              $ref: '#/components/headers/CacheControl'
+            ETag:
+              $ref: '#/components/headers/ETag'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AssetsResponse'
+              examples:
+                assetsCatalog:
+                  $ref: '#/components/examples/AssetsCatalog'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+        '504':
+          $ref: '#/components/responses/GatewayTimeout'
+
+  /v1/pairs:
+    get:
+      operationId: listPairs
+      summary: Список направленных пар с лимитами и комиссиями
+      description: |
+        Возвращает конфигурацию всех направленных пар обмена. Каждая пара односторонняя:
+        `RUB→USDT` и `USDT→RUB` — **разные** записи с разными лимитами и комиссиями
+        (канон §2, §10.4).
+
+        Используется BFF на **шаге 5** (пара разрешена к обмену) и как источник
+        `minAmount` / `maxAmount` для **шагов 11 и 12**.
+
+        Фильтры `fromAsset` / `toAsset` / `enabled` применяются конъюнктивно (AND).
+        Если ни одна пара не подходит под фильтр — возвращается `200` с пустым массивом
+        `pairs`, а **не** `404`: отсутствие пары — это доменный факт, который BFF
+        транслирует в `PAIR_NOT_SUPPORTED` самостоятельно.
+
+        Кеш — 5 минут, stale-ok.
+      tags: [Pairs]
+      parameters:
+        - $ref: '#/components/parameters/CorrelationId'
+        - $ref: '#/components/parameters/RequestId'
+        - $ref: '#/components/parameters/FromAssetQuery'
+        - $ref: '#/components/parameters/ToAssetQuery'
+        - $ref: '#/components/parameters/EnabledQuery'
+      responses:
+        '200':
+          description: Список пар получен (возможно пустой).
+          headers:
+            X-Correlation-Id:
+              $ref: '#/components/headers/XCorrelationId'
+            X-Request-Id:
+              $ref: '#/components/headers/XRequestId'
+            Cache-Control:
+              $ref: '#/components/headers/CacheControl'
+            ETag:
+              $ref: '#/components/headers/ETag'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PairsResponse'
+              examples:
+                allPairs:
+                  $ref: '#/components/examples/PairsAll'
+                eurSourceNotSupported:
+                  $ref: '#/components/examples/PairsEurSourceEmpty'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '422':
+          $ref: '#/components/responses/UnprocessableEntity'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+        '504':
+          $ref: '#/components/responses/GatewayTimeout'
+
+  /v1/pairs/{pairId}:
+    get:
+      operationId: getPair
+      summary: Конфигурация одной направленной пары
+      description: |
+        Возвращает конфигурацию конкретной пары по её идентификатору вида
+        `RUB-USDT@TRON` (формат: `FROM[@NETWORK]-TO[@NETWORK]`).
+
+        Ответы, важные для цепочки валидации:
+
+        * `200` + `enabled: true` — пара доступна, из неё берутся `minAmount`, `maxAmount`,
+          `feePolicy`;
+        * `200` + `enabled: false` — пара временно выключена, `disabledReason` объясняет
+          почему; BFF транслирует это в `PAIR_NOT_SUPPORTED` (422) на **шаге 5**;
+        * `404` с кодом `PAIR_UNKNOWN` — пары нет в конфигурации вовсе (например любая
+          пара `EUR→*`, канон §10.4); BFF также транслирует в `PAIR_NOT_SUPPORTED` (422).
+
+        Оба доменных исхода дают пользователю одно и то же сообщение
+        `This pair is not available right now` (канон §7) — различие не раскрывается наружу,
+        чтобы не давать сигнал о внутренней конфигурации.
+      tags: [Pairs]
+      parameters:
+        - $ref: '#/components/parameters/CorrelationId'
+        - $ref: '#/components/parameters/RequestId'
+        - $ref: '#/components/parameters/PairIdPath'
+      responses:
+        '200':
+          description: Конфигурация пары получена (пара может быть выключена — см. `enabled`).
+          headers:
+            X-Correlation-Id:
+              $ref: '#/components/headers/XCorrelationId'
+            X-Request-Id:
+              $ref: '#/components/headers/XRequestId'
+            Cache-Control:
+              $ref: '#/components/headers/CacheControl'
+            ETag:
+              $ref: '#/components/headers/ETag'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PairConfig'
+              examples:
+                rubToUsdt:
+                  $ref: '#/components/examples/PairRubUsdt'
+                usdtToRub:
+                  $ref: '#/components/examples/PairUsdtRub'
+                pairDisabled:
+                  $ref: '#/components/examples/PairDisabled'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          description: |
+            Пара не найдена в конфигурации. Наиболее частый случай — направление `EUR→*`,
+            которое намеренно не поддерживается (канон §10.4).
+            Маппинг: код `PAIR_UNKNOWN` → наш `PAIR_NOT_SUPPORTED` (422).
+          headers:
+            X-Correlation-Id:
+              $ref: '#/components/headers/XCorrelationId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LimitsFeesError'
+              examples:
+                eurPairUnknown:
+                  $ref: '#/components/examples/ErrorEurPairUnknown'
+                pairUnknown:
+                  $ref: '#/components/examples/ErrorPairUnknown'
+        '422':
+          $ref: '#/components/responses/UnprocessableEntity'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+        '504':
+          $ref: '#/components/responses/GatewayTimeout'
+
+  /v1/users/{userId}/limits:
+    get:
+      operationId: getUserLimits
+      summary: Снимок лимитов оборота пользователя
+      description: |
+        Возвращает мгновенный снимок окон лимитов оборота: за транзакцию, за сутки,
+        за месяц и за год. Все значения нормализованы в валюту `RUB`
+        (`normalizationCurrency`), потому что лимит един для всех активов и не может
+        считаться в разных валютах одновременно.
+
+        Используется BFF на **шаге 15** цепочки валидации (канон §6):
+
+        * сравнивается `fromAmount`, приведённый к `RUB`, с `remaining` окна `DAILY` →
+          при превышении наш `LIMIT_EXCEEDED_DAILY` (422);
+        * затем то же для окна `MONTHLY` → `LIMIT_EXCEEDED_MONTHLY` (422).
+
+        Ответ **персональный**: кеш строго партиционируется по `userId`, TTL 60 с,
+        stale-ok. Значения `used` / `remaining` не попадают в общие логи (см. раздел PII
+        в `info.description`).
+
+        Снимок консистентен на момент `evaluatedAt`; между снимком и созданием заявки
+        остаток мог измениться из-за параллельной операции — окончательное решение
+        принимает S6 при создании резерва.
+      tags: [Limits]
+      parameters:
+        - $ref: '#/components/parameters/CorrelationId'
+        - $ref: '#/components/parameters/RequestId'
+        - $ref: '#/components/parameters/UserIdPath'
+        - $ref: '#/components/parameters/PeriodQuery'
+      responses:
+        '200':
+          description: Снимок лимитов получен.
+          headers:
+            X-Correlation-Id:
+              $ref: '#/components/headers/XCorrelationId'
+            X-Request-Id:
+              $ref: '#/components/headers/XRequestId'
+            Cache-Control:
+              $ref: '#/components/headers/CacheControlPrivate'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UserLimits'
+              examples:
+                tier2Snapshot:
+                  $ref: '#/components/examples/UserLimitsTier2'
+                dailyAlmostExhausted:
+                  $ref: '#/components/examples/UserLimitsDailyAlmostExhausted'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          description: |
+            Доменный отказ по лимитам. Возвращается, если сервис вызван в режиме проверки
+            конкретной суммы и она не проходит.
+            Маппинг: `DAILY_LIMIT_EXCEEDED` → `LIMIT_EXCEEDED_DAILY` (422);
+            `MONTHLY_LIMIT_EXCEEDED` → `LIMIT_EXCEEDED_MONTHLY` (422).
+          headers:
+            X-Correlation-Id:
+              $ref: '#/components/headers/XCorrelationId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LimitsFeesError'
+              examples:
+                dailyLimitExceeded:
+                  $ref: '#/components/examples/ErrorDailyLimitExceeded'
+                monthlyLimitExceeded:
+                  $ref: '#/components/examples/ErrorMonthlyLimitExceeded'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+        '504':
+          $ref: '#/components/responses/GatewayTimeout'
+
+  /v1/users/{userId}/fee-schedule:
+    get:
+      operationId: getUserFeeSchedule
+      summary: Персональная схема комиссий пользователя
+      description: |
+        Возвращает эффективную схему комиссий для пользователя: базовую политику его тира,
+        переопределения по конкретным парам и список активных промо-акций.
+
+        Порядок применения при построении котировки (канон §5.3):
+
+        1. берём `default` (политика тира пользователя);
+        2. если для пары есть запись в `overridesByPair` — она **полностью** заменяет
+           `percent` / `minFee` / `maxFee`;
+        3. если действует промо из `activePromos`, применимое к этой паре, — `percent`
+           уменьшается на `discountPercent` (в абсолютных процентных пунктах,
+           результат не может стать отрицательным);
+        4. `feeRaw = fromAmount × percent / 100`;
+        5. `feeAmount = clamp(feeRaw, minFee, maxFee)` с округлением **вверх**
+           до `decimals(fromAsset)` (канон §5.4).
+
+        Кеш 60 с, stale-ok, партиционирован по `userId`. Содержит PII (тир обслуживания).
+      tags: [Fees]
+      parameters:
+        - $ref: '#/components/parameters/CorrelationId'
+        - $ref: '#/components/parameters/RequestId'
+        - $ref: '#/components/parameters/UserIdPath'
+        - $ref: '#/components/parameters/PairIdQuery'
+      responses:
+        '200':
+          description: Схема комиссий получена.
+          headers:
+            X-Correlation-Id:
+              $ref: '#/components/headers/XCorrelationId'
+            X-Request-Id:
+              $ref: '#/components/headers/XRequestId'
+            Cache-Control:
+              $ref: '#/components/headers/CacheControlPrivate'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FeeSchedule'
+              examples:
+                tier2Schedule:
+                  $ref: '#/components/examples/FeeScheduleTier2'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+        '504':
+          $ref: '#/components/responses/GatewayTimeout'
+
+components:
+
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: |
+        **Service-to-service JWT.** BFF предъявляет короткоживущий токен сервисного
+        аккаунта (`sub = svc:exchange-bff`, TTL ≤ 300 с, подпись `RS256`, обязательные
+        claims `iss`, `aud = limits-fees`, `exp`, `jti`) в заголовке
+        `Authorization: Bearer <token>`.
+
+        Токен **дополняет**, а не заменяет транспортную аутентификацию: соединение
+        обязано быть установлено по **mTLS** — клиентский сертификат выдаётся внутренним
+        CA service mesh, CN сертификата обязан совпадать с `sub` токена. Запрос без
+        валидного клиентского сертификата отбрасывается на уровне mesh и до приложения
+        не доходит.
+
+        Пользовательский JWT в S4 **не передаётся**: сервис доверяет BFF и работает с
+        `userId` как с параметром пути. Ответственность за авторизацию пользователя
+        лежит на BFF.
+
+  parameters:
+
+    CorrelationId:
+      name: X-Correlation-Id
+      in: header
+      required: false
+      description: |
+        Сквозной идентификатор бизнес-операции (канон §9). BFF передаёт его во все
+        внешние вызовы одной заявки. Сервис обязан вернуть значение в ответе и во всех
+        ошибках; при отсутствии — сгенерировать собственное. Формат — ULID (26 символов
+        Crockford Base32) либо UUIDv4.
+      schema:
+        type: string
+        minLength: 26
+        maxLength: 36
+        pattern: '^([0-9A-HJKMNP-TV-Z]{26}|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$'
+        examples:
+          - "01J9X2C4K7QF8N3M5T6V7W8Y9Z"
+          - "9f1c2b7e-3a4d-4f5b-8c9d-0e1f2a3b4c5d"
+
+    RequestId:
+      name: X-Request-Id
+      in: header
+      required: false
+      description: |
+        Идентификатор конкретной HTTP-попытки. В отличие от `X-Correlation-Id` меняется
+        на каждом ретрае, что позволяет отличить повтор от нового запроса при разборе
+        инцидентов.
+      schema:
+        type: string
+        format: uuid
+        minLength: 36
+        maxLength: 36
+        pattern: '^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$'
+        examples:
+          - "3f2504e0-4f89-41d3-9a0c-0305e82c3301"
+
+    PairIdPath:
+      name: pairId
+      in: path
+      required: true
+      description: |
+        Идентификатор направленной пары в формате `FROM[@NETWORK]-TO[@NETWORK]`,
+        например `RUB-USDT@TRON` или `BTC@BITCOIN-USDT@TRON`. Для фиатных активов
+        сеть опускается. Регистр — только верхний.
+      schema:
+        $ref: '#/components/schemas/PairId'
+
+    PairIdQuery:
+      name: pairId
+      in: query
+      required: false
+      description: |
+        Необязательный фильтр: вернуть схему комиссий, суженную до одной пары.
+        Если не задан — возвращаются все переопределения пользователя.
+      schema:
+        $ref: '#/components/schemas/PairId'
+
+    UserIdPath:
+      name: userId
+      in: path
+      required: true
+      description: |
+        Идентификатор пользователя (канон §10.1). Непрямой персональный идентификатор:
+        допустим в логах, но не в клиентских трассировках.
+      schema:
+        $ref: '#/components/schemas/UserId'
+
+    FromAssetQuery:
+      name: fromAsset
+      in: query
+      required: false
+      description: |
+        Фильтр по активу списания. Принимает либо голый `assetId` (`RUB`), либо
+        квалифицированную форму с сетью (`USDT@TRON`). Без сети возвращаются все сети
+        этого актива.
+      schema:
+        $ref: '#/components/schemas/AssetQualifier'
+
+    ToAssetQuery:
+      name: toAsset
+      in: query
+      required: false
+      description: |
+        Фильтр по активу получения. Правила те же, что у `fromAsset`.
+        Комбинация `fromAsset` + `toAsset` однозначно задаёт направление.
+      schema:
+        $ref: '#/components/schemas/AssetQualifier'
+
+    EnabledQuery:
+      name: enabled
+      in: query
+      required: false
+      description: |
+        Фильтр по признаку включённости. `true` — только доступные записи,
+        `false` — только выключенные, параметр опущен — все записи.
+        BFF в проде запрашивает без фильтра, чтобы получить `disabledReason`
+        и отличить «выключено» от «не существует».
+      schema:
+        type: boolean
+        examples:
+          - true
+
+    AssetTypeQuery:
+      name: type
+      in: query
+      required: false
+      description: Фильтр по типу актива — фиат или крипто (канон §4.1).
+      schema:
+        $ref: '#/components/schemas/AssetType'
+
+    PeriodQuery:
+      name: period
+      in: query
+      required: false
+      description: |
+        Фильтр по окну лимита. Если не задан — возвращаются все окна.
+        BFF на шаге 15 запрашивает без фильтра, потому что нужны и сутки, и месяц
+        за один вызов (экономия на сетевом бюджете 1 000 мс).
+      schema:
+        $ref: '#/components/schemas/LimitPeriod'
+
+  headers:
+
+    XCorrelationId:
+      description: Сквозной идентификатор бизнес-операции, эхом возвращается сервисом.
+      required: true
+      schema:
+        type: string
+        minLength: 26
+        maxLength: 36
+        examples:
+          - "01J9X2C4K7QF8N3M5T6V7W8Y9Z"
+
+    XRequestId:
+      description: Идентификатор конкретной HTTP-попытки, эхом возвращается сервисом.
+      required: false
+      schema:
+        type: string
+        format: uuid
+        minLength: 36
+        maxLength: 36
+        examples:
+          - "3f2504e0-4f89-41d3-9a0c-0305e82c3301"
+
+    CacheControl:
+      description: |
+        Директива кеширования для публичных справочников. Соответствует TTL 5 мин
+        из канона §11; `stale-while-revalidate` разрешает отдачу устаревшей копии.
+      required: false
+      schema:
+        type: string
+        maxLength: 200
+        examples:
+          - "public, max-age=300, stale-while-revalidate=600"
+
+    CacheControlPrivate:
+      description: |
+        Директива кеширования для персональных ответов (лимиты, комиссии).
+        `private` запрещает хранение в разделяемых кешах; TTL 60 с по канону §11.
+      required: false
+      schema:
+        type: string
+        maxLength: 200
+        examples:
+          - "private, max-age=60, stale-while-revalidate=300"
+
+    ETag:
+      description: |
+        Слабый валидатор версии справочника. BFF использует его в условных запросах
+        (`If-None-Match`), чтобы продлевать кеш без перекачки тела.
+      required: false
+      schema:
+        type: string
+        maxLength: 128
+        examples:
+          - 'W/"pairs-2026-08-07T09-00-00Z-14"'
+
+    RetryAfter:
+      description: |
+        Через сколько секунд разрешено повторить запрос. Возвращается при `429` и `503`.
+        BFF использует значение как нижнюю границу backoff.
+      required: false
+      schema:
+        type: integer
+        minimum: 0
+        maximum: 3600
+        examples:
+          - 2
+
+  schemas:
+
+    DecimalString:
+      type: string
+      description: |
+        Денежная величина, сумма, лимит, комиссия или процент в виде **строки**
+        с десятичной записью (канон §5.1). Двоичные `float`/`double` запрещены на
+        всём пути: API, BFF, состояние фронтенда, отображение. Значение неотрицательное.
+        Целая часть — до 19 цифр, дробная — до 18 знаков.
+      minLength: 1
+      maxLength: 40
+      pattern: '^(0|[1-9]\d{0,18})(\.\d{1,18})?$'
+      examples:
+        - "25450.00"
+        - "0.010638297872"
+        - "0"
+
+    PercentString:
+      type: string
+      description: |
+        Процентная ставка в виде строки. Значение выражено **в процентах**, а не в долях:
+        `"0.35"` означает 0.35 % (канон §4.4). Расчёт: `feeRaw = fromAmount × percent / 100`.
+      minLength: 1
+      maxLength: 40
+      pattern: '^(0|[1-9]\d{0,18})(\.\d{1,18})?$'
+      examples:
+        - "0.35"
+        - "0.40"
+        - "0.60"
+
+    Timestamp:
+      type: string
+      format: date-time
+      description: |
+        Момент времени в ISO-8601, зона UTC, обязательные миллисекунды и суффикс `Z`
+        (канон §9). Смещения вида `+03:00` не допускаются.
+      minLength: 24
+      maxLength: 24
+      pattern: '^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$'
+      examples:
+        - "2026-08-07T10:15:32.117Z"
+
+    UserId:
+      type: string
+      description: |
+        Идентификатор пользователя: префикс `usr_` плюс ULID (26 символов Crockford
+        Base32, канон §10.1). Устойчиво сортируется по времени создания.
+      minLength: 30
+      maxLength: 30
+      pattern: '^usr_[0-9A-HJKMNP-TV-Z]{26}$'
+      examples:
+        - "usr_01J8ZQ4H9K2M3N4P5R6S7T8V9W"
+
+    AssetId:
+      type: string
+      description: |
+        Код учётной единицы баланса (канон §4.1). Уникален в пределах кошелька
+        вместе с `network`. Только заглавные латинские буквы и цифры.
+      minLength: 2
+      maxLength: 12
+      pattern: '^[A-Z0-9]{2,12}$'
+      examples:
+        - "RUB"
+        - "USDT"
+        - "BTC"
+
+    Network:
+      type: [string, 'null']
+      description: |
+        Блокчейн-сеть крипто-актива (канон §2). Обязательна для `type = CRYPTO`,
+        для фиата — `null`. `USDT@TRON` и `USDT@ETHEREUM` — **разные балансы**.
+      enum: ["TRON", "ETHEREUM", "BITCOIN", null]
+      examples:
+        - "TRON"
+        - null
+
+    AssetType:
+      type: string
+      description: Тип учётной единицы — фиатная валюта или крипто-актив (канон §4.1).
+      enum: ["FIAT", "CRYPTO"]
+      examples:
+        - "FIAT"
+        - "CRYPTO"
+
+    AssetQualifier:
+      type: string
+      description: |
+        Квалифицированная ссылка на актив в виде строки: `ASSET` для фиата либо
+        `ASSET@NETWORK` для крипто. Используется в query-фильтрах, где передавать
+        объект неудобно.
+      minLength: 2
+      maxLength: 33
+      pattern: '^[A-Z0-9]{2,12}(@(TRON|ETHEREUM|BITCOIN))?$'
+      examples:
+        - "RUB"
+        - "USDT@TRON"
+
+    PairId:
+      type: string
+      description: |
+        Идентификатор направленной пары: `FROM[@NETWORK]-TO[@NETWORK]`. Пары
+        односторонние, поэтому `RUB-USDT@TRON` и `USDT@TRON-RUB` — разные сущности
+        с независимыми лимитами и комиссиями (канон §2).
+      minLength: 5
+      maxLength: 67
+      pattern: '^[A-Z0-9]{2,12}(@(TRON|ETHEREUM|BITCOIN))?-[A-Z0-9]{2,12}(@(TRON|ETHEREUM|BITCOIN))?$'
+      examples:
+        - "RUB-USDT@TRON"
+        - "BTC@BITCOIN-USDT@TRON"
+        - "RUB-EUR"
+
+    Tier:
+      type: string
+      description: |
+        Тир обслуживания пользователя. Определяет базовые лимиты оборота и базовую
+        ставку комиссии. Фикстура прототипа — `TIER_2` (канон §10.1).
+      enum: ["TIER_0", "TIER_1", "TIER_2", "TIER_3"]
+      examples:
+        - "TIER_2"
+
+    AssetRef:
+      type: object
+      description: |
+        Ссылка на актив: код плюс сеть. Именно пара `(assetId, network)` однозначно
+        идентифицирует баланс (канон §2, §4.2).
+      additionalProperties: false
+      required: [assetId, network]
+      properties:
+        assetId:
+          $ref: '#/components/schemas/AssetId'
+        network:
+          $ref: '#/components/schemas/Network'
+      examples:
+        - assetId: "USDT"
+          network: "TRON"
+        - assetId: "RUB"
+          network: null
+
+    Asset:
+      type: object
+      description: |
+        Запись справочника активов (канон §4.1). Точность `decimals` нормативна:
+        все суммы по этому активу обязаны иметь не больше знаков после запятой
+        (инвариант I5 канона §5.4).
+      additionalProperties: false
+      required: [assetId, type, network, decimals, symbol, displayName, enabled, disabledReason]
+      properties:
+        assetId:
+          $ref: '#/components/schemas/AssetId'
+        type:
+          $ref: '#/components/schemas/AssetType'
+        network:
+          $ref: '#/components/schemas/Network'
+        decimals:
+          type: integer
+          description: |
+            Число знаков после запятой для этого актива (канон §4.1):
+            `RUB` = 2, `EUR` = 2, `USDT` = 6, `BTC` = 8, `ETH` = 8.
+            Используется как цель округления в §5.3 и как ограничение инварианта I5.
+          minimum: 0
+          maximum: 18
+          examples:
+            - 2
+            - 6
+            - 8
+        symbol:
+          type: string
+          description: Короткий символ актива. Только для отображения, в расчётах не участвует.
+          minLength: 1
+          maxLength: 8
+          examples:
+            - "₽"
+            - "$"
+            - "₿"
+        displayName:
+          type: string
+          description: Человекочитаемое название актива для UI.
+          minLength: 1
+          maxLength: 64
+          examples:
+            - "Russian Ruble"
+            - "Tether USD (TRON)"
+        enabled:
+          type: boolean
+          description: |
+            Актив доступен для обмена. `false` → BFF на **шаге 3** цепочки валидации
+            возвращает `ASSET_NOT_SUPPORTED` (422).
+          examples:
+            - true
+        disabledReason:
+          type: [string, 'null']
+          description: |
+            Причина отключения актива. Заполняется только при `enabled: false`,
+            иначе `null`. Наружу пользователю не показывается — это внутренняя
+            диагностика для логов и дежурной смены.
+          enum: ["MAINTENANCE", "NETWORK_HALTED", "REGULATORY_HOLD", "DEPRECATED", "LIQUIDITY_SHORTAGE", null]
+          examples:
+            - null
+            - "NETWORK_HALTED"
+
+    AssetsResponse:
+      type: object
+      description: Обёртка ответа справочника активов.
+      additionalProperties: false
+      required: [assets, updatedAt, version]
+      properties:
+        assets:
+          type: array
+          description: Записи справочника. Порядок не гарантирован, сортируйте на клиенте.
+          minItems: 0
+          maxItems: 500
+          items:
+            $ref: '#/components/schemas/Asset'
+        updatedAt:
+          allOf:
+            - $ref: '#/components/schemas/Timestamp'
+          description: Момент последнего изменения справочника на стороне S4.
+        version:
+          type: integer
+          description: |
+            Монотонная версия справочника. BFF сохраняет её вместе с кешем; смена версии
+            означает, что кеш нужно обновить даже до истечения TTL.
+          minimum: 1
+          maximum: 9007199254740991
+          examples:
+            - 14
+
+    FeeTierOverride:
+      type: object
+      description: |
+        Переопределение параметров комиссии для конкретного тира обслуживания.
+        Применяется, если тир пользователя совпадает с `tier`; заменяет `percent`,
+        `minFee` и `maxFee` базовой политики целиком.
+      additionalProperties: false
+      required: [tier, percent, minFee, maxFee]
+      properties:
+        tier:
+          $ref: '#/components/schemas/Tier'
+        percent:
+          allOf:
+            - $ref: '#/components/schemas/PercentString'
+          description: Ставка комиссии для этого тира, в процентах (`"0.25"` = 0.25 %).
+        minFee:
+          allOf:
+            - $ref: '#/components/schemas/DecimalString'
+          description: Минимальная комиссия для этого тира, в валюте списания.
+        maxFee:
+          type: [string, 'null']
+          description: |
+            Максимальная комиссия для этого тира, в валюте списания. `null` означает
+            «потолок не установлен».
+          pattern: '^(0|[1-9]\d{0,18})(\.\d{1,18})?$'
+          minLength: 1
+          maxLength: 40
+          examples:
+            - "5000.00"
+            - null
+
+    FeePromo:
+      type: object
+      description: |
+        Активная промо-акция, снижающая ставку комиссии. Скидка применяется **в
+        абсолютных процентных пунктах** к `percent`: при `percent = "0.35"` и
+        `discountPercent = "0.10"` эффективная ставка равна `"0.25"`. Результат
+        не может стать отрицательным — при переполнении ставка обнуляется.
+      additionalProperties: false
+      required: [promoId, discountPercent, validFrom, validUntil, appliesToPairs]
+      properties:
+        promoId:
+          type: string
+          description: Идентификатор промо-акции. Стабилен, пригоден для логирования и аналитики.
+          minLength: 3
+          maxLength: 64
+          pattern: '^[a-z0-9][a-z0-9_-]{2,63}$'
+          examples:
+            - "promo_summer_2026"
+        discountPercent:
+          allOf:
+            - $ref: '#/components/schemas/PercentString'
+          description: Скидка в процентных пунктах, вычитаемая из `percent`.
+        validFrom:
+          allOf:
+            - $ref: '#/components/schemas/Timestamp'
+          description: Начало действия промо (включительно).
+        validUntil:
+          allOf:
+            - $ref: '#/components/schemas/Timestamp'
+          description: Конец действия промо (исключительно).
+        appliesToPairs:
+          type: array
+          description: |
+            Пары, на которые распространяется промо. Пустой массив означает
+            «на все пары».
+          minItems: 0
+          maxItems: 200
+          items:
+            $ref: '#/components/schemas/PairId'
+
+    FeePolicy:
+      type: object
+      description: |
+        Политика комиссии по паре (канон §4.4). Определяет, сколько и как удерживается
+        с пользователя при обмене.
+      additionalProperties: false
+      required: [mode, percent, minFee, maxFee, networkFee, tierOverrides, promo, roundingMode]
+      properties:
+        mode:
+          type: string
+          description: |
+            Режим удержания комиссии. Зафиксирован каноном §5.3 как единственно
+            допустимый: комиссия удерживается **внутри** введённой суммы, а не сверху.
+            Причина — иначе кнопка `MAX` / чип «100 %» всегда приводили бы к
+            `INSUFFICIENT_FUNDS`, потому что `fromAmount + fee > available`.
+          enum: ["INCLUDED_IN_SOURCE"]
+          examples:
+            - "INCLUDED_IN_SOURCE"
+        percent:
+          allOf:
+            - $ref: '#/components/schemas/PercentString'
+          description: |
+            Базовая ставка комиссии в процентах. `"0.35"` = 0.35 %.
+            Шаг 2 расчёта (канон §5.3): `feeRaw = fromAmount × percent / 100`.
+        minFee:
+          allOf:
+            - $ref: '#/components/schemas/DecimalString'
+          description: |
+            Нижняя граница комиссии **в валюте списания** (`fromAsset`).
+            Шаг 3 расчёта: `feeAmount = clamp(feeRaw, minFee, maxFee)`.
+        maxFee:
+          type: [string, 'null']
+          description: |
+            Верхняя граница комиссии в валюте списания. `null` означает, что потолка
+            нет и `clamp` ограничивается только снизу. Во всех фикстурах канона §10.4
+            потолок не задан.
+          pattern: '^(0|[1-9]\d{0,18})(\.\d{1,18})?$'
+          minLength: 1
+          maxLength: 40
+          examples:
+            - null
+            - "5000.00"
+        networkFee:
+          allOf:
+            - $ref: '#/components/schemas/DecimalString'
+          description: |
+            Сетевая (ончейн) комиссия. Всегда `"0"`, потому что обмен **внутренний**:
+            активы перемещаются между балансами одного кошелька, ончейн-транзакции не
+            выполняются (канон §5.5). Поле сохранено намеренно: строка `Network` в
+            Exchange Summary показывает пользователю, в какой сети он получит актив,
+            и это влияет на стоимость будущего вывода.
+        tierOverrides:
+          type: array
+          description: |
+            Переопределения ставки по тирам. Применяется запись, чей `tier` совпадает
+            с тиром пользователя; при отсутствии совпадения действуют базовые
+            `percent` / `minFee` / `maxFee`.
+          minItems: 0
+          maxItems: 8
+          items:
+            $ref: '#/components/schemas/FeeTierOverride'
+        promo:
+          oneOf:
+            - $ref: '#/components/schemas/FeePromo'
+            - type: 'null'
+          description: |
+            Действующая промо-акция для этой пары либо `null`, если промо нет.
+            Применяется после `tierOverrides`.
+        roundingMode:
+          type: string
+          description: |
+            Режим округления **суммы комиссии** `feeAmount` до `decimals(fromAsset)`.
+            Зафиксирован каноном §5.4 как `ROUND_UP`: округление вверх детерминированно
+            и не работает в убыток системе. Banker's rounding не применяется — он
+            недетерминирован для ревизии.
+
+            Для сравнения (эти режимы задаются не здесь, а каноном):
+            `toAmount` округляется `ROUND_DOWN` до `decimals(toAsset)`;
+            `rate` не округляется вовсе; `inverseRate` — `ROUND_HALF_UP`, 2 знака,
+            только для отображения.
+          enum: ["ROUND_UP"]
+          examples:
+            - "ROUND_UP"
+
+    PairConfig:
+      type: object
+      description: |
+        Конфигурация направленной пары обмена (канон §10.4). Пары односторонние:
+        `RUB→USDT` и `USDT→RUB` конфигурируются независимо и имеют разные лимиты.
+      additionalProperties: false
+      required:
+        - pairId
+        - fromAsset
+        - toAsset
+        - enabled
+        - disabledReason
+        - minAmount
+        - maxAmount
+        - amountStep
+        - decimalsFrom
+        - decimalsTo
+        - feePolicy
+        - settlementMode
+        - updatedAt
+        - version
+      properties:
+        pairId:
+          $ref: '#/components/schemas/PairId'
+        fromAsset:
+          allOf:
+            - $ref: '#/components/schemas/AssetRef'
+          description: Актив списания. Именно в его валюте выражены `minAmount`, `maxAmount`, `minFee`.
+        toAsset:
+          allOf:
+            - $ref: '#/components/schemas/AssetRef'
+          description: Актив получения.
+        enabled:
+          type: boolean
+          description: |
+            Пара доступна к обмену. `false` → BFF на **шаге 5** цепочки валидации
+            возвращает `PAIR_NOT_SUPPORTED` (422).
+          examples:
+            - true
+        disabledReason:
+          type: [string, 'null']
+          description: |
+            Причина выключения пары. Заполняется только при `enabled: false`, иначе
+            `null`. Наружу пользователю не показывается: и «выключено», и «не существует»
+            дают одно сообщение `This pair is not available right now`.
+          enum: ["MAINTENANCE", "NO_LIQUIDITY", "RATE_SOURCE_DOWN", "REGULATORY_HOLD", "NOT_CONFIGURED", null]
+          examples:
+            - null
+            - "NO_LIQUIDITY"
+        minAmount:
+          allOf:
+            - $ref: '#/components/schemas/DecimalString'
+          description: |
+            Минимальная сумма обмена **в валюте списания**. Шаг 11 цепочки валидации:
+            `fromAmount ≥ minAmount` иначе `AMOUNT_BELOW_MINIMUM` (422),
+            сообщение `Minimum amount is {min} {asset}`.
+        maxAmount:
+          allOf:
+            - $ref: '#/components/schemas/DecimalString'
+          description: |
+            Максимальная сумма обмена **в валюте списания**. Шаг 12 цепочки валидации:
+            `fromAmount ≤ maxAmount` иначе `AMOUNT_ABOVE_MAXIMUM` (422).
+            Это ограничение пары, оно не заменяет лимиты оборота пользователя (шаг 15).
+        amountStep:
+          allOf:
+            - $ref: '#/components/schemas/DecimalString'
+          description: |
+            Шаг допустимой суммы в валюте списания. Обычно равен минимальной единице
+            актива (`0.01` для `RUB`, `0.000001` для `USDT`, `0.00000001` для `BTC`/`ETH`).
+            Сумма обязана быть кратна шагу.
+        decimalsFrom:
+          type: integer
+          description: |
+            Точность актива списания. Дублируется здесь, чтобы построить котировку
+            без второго обращения к справочнику активов. Цель округления `feeAmount`
+            (канон §5.3, шаг 3).
+          minimum: 0
+          maximum: 18
+          examples:
+            - 2
+        decimalsTo:
+          type: integer
+          description: |
+            Точность актива получения. Цель округления `toAmount` вниз
+            (канон §5.3, шаг 6).
+          minimum: 0
+          maximum: 18
+          examples:
+            - 6
+        feePolicy:
+          $ref: '#/components/schemas/FeePolicy'
+        settlementMode:
+          type: string
+          description: |
+            Режим расчётов по паре. Всегда `INTERNAL`: обмен происходит между балансами
+            одного кошелька, ончейн-перевод не выполняется, поэтому
+            `feePolicy.networkFee = "0"` (канон §5.5).
+          enum: ["INTERNAL"]
+          examples:
+            - "INTERNAL"
+        updatedAt:
+          allOf:
+            - $ref: '#/components/schemas/Timestamp'
+          description: Момент последнего изменения конфигурации этой пары.
+        version:
+          type: integer
+          description: |
+            Монотонная версия конфигурации пары. Записывается BFF в аудит котировки,
+            чтобы расчёт можно было воспроизвести спустя время.
+          minimum: 1
+          maximum: 9007199254740991
+          examples:
+            - 7
+
+    PairsResponse:
+      type: object
+      description: |
+        Обёртка списка пар. Пагинации нет: число пар заведомо мало (десятки),
+        а полный список кешируется целиком на 5 минут.
+      additionalProperties: false
+      required: [pairs, total, updatedAt, version]
+      properties:
+        pairs:
+          type: array
+          description: |
+            Конфигурации пар, подходящие под фильтр. Пустой массив — валидный ответ,
+            означающий «направление не сконфигурировано» (например любое `EUR→*`).
+          minItems: 0
+          maxItems: 500
+          items:
+            $ref: '#/components/schemas/PairConfig'
+        total:
+          type: integer
+          description: Число элементов в `pairs`. Дублируется для быстрых проверок в логах.
+          minimum: 0
+          maximum: 500
+          examples:
+            - 8
+        updatedAt:
+          allOf:
+            - $ref: '#/components/schemas/Timestamp'
+          description: Момент последнего изменения любой из пар в наборе.
+        version:
+          type: integer
+          description: Монотонная версия конфигурации набора пар.
+          minimum: 1
+          maximum: 9007199254740991
+          examples:
+            - 14
+
+    LimitPeriod:
+      type: string
+      description: |
+        Окно лимита оборота. `PER_TRANSACTION` — ограничение одной операции,
+        остальные — скользящие/календарные окна накопления.
+      enum: ["PER_TRANSACTION", "DAILY", "MONTHLY", "YEARLY"]
+      examples:
+        - "DAILY"
+
+    LimitWindow:
+      type: object
+      description: |
+        Одно окно лимита. Инвариант: `remaining = limit − used`, значение никогда
+        не отрицательное (при исчерпании ровно `"0"`).
+      additionalProperties: false
+      required: [period, limit, used, remaining, resetAt, windowStartedAt, currency]
+      properties:
+        period:
+          $ref: '#/components/schemas/LimitPeriod'
+        limit:
+          allOf:
+            - $ref: '#/components/schemas/DecimalString'
+          description: Полный размер лимита за окно, в валюте нормализации.
+        used:
+          allOf:
+            - $ref: '#/components/schemas/DecimalString'
+          description: |
+            Израсходовано в текущем окне, в валюте нормализации. **PII-чувствительно**:
+            раскрывает объём операций клиента, в общие логи не пишется.
+        remaining:
+          allOf:
+            - $ref: '#/components/schemas/DecimalString'
+          description: |
+            Остаток окна: `limit − used`. Именно с этим значением BFF сравнивает
+            нормализованную `fromAmount` на шаге 15. Попадает в текст ошибки
+            `Daily limit reached. Available today: {remaining}` (канон §7).
+        resetAt:
+          allOf:
+            - $ref: '#/components/schemas/Timestamp'
+          description: |
+            Момент, когда окно обнулится и `used` вернётся к нулю. Для `PER_TRANSACTION`
+            смысла не имеет, но поле обязательно — сервис отдаёт конец текущих суток.
+        windowStartedAt:
+          allOf:
+            - $ref: '#/components/schemas/Timestamp'
+          description: Момент начала текущего окна накопления.
+        currency:
+          allOf:
+            - $ref: '#/components/schemas/AssetId'
+          description: |
+            Валюта, в которой выражены `limit` / `used` / `remaining`. Совпадает
+            с `normalizationCurrency` снимка.
+
+    UserLimits:
+      type: object
+      description: |
+        Снимок лимитов оборота пользователя (канон §10.5). Все окна возвращаются
+        одним вызовом, чтобы уложиться в таймаут 1 000 мс без повторных обращений.
+      additionalProperties: false
+      required:
+        - userId
+        - tier
+        - normalizationCurrency
+        - windows
+        - perTransactionMax
+        - evaluatedAt
+        - version
+      properties:
+        userId:
+          $ref: '#/components/schemas/UserId'
+        tier:
+          $ref: '#/components/schemas/Tier'
+        normalizationCurrency:
+          allOf:
+            - $ref: '#/components/schemas/AssetId'
+          description: |
+            Валюта нормализации лимитов — `RUB`.
+
+            **Зачем нужна.** Лимит оборота — единый для пользователя, а обменивать он
+            может любые пары: `RUB→USDT`, `BTC→USDT`, `ETH→USDT`. Складывать суммы в
+            разных активах нельзя, поэтому каждая операция пересчитывается в одну
+            опорную валюту по курсу на момент операции и накапливается уже в ней.
+            Из этого следуют два практических правила:
+
+            * BFF обязан привести `fromAmount` к `RUB` **тем же** курсом, что применён
+              в котировке, прежде чем сравнивать с `remaining`;
+            * `limit` / `used` / `remaining` **не** являются суммами в валюте списания
+              и не должны показываться пользователю рядом с полем «You Pay» без
+              явной подписи валюты.
+          enum: ["RUB"]
+          examples:
+            - "RUB"
+        windows:
+          type: array
+          description: |
+            Окна лимитов. Порядок соответствует возрастанию длительности окна:
+            `PER_TRANSACTION`, `DAILY`, `MONTHLY`, `YEARLY`. BFF проверяет их
+            в этом же порядке, fail-fast.
+          minItems: 1
+          maxItems: 4
+          items:
+            $ref: '#/components/schemas/LimitWindow'
+        perTransactionMax:
+          allOf:
+            - $ref: '#/components/schemas/DecimalString'
+          description: |
+            Максимум одной операции в валюте нормализации. Продублирован верхним полем
+            для удобства: это то же значение, что `limit` окна `PER_TRANSACTION`.
+            Не путать с `PairConfig.maxAmount` — тот выражен в валюте списания
+            и относится к паре, а не к пользователю.
+        yearly:
+          oneOf:
+            - $ref: '#/components/schemas/LimitWindow'
+            - type: 'null'
+          description: |
+            Годовое окно, продублированное верхним полем для удобства комплаенс-отчётов.
+            `null`, если для тира годовой лимит не установлен.
+        evaluatedAt:
+          allOf:
+            - $ref: '#/components/schemas/Timestamp'
+          description: |
+            Момент, на который построен снимок. Между `evaluatedAt` и созданием заявки
+            остаток мог измениться параллельной операцией — снимок не является
+            резервированием лимита.
+        version:
+          type: integer
+          description: |
+            Монотонная версия состояния лимитов пользователя. Растёт при каждом
+            изменении `used`. Позволяет BFF отбросить устаревший ответ, пришедший
+            после более свежего (out-of-order на ретраях).
+          minimum: 1
+          maximum: 9007199254740991
+          examples:
+            - 4821
+
+    FeeScheduleOverride:
+      type: object
+      description: |
+        Персональное переопределение политики комиссии для одной пары. Имеет приоритет
+        над `default` и над `tierOverrides` внутри базовой политики.
+      additionalProperties: false
+      required: [pairId, policy]
+      properties:
+        pairId:
+          $ref: '#/components/schemas/PairId'
+        policy:
+          $ref: '#/components/schemas/FeePolicy'
+
+    FeeSchedule:
+      type: object
+      description: |
+        Персональная схема комиссий пользователя. Эффективная политика для пары
+        вычисляется как `default` → переопределение из `overridesByPair` →
+        применение подходящего промо из `activePromos`.
+      additionalProperties: false
+      required: [userId, tier, default, overridesByPair, activePromos, validUntil]
+      properties:
+        userId:
+          $ref: '#/components/schemas/UserId'
+        tier:
+          $ref: '#/components/schemas/Tier'
+        default:
+          allOf:
+            - $ref: '#/components/schemas/FeePolicy'
+          description: |
+            Базовая политика комиссии тира. Применяется ко всем парам, для которых нет
+            записи в `overridesByPair`.
+        overridesByPair:
+          type: array
+          description: |
+            Персональные переопределения по парам. Пустой массив — обычный случай:
+            у большинства пользователей действует только политика тира.
+          minItems: 0
+          maxItems: 200
+          items:
+            $ref: '#/components/schemas/FeeScheduleOverride'
+        activePromos:
+          type: array
+          description: |
+            Промо-акции, действующие для пользователя на момент запроса. Если применимо
+            несколько — берётся промо с наибольшим `discountPercent`; промо не суммируются.
+          minItems: 0
+          maxItems: 20
+          items:
+            $ref: '#/components/schemas/FeePromo'
+        validUntil:
+          allOf:
+            - $ref: '#/components/schemas/Timestamp'
+          description: |
+            Момент, до которого схема гарантированно актуальна. Соответствует TTL кеша
+            комиссий 60 с (канон §11). После этого момента BFF обязан обновить схему,
+            но при недоступности S4 может продолжать использовать устаревшую копию
+            (stale-ok) с пометкой `degraded`.
+
+    LimitsFeesErrorCode:
+      type: string
+      description: |
+        Код ошибки **сервиса S4**. Это не наш код: BFF обязан отобразить его в код
+        каталога канона §7 перед отдачей наружу. Таблица маппинга:
+
+        | Код S4 | HTTP S4 | → наш код (канон §7) | HTTP наружу |
+        |---|---|---|---|
+        | `VALIDATION_FAILED` | 400 | → `VALIDATION_ERROR` | 400 |
+        | `UNAUTHENTICATED` | 401 | → `EXCHANGE_SERVICE_UNAVAILABLE` | 503 |
+        | `FORBIDDEN` | 403 | → `EXCHANGE_SERVICE_UNAVAILABLE` | 503 |
+        | `PAIR_UNKNOWN` | 404 | → `PAIR_NOT_SUPPORTED` | 422 |
+        | `PAIR_DISABLED` | 422 | → `PAIR_NOT_SUPPORTED` | 422 |
+        | `ASSET_UNKNOWN` | 404 | → `ASSET_NOT_SUPPORTED` | 422 |
+        | `ASSET_DISABLED` | 422 | → `ASSET_NOT_SUPPORTED` | 422 |
+        | `AMOUNT_TOO_SMALL` | 422 | → `AMOUNT_BELOW_MINIMUM` | 422 |
+        | `AMOUNT_TOO_LARGE` | 422 | → `AMOUNT_ABOVE_MAXIMUM` | 422 |
+        | `DAILY_LIMIT_EXCEEDED` | 422 | → `LIMIT_EXCEEDED_DAILY` | 422 |
+        | `MONTHLY_LIMIT_EXCEEDED` | 422 | → `LIMIT_EXCEEDED_MONTHLY` | 422 |
+        | `USER_UNKNOWN` | 404 | → `EXCHANGE_SERVICE_UNAVAILABLE` | 503 |
+        | `RATE_LIMITED` | 429 | → `RATE_LIMITED` | 429 |
+        | `INTERNAL_ERROR` | 500 | → `EXCHANGE_SERVICE_UNAVAILABLE` | 503 |
+        | `SERVICE_UNAVAILABLE` | 503 | → `EXCHANGE_SERVICE_UNAVAILABLE` | 503 |
+        | `UPSTREAM_TIMEOUT` | 504 | → `UPSTREAM_TIMEOUT` | 504 |
+        | *(таймаут клиента / нет ответа)* | — | → `UPSTREAM_TIMEOUT` | 504 |
+
+        Ни при каких обстоятельствах код S4 не должен утечь во внешний ответ BFF:
+        фронтенд ветвится только по кодам канона §7.
+      enum:
+        - "VALIDATION_FAILED"
+        - "UNAUTHENTICATED"
+        - "FORBIDDEN"
+        - "PAIR_UNKNOWN"
+        - "PAIR_DISABLED"
+        - "ASSET_UNKNOWN"
+        - "ASSET_DISABLED"
+        - "AMOUNT_TOO_SMALL"
+        - "AMOUNT_TOO_LARGE"
+        - "DAILY_LIMIT_EXCEEDED"
+        - "MONTHLY_LIMIT_EXCEEDED"
+        - "USER_UNKNOWN"
+        - "RATE_LIMITED"
+        - "INTERNAL_ERROR"
+        - "SERVICE_UNAVAILABLE"
+        - "UPSTREAM_TIMEOUT"
+      examples:
+        - "PAIR_UNKNOWN"
+        - "DAILY_LIMIT_EXCEEDED"
+
+    LimitsFeesError:
+      type: object
+      description: |
+        Собственный конверт ошибки сервиса S4. Отличается от нашего RFC 9457
+        Problem Details (канон §7) — BFF обязан выполнить преобразование, а не
+        пробрасывать этот объект наружу.
+      additionalProperties: false
+      required: [error, message, traceId, timestamp]
+      properties:
+        error:
+          $ref: '#/components/schemas/LimitsFeesErrorCode'
+        message:
+          type: string
+          description: |
+            Человекочитаемое техническое описание на английском. Предназначено для
+            инженеров и логов, **не** для показа пользователю: наружу идёт текст из
+            каталога канона §7.
+          minLength: 1
+          maxLength: 512
+          examples:
+            - "Pair EUR-USDT@TRON is not configured"
+        traceId:
+          type: string
+          description: |
+            Идентификатор трассировки на стороне S4. Логируется BFF рядом со своим
+            `correlationId`, чтобы связать инцидент между сервисами.
+          minLength: 8
+          maxLength: 64
+          pattern: '^[0-9a-zA-Z_-]{8,64}$'
+          examples:
+            - "f4b1c0a29e7d4d13"
+        timestamp:
+          allOf:
+            - $ref: '#/components/schemas/Timestamp'
+          description: Момент формирования ошибки на стороне S4.
+        details:
+          type: [object, 'null']
+          description: |
+            Структурированный контекст ошибки: имена полей, границы, остатки лимитов.
+            Ключи и значения — строки, чтобы денежные величины не потеряли точность
+            (канон §5.1). Может быть `null`, если контекста нет.
+            Внимание: при кодах лимитов сюда попадает PII-чувствительный `remaining`.
+          additionalProperties:
+            type: string
+            maxLength: 256
+          examples:
+            - pairId: "EUR-USDT@TRON"
+            - period: "DAILY"
+              remaining: "320000.00"
+              requested: "500000.00"
+              currency: "RUB"
+
+  responses:
+
+    BadRequest:
+      description: |
+        Некорректный запрос: не прошёл валидацию формат параметра пути или query.
+        Маппинг: `VALIDATION_FAILED` → наш `VALIDATION_ERROR` (400).
+        Это дефект BFF, а не пользователя — на такой ответ ретрай бессмысленен.
+      headers:
+        X-Correlation-Id:
+          $ref: '#/components/headers/XCorrelationId'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/LimitsFeesError'
+          examples:
+            validationFailed:
+              $ref: '#/components/examples/ErrorValidationFailed'
+
+    Unauthorized:
+      description: |
+        Сервисный JWT отсутствует, просрочен или подпись неверна.
+        Маппинг: `UNAUTHENTICATED` → наш `EXCHANGE_SERVICE_UNAVAILABLE` (503) —
+        для пользователя это отказ инфраструктуры, деталей он знать не должен.
+        Ретрай запрещён до обновления токена; событие эскалируется дежурному.
+      headers:
+        X-Correlation-Id:
+          $ref: '#/components/headers/XCorrelationId'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/LimitsFeesError'
+          examples:
+            unauthenticated:
+              $ref: '#/components/examples/ErrorUnauthenticated'
+
+    Forbidden:
+      description: |
+        Сервисный аккаунт аутентифицирован, но не имеет права на этот ресурс
+        (например запрашивает чужого пользователя).
+        Маппинг: `FORBIDDEN` → наш `EXCHANGE_SERVICE_UNAVAILABLE` (503).
+      headers:
+        X-Correlation-Id:
+          $ref: '#/components/headers/XCorrelationId'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/LimitsFeesError'
+          examples:
+            forbidden:
+              $ref: '#/components/examples/ErrorForbidden'
+
+    NotFound:
+      description: |
+        Ресурс не найден.
+        Маппинг: `PAIR_UNKNOWN` → `PAIR_NOT_SUPPORTED` (422);
+        `ASSET_UNKNOWN` → `ASSET_NOT_SUPPORTED` (422);
+        `USER_UNKNOWN` → `EXCHANGE_SERVICE_UNAVAILABLE` (503), потому что пользователь
+        уже прошёл аутентификацию в gateway — его отсутствие в S4 означает
+        рассинхронизацию справочников, а не ошибку клиента.
+      headers:
+        X-Correlation-Id:
+          $ref: '#/components/headers/XCorrelationId'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/LimitsFeesError'
+          examples:
+            pairUnknown:
+              $ref: '#/components/examples/ErrorPairUnknown'
+            userUnknown:
+              $ref: '#/components/examples/ErrorUserUnknown'
+
+    UnprocessableEntity:
+      description: |
+        Доменный отказ. Маппинг:
+        `PAIR_DISABLED` → `PAIR_NOT_SUPPORTED` (422);
+        `ASSET_DISABLED` → `ASSET_NOT_SUPPORTED` (422);
+        `AMOUNT_TOO_SMALL` → `AMOUNT_BELOW_MINIMUM` (422);
+        `AMOUNT_TOO_LARGE` → `AMOUNT_ABOVE_MAXIMUM` (422);
+        `DAILY_LIMIT_EXCEEDED` → `LIMIT_EXCEEDED_DAILY` (422);
+        `MONTHLY_LIMIT_EXCEEDED` → `LIMIT_EXCEEDED_MONTHLY` (422).
+        Все — не retryable.
+      headers:
+        X-Correlation-Id:
+          $ref: '#/components/headers/XCorrelationId'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/LimitsFeesError'
+          examples:
+            pairDisabled:
+              $ref: '#/components/examples/ErrorPairDisabled'
+            assetDisabled:
+              $ref: '#/components/examples/ErrorAssetDisabled'
+            amountTooSmall:
+              $ref: '#/components/examples/ErrorAmountTooSmall'
+            amountTooLarge:
+              $ref: '#/components/examples/ErrorAmountTooLarge'
+            dailyLimitExceeded:
+              $ref: '#/components/examples/ErrorDailyLimitExceeded'
+
+    TooManyRequests:
+      description: |
+        Превышен лимит частоты запросов сервисного аккаунта.
+        Маппинг: `RATE_LIMITED` → наш `RATE_LIMITED` (429), retryable.
+        BFF обязан уважать заголовок `Retry-After` и не считать этот ответ отказом
+        для circuit breaker.
+      headers:
+        X-Correlation-Id:
+          $ref: '#/components/headers/XCorrelationId'
+        Retry-After:
+          $ref: '#/components/headers/RetryAfter'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/LimitsFeesError'
+          examples:
+            rateLimited:
+              $ref: '#/components/examples/ErrorRateLimited'
+
+    InternalServerError:
+      description: |
+        Внутренний сбой S4.
+        Маппинг: `INTERNAL_ERROR` → наш `EXCHANGE_SERVICE_UNAVAILABLE` (503), retryable.
+        Порядок действий BFF: попытка отдать данные из кеша (в т.ч. stale) →
+        если кеша нет, заявка не создаётся. Ответ учитывается circuit breaker.
+      headers:
+        X-Correlation-Id:
+          $ref: '#/components/headers/XCorrelationId'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/LimitsFeesError'
+          examples:
+            internalError:
+              $ref: '#/components/examples/ErrorInternal'
+
+    ServiceUnavailable:
+      description: |
+        S4 временно недоступен (деплой, перегрузка, отказ зависимости).
+        Маппинг: `SERVICE_UNAVAILABLE` → наш `EXCHANGE_SERVICE_UNAVAILABLE` (503), retryable.
+        Поведение то же, что при `500`: stale-кеш, иначе отказ создания заявки.
+      headers:
+        X-Correlation-Id:
+          $ref: '#/components/headers/XCorrelationId'
+        Retry-After:
+          $ref: '#/components/headers/RetryAfter'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/LimitsFeesError'
+          examples:
+            serviceUnavailable:
+              $ref: '#/components/examples/ErrorServiceUnavailable'
+
+    GatewayTimeout:
+      description: |
+        S4 не ответил в отведённые 1 000 мс (канон §11) либо сам не дождался своей
+        зависимости.
+        Маппинг: `UPSTREAM_TIMEOUT` → наш `UPSTREAM_TIMEOUT` (504), retryable.
+        Ретрай разрешён, потому что все вызовы S4 — идемпотентные `GET`
+        (максимум 2 попытки, экспоненциальный backoff + jitter).
+      headers:
+        X-Correlation-Id:
+          $ref: '#/components/headers/XCorrelationId'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/LimitsFeesError'
+          examples:
+            upstreamTimeout:
+              $ref: '#/components/examples/ErrorUpstreamTimeout'
+
+  examples:
+
+    AssetsCatalog:
+      summary: Полный справочник активов (фикстуры канона §10.2)
+      description: |
+        Пять активов прототипа. `EUR` включён как актив, но пары `EUR→*` не
+        сконфигурированы — это разные вещи: актив существует, а направление обмена нет.
+      value:
+        assets:
+          - assetId: "RUB"
+            type: "FIAT"
+            network: null
+            decimals: 2
+            symbol: "₽"
+            displayName: "Russian Ruble"
+            enabled: true
+            disabledReason: null
+          - assetId: "USDT"
+            type: "CRYPTO"
+            network: "TRON"
+            decimals: 6
+            symbol: "$"
+            displayName: "Tether USD (TRON)"
+            enabled: true
+            disabledReason: null
+          - assetId: "BTC"
+            type: "CRYPTO"
+            network: "BITCOIN"
+            decimals: 8
+            symbol: "₿"
+            displayName: "Bitcoin"
+            enabled: true
+            disabledReason: null
+          - assetId: "ETH"
+            type: "CRYPTO"
+            network: "ETHEREUM"
+            decimals: 8
+            symbol: "Ξ"
+            displayName: "Ethereum"
+            enabled: true
+            disabledReason: null
+          - assetId: "EUR"
+            type: "FIAT"
+            network: null
+            decimals: 2
+            symbol: "€"
+            displayName: "Euro"
+            enabled: true
+            disabledReason: null
+        updatedAt: "2026-08-07T09:00:00.000Z"
+        version: 14
+
+    PairRubUsdt:
+      summary: Пара RUB→USDT@TRON — дефолтная пара экрана обмена
+      description: |
+        Фикстура канона §10.4: `percent = 0.35`, `minFee = 10.00 RUB`,
+        `min = 500.00 RUB`, `max = 1000000.00 RUB`. Это пара по умолчанию
+        при открытии экрана (канон §10.3, BRD §3).
+      value:
+        pairId: "RUB-USDT@TRON"
+        fromAsset:
+          assetId: "RUB"
+          network: null
+        toAsset:
+          assetId: "USDT"
+          network: "TRON"
+        enabled: true
+        disabledReason: null
+        minAmount: "500.00"
+        maxAmount: "1000000.00"
+        amountStep: "0.01"
+        decimalsFrom: 2
+        decimalsTo: 6
+        feePolicy:
+          mode: "INCLUDED_IN_SOURCE"
+          percent: "0.35"
+          minFee: "10.00"
+          maxFee: null
+          networkFee: "0"
+          tierOverrides: []
+          promo: null
+          roundingMode: "ROUND_UP"
+        settlementMode: "INTERNAL"
+        updatedAt: "2026-08-07T09:00:00.000Z"
+        version: 7
+
+    PairUsdtRub:
+      summary: Пара USDT@TRON→RUB — обратное направление сконфигурировано отдельно
+      description: |
+        Демонстрация односторонности пар: лимиты выражены в `USDT`, а не в `RUB`,
+        и не являются «зеркалом» пары `RUB→USDT` (канон §2, §10.4).
+      value:
+        pairId: "USDT@TRON-RUB"
+        fromAsset:
+          assetId: "USDT"
+          network: "TRON"
+        toAsset:
+          assetId: "RUB"
+          network: null
+        enabled: true
+        disabledReason: null
+        minAmount: "5.000000"
+        maxAmount: "10000.000000"
+        amountStep: "0.000001"
+        decimalsFrom: 6
+        decimalsTo: 2
+        feePolicy:
+          mode: "INCLUDED_IN_SOURCE"
+          percent: "0.35"
+          minFee: "0.50"
+          maxFee: null
+          networkFee: "0"
+          tierOverrides: []
+          promo: null
+          roundingMode: "ROUND_UP"
+        settlementMode: "INTERNAL"
+        updatedAt: "2026-08-07T09:00:00.000Z"
+        version: 7
+
+    PairDisabled:
+      summary: Пара временно выключена (enabled = false)
+      description: |
+        Пара существует в конфигурации, но обмен по ней сейчас невозможен.
+        BFF на **шаге 5** транслирует это в `PAIR_NOT_SUPPORTED` (422),
+        сообщение пользователю — `This pair is not available right now`.
+        `disabledReason` наружу не отдаётся.
+      value:
+        pairId: "RUB-EUR"
+        fromAsset:
+          assetId: "RUB"
+          network: null
+        toAsset:
+          assetId: "EUR"
+          network: null
+        enabled: false
+        disabledReason: "NO_LIQUIDITY"
+        minAmount: "1000.00"
+        maxAmount: "500000.00"
+        amountStep: "0.01"
+        decimalsFrom: 2
+        decimalsTo: 2
+        feePolicy:
+          mode: "INCLUDED_IN_SOURCE"
+          percent: "0.60"
+          minFee: "20.00"
+          maxFee: null
+          networkFee: "0"
+          tierOverrides: []
+          promo: null
+          roundingMode: "ROUND_UP"
+        settlementMode: "INTERNAL"
+        updatedAt: "2026-08-07T09:00:00.000Z"
+        version: 8
+
+    PairsAll:
+      summary: Все восемь пар из фикстур канона §10.4
+      description: |
+        Полный набор сконфигурированных направлений. Обратите внимание: направлений
+        `EUR→*` в наборе **нет** — это намеренно, для демонстрации `PAIR_NOT_SUPPORTED`
+        (канон §10.4).
+      value:
+        pairs:
+          - pairId: "RUB-USDT@TRON"
+            fromAsset: { assetId: "RUB", network: null }
+            toAsset: { assetId: "USDT", network: "TRON" }
+            enabled: true
+            disabledReason: null
+            minAmount: "500.00"
+            maxAmount: "1000000.00"
+            amountStep: "0.01"
+            decimalsFrom: 2
+            decimalsTo: 6
+            feePolicy:
+              mode: "INCLUDED_IN_SOURCE"
+              percent: "0.35"
+              minFee: "10.00"
+              maxFee: null
+              networkFee: "0"
+              tierOverrides: []
+              promo: null
+              roundingMode: "ROUND_UP"
+            settlementMode: "INTERNAL"
+            updatedAt: "2026-08-07T09:00:00.000Z"
+            version: 7
+          - pairId: "USDT@TRON-RUB"
+            fromAsset: { assetId: "USDT", network: "TRON" }
+            toAsset: { assetId: "RUB", network: null }
+            enabled: true
+            disabledReason: null
+            minAmount: "5.000000"
+            maxAmount: "10000.000000"
+            amountStep: "0.000001"
+            decimalsFrom: 6
+            decimalsTo: 2
+            feePolicy:
+              mode: "INCLUDED_IN_SOURCE"
+              percent: "0.35"
+              minFee: "0.50"
+              maxFee: null
+              networkFee: "0"
+              tierOverrides: []
+              promo: null
+              roundingMode: "ROUND_UP"
+            settlementMode: "INTERNAL"
+            updatedAt: "2026-08-07T09:00:00.000Z"
+            version: 7
+          - pairId: "RUB-BTC@BITCOIN"
+            fromAsset: { assetId: "RUB", network: null }
+            toAsset: { assetId: "BTC", network: "BITCOIN" }
+            enabled: true
+            disabledReason: null
+            minAmount: "1000.00"
+            maxAmount: "1000000.00"
+            amountStep: "0.01"
+            decimalsFrom: 2
+            decimalsTo: 8
+            feePolicy:
+              mode: "INCLUDED_IN_SOURCE"
+              percent: "0.50"
+              minFee: "10.00"
+              maxFee: null
+              networkFee: "0"
+              tierOverrides: []
+              promo: null
+              roundingMode: "ROUND_UP"
+            settlementMode: "INTERNAL"
+            updatedAt: "2026-08-07T09:00:00.000Z"
+            version: 7
+          - pairId: "USDT@TRON-BTC@BITCOIN"
+            fromAsset: { assetId: "USDT", network: "TRON" }
+            toAsset: { assetId: "BTC", network: "BITCOIN" }
+            enabled: true
+            disabledReason: null
+            minAmount: "10.000000"
+            maxAmount: "10000.000000"
+            amountStep: "0.000001"
+            decimalsFrom: 6
+            decimalsTo: 8
+            feePolicy:
+              mode: "INCLUDED_IN_SOURCE"
+              percent: "0.40"
+              minFee: "0.50"
+              maxFee: null
+              networkFee: "0"
+              tierOverrides: []
+              promo: null
+              roundingMode: "ROUND_UP"
+            settlementMode: "INTERNAL"
+            updatedAt: "2026-08-07T09:00:00.000Z"
+            version: 7
+          - pairId: "USDT@TRON-ETH@ETHEREUM"
+            fromAsset: { assetId: "USDT", network: "TRON" }
+            toAsset: { assetId: "ETH", network: "ETHEREUM" }
+            enabled: true
+            disabledReason: null
+            minAmount: "10.000000"
+            maxAmount: "10000.000000"
+            amountStep: "0.000001"
+            decimalsFrom: 6
+            decimalsTo: 8
+            feePolicy:
+              mode: "INCLUDED_IN_SOURCE"
+              percent: "0.40"
+              minFee: "0.50"
+              maxFee: null
+              networkFee: "0"
+              tierOverrides: []
+              promo: null
+              roundingMode: "ROUND_UP"
+            settlementMode: "INTERNAL"
+            updatedAt: "2026-08-07T09:00:00.000Z"
+            version: 7
+          - pairId: "BTC@BITCOIN-USDT@TRON"
+            fromAsset: { assetId: "BTC", network: "BITCOIN" }
+            toAsset: { assetId: "USDT", network: "TRON" }
+            enabled: true
+            disabledReason: null
+            minAmount: "0.00020000"
+            maxAmount: "2.00000000"
+            amountStep: "0.00000001"
+            decimalsFrom: 8
+            decimalsTo: 6
+            feePolicy:
+              mode: "INCLUDED_IN_SOURCE"
+              percent: "0.40"
+              minFee: "0.00005"
+              maxFee: null
+              networkFee: "0"
+              tierOverrides: []
+              promo: null
+              roundingMode: "ROUND_UP"
+            settlementMode: "INTERNAL"
+            updatedAt: "2026-08-07T09:00:00.000Z"
+            version: 7
+          - pairId: "ETH@ETHEREUM-USDT@TRON"
+            fromAsset: { assetId: "ETH", network: "ETHEREUM" }
+            toAsset: { assetId: "USDT", network: "TRON" }
+            enabled: true
+            disabledReason: null
+            minAmount: "0.00500000"
+            maxAmount: "50.00000000"
+            amountStep: "0.00000001"
+            decimalsFrom: 8
+            decimalsTo: 6
+            feePolicy:
+              mode: "INCLUDED_IN_SOURCE"
+              percent: "0.40"
+              minFee: "0.0005"
+              maxFee: null
+              networkFee: "0"
+              tierOverrides: []
+              promo: null
+              roundingMode: "ROUND_UP"
+            settlementMode: "INTERNAL"
+            updatedAt: "2026-08-07T09:00:00.000Z"
+            version: 7
+          - pairId: "RUB-EUR"
+            fromAsset: { assetId: "RUB", network: null }
+            toAsset: { assetId: "EUR", network: null }
+            enabled: true
+            disabledReason: null
+            minAmount: "1000.00"
+            maxAmount: "500000.00"
+            amountStep: "0.01"
+            decimalsFrom: 2
+            decimalsTo: 2
+            feePolicy:
+              mode: "INCLUDED_IN_SOURCE"
+              percent: "0.60"
+              minFee: "20.00"
+              maxFee: null
+              networkFee: "0"
+              tierOverrides: []
+              promo: null
+              roundingMode: "ROUND_UP"
+            settlementMode: "INTERNAL"
+            updatedAt: "2026-08-07T09:00:00.000Z"
+            version: 7
+        total: 8
+        updatedAt: "2026-08-07T09:00:00.000Z"
+        version: 14
+
+    PairsEurSourceEmpty:
+      summary: Направление EUR→* не поддерживается — пустой список
+      description: |
+        Запрос `GET /v1/pairs?fromAsset=EUR` возвращает `200` с пустым массивом:
+        актив `EUR` существует и включён, но ни одного направления из него не
+        сконфигурировано (канон §10.4).
+
+        BFF трактует пустой результат как отсутствие пары и на **шаге 5** цепочки
+        валидации возвращает наружу `PAIR_NOT_SUPPORTED` (422),
+        сообщение `This pair is not available right now`.
+        Это не ошибка транспорта — ретрай не выполняется.
+      value:
+        pairs: []
+        total: 0
+        updatedAt: "2026-08-07T09:00:00.000Z"
+        version: 14
+
+    UserLimitsTier2:
+      summary: Лимиты TIER_2 — фикстуры канона §10.5
+      description: |
+        Сутки: лимит `500000.00`, использовано `180000.00`, остаток `320000.00`.
+        Месяц: лимит `5000000.00`, использовано `1240000.00`, остаток `3760000.00`.
+        Все значения в `RUB` — валюте нормализации.
+      value:
+        userId: "usr_01J8ZQ4H9K2M3N4P5R6S7T8V9W"
+        tier: "TIER_2"
+        normalizationCurrency: "RUB"
+        windows:
+          - period: "PER_TRANSACTION"
+            limit: "300000.00"
+            used: "0"
+            remaining: "300000.00"
+            resetAt: "2026-08-08T00:00:00.000Z"
+            windowStartedAt: "2026-08-07T00:00:00.000Z"
+            currency: "RUB"
+          - period: "DAILY"
+            limit: "500000.00"
+            used: "180000.00"
+            remaining: "320000.00"
+            resetAt: "2026-08-08T00:00:00.000Z"
+            windowStartedAt: "2026-08-07T00:00:00.000Z"
+            currency: "RUB"
+          - period: "MONTHLY"
+            limit: "5000000.00"
+            used: "1240000.00"
+            remaining: "3760000.00"
+            resetAt: "2026-09-01T00:00:00.000Z"
+            windowStartedAt: "2026-08-01T00:00:00.000Z"
+            currency: "RUB"
+          - period: "YEARLY"
+            limit: "50000000.00"
+            used: "8730000.00"
+            remaining: "41270000.00"
+            resetAt: "2027-01-01T00:00:00.000Z"
+            windowStartedAt: "2026-01-01T00:00:00.000Z"
+            currency: "RUB"
+        perTransactionMax: "300000.00"
+        yearly:
+          period: "YEARLY"
+          limit: "50000000.00"
+          used: "8730000.00"
+          remaining: "41270000.00"
+          resetAt: "2027-01-01T00:00:00.000Z"
+          windowStartedAt: "2026-01-01T00:00:00.000Z"
+          currency: "RUB"
+        evaluatedAt: "2026-08-07T10:15:32.117Z"
+        version: 4821
+
+    UserLimitsDailyAlmostExhausted:
+      summary: Дневной лимит почти исчерпан (сценарий LIMIT_HIT канона §10.6)
+      description: |
+        Остаток суток — `1000.00 RUB`. Любая попытка обменять больше даёт
+        `LIMIT_EXCEEDED_DAILY` (422) с сообщением
+        `Daily limit reached. Available today: 1000.00`.
+      value:
+        userId: "usr_01J8ZQ4H9K2M3N4P5R6S7T8V9W"
+        tier: "TIER_2"
+        normalizationCurrency: "RUB"
+        windows:
+          - period: "PER_TRANSACTION"
+            limit: "300000.00"
+            used: "0"
+            remaining: "300000.00"
+            resetAt: "2026-08-08T00:00:00.000Z"
+            windowStartedAt: "2026-08-07T00:00:00.000Z"
+            currency: "RUB"
+          - period: "DAILY"
+            limit: "500000.00"
+            used: "499000.00"
+            remaining: "1000.00"
+            resetAt: "2026-08-08T00:00:00.000Z"
+            windowStartedAt: "2026-08-07T00:00:00.000Z"
+            currency: "RUB"
+          - period: "MONTHLY"
+            limit: "5000000.00"
+            used: "1240000.00"
+            remaining: "3760000.00"
+            resetAt: "2026-09-01T00:00:00.000Z"
+            windowStartedAt: "2026-08-01T00:00:00.000Z"
+            currency: "RUB"
+        perTransactionMax: "300000.00"
+        yearly: null
+        evaluatedAt: "2026-08-07T10:15:32.117Z"
+        version: 4830
+
+    FeeScheduleTier2:
+      summary: Схема комиссий пользователя TIER_2
+      description: |
+        Базовая ставка `0.35 %` с минимумом `10.00 RUB`, персональное переопределение
+        для пары `RUB→BTC` и одно активное промо на пару `RUB→USDT`.
+      value:
+        userId: "usr_01J8ZQ4H9K2M3N4P5R6S7T8V9W"
+        tier: "TIER_2"
+        default:
+          mode: "INCLUDED_IN_SOURCE"
+          percent: "0.35"
+          minFee: "10.00"
+          maxFee: null
+          networkFee: "0"
+          tierOverrides:
+            - tier: "TIER_3"
+              percent: "0.25"
+              minFee: "5.00"
+              maxFee: null
+          promo: null
+          roundingMode: "ROUND_UP"
+        overridesByPair:
+          - pairId: "RUB-BTC@BITCOIN"
+            policy:
+              mode: "INCLUDED_IN_SOURCE"
+              percent: "0.50"
+              minFee: "10.00"
+              maxFee: null
+              networkFee: "0"
+              tierOverrides: []
+              promo: null
+              roundingMode: "ROUND_UP"
+        activePromos:
+          - promoId: "promo_summer_2026"
+            discountPercent: "0.10"
+            validFrom: "2026-08-01T00:00:00.000Z"
+            validUntil: "2026-09-01T00:00:00.000Z"
+            appliesToPairs:
+              - "RUB-USDT@TRON"
+        validUntil: "2026-08-07T10:16:32.117Z"
+
+    ErrorValidationFailed:
+      summary: 400 — некорректный формат параметра
+      description: "Маппинг: `VALIDATION_FAILED` → наш `VALIDATION_ERROR` (400), не retryable."
+      value:
+        error: "VALIDATION_FAILED"
+        message: "Path parameter 'pairId' does not match required format FROM[@NETWORK]-TO[@NETWORK]"
+        traceId: "a1b2c3d4e5f60718"
+        timestamp: "2026-08-07T10:15:32.117Z"
+        details:
+          parameter: "pairId"
+          received: "rub_usdt"
+
+    ErrorUnauthenticated:
+      summary: 401 — сервисный токен невалиден
+      description: "Маппинг: `UNAUTHENTICATED` → наш `EXCHANGE_SERVICE_UNAVAILABLE` (503)."
+      value:
+        error: "UNAUTHENTICATED"
+        message: "Service JWT expired at 2026-08-07T10:14:00Z"
+        traceId: "b2c3d4e5f6071829"
+        timestamp: "2026-08-07T10:15:32.117Z"
+        details: null
+
+    ErrorForbidden:
+      summary: 403 — сервисный аккаунт не имеет прав на ресурс
+      description: "Маппинг: `FORBIDDEN` → наш `EXCHANGE_SERVICE_UNAVAILABLE` (503)."
+      value:
+        error: "FORBIDDEN"
+        message: "Service account svc:exchange-bff is not allowed to read fee schedules"
+        traceId: "c3d4e5f607182930"
+        timestamp: "2026-08-07T10:15:32.117Z"
+        details:
+          requiredScope: "fees:read"
+
+    ErrorPairUnknown:
+      summary: 404 — пара отсутствует в конфигурации
+      description: "Маппинг: `PAIR_UNKNOWN` → наш `PAIR_NOT_SUPPORTED` (422), не retryable."
+      value:
+        error: "PAIR_UNKNOWN"
+        message: "Pair BTC@BITCOIN-ETH@ETHEREUM is not configured"
+        traceId: "d4e5f60718293041"
+        timestamp: "2026-08-07T10:15:32.117Z"
+        details:
+          pairId: "BTC@BITCOIN-ETH@ETHEREUM"
+
+    ErrorEurPairUnknown:
+      summary: 404 — направление EUR→USDT намеренно не поддерживается
+      description: |
+        Канон §10.4: пара `EUR→*` не сконфигурирована для демонстрации негативного пути.
+        Маппинг: `PAIR_UNKNOWN` → наш `PAIR_NOT_SUPPORTED` (422),
+        сообщение пользователю `This pair is not available right now`,
+        крепится к селектору активов. Не retryable.
+      value:
+        error: "PAIR_UNKNOWN"
+        message: "Pair EUR-USDT@TRON is not configured; EUR is supported as a balance asset only"
+        traceId: "e5f6071829304152"
+        timestamp: "2026-08-07T10:15:32.117Z"
+        details:
+          pairId: "EUR-USDT@TRON"
+          fromAsset: "EUR"
+          hint: "EUR_AS_SOURCE_NOT_SUPPORTED"
+
+    ErrorUserUnknown:
+      summary: 404 — пользователь неизвестен сервису лимитов
+      description: |
+        Маппинг: `USER_UNKNOWN` → наш `EXCHANGE_SERVICE_UNAVAILABLE` (503).
+        Это признак рассинхронизации справочников S1 и S4, а не ошибки клиента;
+        событие эскалируется дежурному.
+      value:
+        error: "USER_UNKNOWN"
+        message: "User usr_01J8ZQ4H9K2M3N4P5R6S7T8V9W has no limit profile"
+        traceId: "f60718293041526a"
+        timestamp: "2026-08-07T10:15:32.117Z"
+        details:
+          userId: "usr_01J8ZQ4H9K2M3N4P5R6S7T8V9W"
+
+    ErrorPairDisabled:
+      summary: 422 — пара временно выключена
+      description: "Маппинг: `PAIR_DISABLED` → наш `PAIR_NOT_SUPPORTED` (422), не retryable."
+      value:
+        error: "PAIR_DISABLED"
+        message: "Pair RUB-EUR is temporarily disabled"
+        traceId: "0718293041526a7b"
+        timestamp: "2026-08-07T10:15:32.117Z"
+        details:
+          pairId: "RUB-EUR"
+          disabledReason: "NO_LIQUIDITY"
+
+    ErrorAssetDisabled:
+      summary: 422 — актив отключён
+      description: |
+        Маппинг: `ASSET_DISABLED` → наш `ASSET_NOT_SUPPORTED` (422), не retryable.
+        Шаг 3 цепочки валидации, сообщение `This asset is not available for exchange`,
+        крепится к селектору.
+      value:
+        error: "ASSET_DISABLED"
+        message: "Asset BTC@BITCOIN is disabled: network halted"
+        traceId: "18293041526a7b8c"
+        timestamp: "2026-08-07T10:15:32.117Z"
+        details:
+          assetId: "BTC"
+          network: "BITCOIN"
+          disabledReason: "NETWORK_HALTED"
+
+    ErrorAmountTooSmall:
+      summary: 422 — сумма ниже минимума пары
+      description: |
+        Маппинг: `AMOUNT_TOO_SMALL` → наш `AMOUNT_BELOW_MINIMUM` (422), не retryable.
+        Шаг 11, сообщение `Minimum amount is 500.00 RUB`, крепится к полю «You Pay».
+      value:
+        error: "AMOUNT_TOO_SMALL"
+        message: "Amount 100.00 RUB is below the minimum 500.00 RUB for pair RUB-USDT@TRON"
+        traceId: "293041526a7b8c9d"
+        timestamp: "2026-08-07T10:15:32.117Z"
+        details:
+          pairId: "RUB-USDT@TRON"
+          requested: "100.00"
+          minAmount: "500.00"
+          assetId: "RUB"
+
+    ErrorAmountTooLarge:
+      summary: 422 — сумма выше максимума пары
+      description: |
+        Маппинг: `AMOUNT_TOO_LARGE` → наш `AMOUNT_ABOVE_MAXIMUM` (422), не retryable.
+        Шаг 12, сообщение `Maximum amount is 1000000.00 RUB`.
+      value:
+        error: "AMOUNT_TOO_LARGE"
+        message: "Amount 2000000.00 RUB exceeds the maximum 1000000.00 RUB for pair RUB-USDT@TRON"
+        traceId: "3041526a7b8c9de0"
+        timestamp: "2026-08-07T10:15:32.117Z"
+        details:
+          pairId: "RUB-USDT@TRON"
+          requested: "2000000.00"
+          maxAmount: "1000000.00"
+          assetId: "RUB"
+
+    ErrorDailyLimitExceeded:
+      summary: 422 — дневной лимит оборота исчерпан
+      description: |
+        Маппинг: `DAILY_LIMIT_EXCEEDED` → наш `LIMIT_EXCEEDED_DAILY` (422), не retryable.
+        Шаг 15, сообщение `Daily limit reached. Available today: 320000.00`.
+        Значения `remaining` PII-чувствительны — в общие логи не пишутся.
+      value:
+        error: "DAILY_LIMIT_EXCEEDED"
+        message: "Requested 500000.00 RUB exceeds remaining daily limit 320000.00 RUB"
+        traceId: "41526a7b8c9de0f1"
+        timestamp: "2026-08-07T10:15:32.117Z"
+        details:
+          period: "DAILY"
+          limit: "500000.00"
+          used: "180000.00"
+          remaining: "320000.00"
+          requested: "500000.00"
+          currency: "RUB"
+
+    ErrorMonthlyLimitExceeded:
+      summary: 422 — месячный лимит оборота исчерпан
+      description: |
+        Маппинг: `MONTHLY_LIMIT_EXCEEDED` → наш `LIMIT_EXCEEDED_MONTHLY` (422),
+        не retryable. Шаг 15, сообщение `Monthly limit reached`.
+      value:
+        error: "MONTHLY_LIMIT_EXCEEDED"
+        message: "Requested 4000000.00 RUB exceeds remaining monthly limit 3760000.00 RUB"
+        traceId: "526a7b8c9de0f102"
+        timestamp: "2026-08-07T10:15:32.117Z"
+        details:
+          period: "MONTHLY"
+          limit: "5000000.00"
+          used: "1240000.00"
+          remaining: "3760000.00"
+          requested: "4000000.00"
+          currency: "RUB"
+
+    ErrorRateLimited:
+      summary: 429 — превышена частота запросов
+      description: |
+        Маппинг: `RATE_LIMITED` → наш `RATE_LIMITED` (429), retryable.
+        BFF уважает `Retry-After` и не засчитывает ответ circuit breaker'у.
+      value:
+        error: "RATE_LIMITED"
+        message: "Rate limit of 500 rps exceeded for service account svc:exchange-bff"
+        traceId: "6a7b8c9de0f10213"
+        timestamp: "2026-08-07T10:15:32.117Z"
+        details:
+          limit: "500"
+          window: "1s"
+          retryAfterSeconds: "2"
+
+    ErrorInternal:
+      summary: 500 — внутренний сбой S4
+      description: |
+        Маппинг: `INTERNAL_ERROR` → наш `EXCHANGE_SERVICE_UNAVAILABLE` (503), retryable.
+        BFF пытается отдать данные из кеша (в т.ч. stale); если кеша нет — заявка
+        не создаётся.
+      value:
+        error: "INTERNAL_ERROR"
+        message: "Unhandled exception while loading pair configuration"
+        traceId: "7b8c9de0f1021324"
+        timestamp: "2026-08-07T10:15:32.117Z"
+        details: null
+
+    ErrorServiceUnavailable:
+      summary: 503 — сервис временно недоступен
+      description: |
+        Маппинг: `SERVICE_UNAVAILABLE` → наш `EXCHANGE_SERVICE_UNAVAILABLE` (503),
+        retryable. Стратегия: stale-кеш активов/пар (5 мин) и комиссий (60 с),
+        иначе отказ создания заявки.
+      value:
+        error: "SERVICE_UNAVAILABLE"
+        message: "Limits & Fees service is draining connections for deployment"
+        traceId: "8c9de0f102132435"
+        timestamp: "2026-08-07T10:15:32.117Z"
+        details:
+          retryAfterSeconds: "5"
+
+    ErrorUpstreamTimeout:
+      summary: 504 — превышен таймаут 1000 мс
+      description: |
+        Маппинг: `UPSTREAM_TIMEOUT` → наш `UPSTREAM_TIMEOUT` (504), retryable.
+        Ретрай безопасен: все операции S4 — идемпотентные `GET` (максимум 2 попытки,
+        экспоненциальный backoff + jitter, канон §11).
+      value:
+        error: "UPSTREAM_TIMEOUT"
+        message: "Limits storage did not respond within 1000 ms"
+        traceId: "9de0f10213243546"
+        timestamp: "2026-08-07T10:15:32.117Z"
+        details:
+          timeoutMs: "1000"

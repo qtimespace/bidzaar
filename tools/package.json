@@ -1,0 +1,13 @@
+{
+  "name": "bidzaar-doc-tools",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "description": "Consistency checks across the delivered documentation: OpenAPI contracts, the error catalog and the Gherkin feature file.",
+  "scripts": {
+    "verify": "node verify-docs.mjs"
+  },
+  "dependencies": {
+    "yaml": "^2.6.1"
+  }
+}

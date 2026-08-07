@@ -1,0 +1,1045 @@
+/*
+ * Exchange screen styles.
+ *
+ * Every value resolves through a token from tokens.css, which mirrors
+ * `docs/UX-UI-Spec.md` §7.2. Layout follows the spec: a single 440 px card,
+ * vertical flow, generous internal padding, low-contrast elevation.
+ */
+
+/* ==========================================================================
+   Card
+   ========================================================================== */
+
+.card {
+  width: 100%;
+  max-width: var(--layout-card-width);
+  background: var(--color-surface);
+  border: var(--control-border-width) solid var(--color-border);
+  border-radius: var(--radius-xl);
+  box-shadow: var(--shadow-card);
+  padding: var(--layout-card-padding);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-6);
+}
+
+.card__header {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+
+.card__title {
+  margin: 0;
+  font-size: var(--font-size-title);
+  line-height: var(--line-height-title);
+  font-weight: var(--font-weight-bold);
+  letter-spacing: var(--letter-spacing-title);
+}
+
+.card__subtitle {
+  margin: 0;
+  font-size: var(--font-size-text);
+  color: var(--color-text-secondary);
+}
+
+@media (max-width: 480px) {
+  .card {
+    padding: var(--space-6);
+    border-radius: var(--radius-lg);
+  }
+}
+
+/* ==========================================================================
+   Amount field
+   ========================================================================== */
+
+.amount-field {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+  padding: var(--layout-block-padding);
+  border: var(--control-border-width) solid var(--color-border);
+  border-radius: var(--radius-lg);
+  background: var(--color-surface);
+  transition:
+    border-color var(--duration-base) var(--ease-standard),
+    box-shadow var(--duration-base) var(--ease-standard),
+    background var(--duration-base) var(--ease-standard);
+}
+
+.amount-field:focus-within {
+  border-color: var(--color-border-accent);
+  box-shadow: var(--shadow-focus);
+}
+
+.amount-field--invalid {
+  border-color: var(--color-border-danger);
+  background: var(--color-surface-danger);
+}
+
+.amount-field--invalid:focus-within {
+  box-shadow: var(--shadow-focus-danger);
+}
+
+.amount-field__header {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--space-4);
+  flex-wrap: wrap;
+}
+
+.amount-field__title {
+  font-size: var(--font-size-text);
+  font-weight: var(--font-weight-semibold);
+  color: var(--color-text-primary);
+}
+
+.amount-field__balance {
+  display: inline-flex;
+  align-items: center;
+  /* The row carries three things now — available, held and MAX — so it has to
+     be allowed to wrap on a 360 px screen instead of pushing the card wider. */
+  flex-wrap: wrap;
+  gap: var(--space-3);
+  font-size: var(--font-size-caption);
+  color: var(--color-text-secondary);
+  font-variant-numeric: tabular-nums;
+}
+
+/* Held funds are called out rather than quietly subtracted: otherwise the ETH
+   case disappears from the screen entirely and the user cannot tell why the
+   spendable amount is lower than the balance they remember (R-07). */
+.amount-field__held {
+  color: var(--color-text-warning);
+}
+
+.max-button {
+  border: var(--control-border-width) solid var(--color-border-accent);
+  border-radius: var(--radius-full);
+  background: var(--color-surface-accent);
+  color: var(--color-text-accent);
+  font-size: 10px;
+  font-weight: var(--font-weight-bold);
+  letter-spacing: var(--letter-spacing-overline);
+  padding: var(--space-1) var(--space-4);
+  transition: background var(--duration-fast) var(--ease-standard);
+}
+
+.max-button:hover:not(:disabled) {
+  background: var(--palette-blue-100);
+}
+
+.max-button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.amount-field__row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-5);
+}
+
+.amount-field__input {
+  flex: 1;
+  min-width: 0;
+  border: none;
+  background: transparent;
+  padding: 0;
+  text-align: right;
+  font-family: var(--font-family-base);
+  font-size: var(--font-size-amount);
+  line-height: var(--line-height-amount);
+  font-weight: var(--font-weight-semibold);
+  letter-spacing: var(--letter-spacing-amount);
+  font-variant-numeric: tabular-nums;
+  color: var(--color-text-primary);
+}
+
+.amount-field__input:focus {
+  outline: none;
+  box-shadow: none;
+}
+
+.amount-field__input::placeholder {
+  color: var(--color-text-disabled);
+}
+
+.amount-field__input[readonly] {
+  color: var(--color-text-primary);
+  cursor: default;
+}
+
+.amount-field__input--loading {
+  display: flex;
+  justify-content: flex-end;
+  align-items: center;
+}
+
+/* Long crypto amounts must shrink rather than overflow the card (UX risk R-04). */
+@media (max-width: 480px) {
+  .amount-field__input {
+    font-size: var(--font-size-amount-md);
+  }
+}
+
+.amount-field__caption {
+  margin: 0;
+  font-size: var(--font-size-caption);
+  line-height: var(--line-height-caption);
+  color: var(--color-text-secondary);
+}
+
+/* ==========================================================================
+   Percent chips
+   ========================================================================== */
+
+.percent-chips {
+  display: flex;
+  gap: var(--space-4);
+  flex-wrap: wrap;
+}
+
+.chip {
+  min-height: var(--control-height-chip);
+  padding: 0 var(--space-5);
+  border: var(--control-border-width) solid var(--color-border);
+  border-radius: var(--radius-full);
+  background: var(--color-surface);
+  color: var(--color-text-secondary);
+  font-size: var(--font-size-caption);
+  font-weight: var(--font-weight-semibold);
+  transition:
+    border-color var(--duration-fast) var(--ease-standard),
+    color var(--duration-fast) var(--ease-standard),
+    background var(--duration-fast) var(--ease-standard);
+}
+
+.chip:hover:not(:disabled) {
+  border-color: var(--color-border-accent);
+  color: var(--color-text-accent);
+}
+
+.chip[aria-pressed='true'] {
+  background: var(--color-surface-accent);
+  border-color: var(--color-border-accent);
+  color: var(--color-text-accent);
+}
+
+.chip:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+/* ==========================================================================
+   Swap button
+   ========================================================================== */
+
+.swap-wrapper {
+  display: flex;
+  justify-content: center;
+  /* Negative margins pull the button into the gap so it visually bridges the
+     two blocks instead of sitting between them as a third element. */
+  margin: calc(var(--space-6) * -1) 0;
+  position: relative;
+  z-index: var(--z-raised);
+  pointer-events: none;
+}
+
+.swap-button {
+  pointer-events: auto;
+  width: var(--control-height-swap);
+  height: var(--control-height-swap);
+  border-radius: var(--radius-full);
+  border: 3px solid var(--color-surface);
+  background: var(--color-action-primary);
+  color: var(--color-action-primary-fg);
+  display: grid;
+  place-items: center;
+  box-shadow: var(--shadow-md);
+  transition:
+    transform var(--duration-base) var(--ease-emphasis),
+    background var(--duration-fast) var(--ease-standard);
+}
+
+.swap-button:hover:not(:disabled) {
+  background: var(--color-action-primary-hover);
+  transform: rotate(180deg);
+}
+
+.swap-button:active:not(:disabled) {
+  background: var(--color-action-primary-active);
+}
+
+.swap-button:disabled {
+  background: var(--color-action-primary-disabled);
+  cursor: not-allowed;
+}
+
+/* ==========================================================================
+   Summary
+   ========================================================================== */
+
+.summary {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+  padding: var(--layout-block-padding);
+  background: var(--color-surface-sunken);
+  border: var(--control-border-width) solid var(--color-border);
+  border-radius: var(--radius-lg);
+}
+
+.summary__row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-6);
+  font-size: var(--font-size-text);
+  min-height: var(--line-height-text);
+}
+
+.summary__label {
+  color: var(--color-text-secondary);
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  flex: none;
+}
+
+.summary__hint {
+  width: 14px;
+  height: 14px;
+  border-radius: var(--radius-full);
+  background: var(--color-border);
+  color: var(--color-text-strong-muted);
+  font-size: 9px;
+  font-weight: var(--font-weight-bold);
+  display: grid;
+  place-items: center;
+  cursor: help;
+}
+
+.summary__value {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+  font-weight: var(--font-weight-medium);
+  overflow-wrap: anywhere;
+}
+
+.summary__row--emphasis .summary__value {
+  font-size: var(--font-size-section);
+  line-height: var(--line-height-section);
+  font-weight: var(--font-weight-bold);
+  color: var(--color-text-primary);
+}
+
+.summary--empty .summary__value {
+  color: var(--color-text-secondary);
+}
+
+/* ==========================================================================
+   Rate timer
+   ========================================================================== */
+
+.rate-timer {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  color: var(--color-text-secondary);
+  font-variant-numeric: tabular-nums;
+}
+
+.rate-timer--warning {
+  color: var(--color-text-warning);
+  font-weight: var(--font-weight-semibold);
+}
+
+.rate-timer--stale {
+  color: var(--color-text-secondary);
+  font-style: italic;
+}
+
+/* ==========================================================================
+   Banners
+   ========================================================================== */
+
+.banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-5);
+  padding: var(--space-5) var(--space-6);
+  border-radius: var(--radius-lg);
+  border: var(--control-border-width) solid transparent;
+  animation: banner-in var(--duration-base) var(--ease-out);
+  z-index: var(--z-banner);
+}
+
+@keyframes banner-in {
+  from {
+    opacity: 0;
+    transform: translateY(-4px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+.banner--warning {
+  background: var(--color-surface-warning);
+  border-color: var(--color-border-warning);
+  color: var(--color-text-warning);
+}
+
+.banner--error {
+  background: var(--color-surface-danger);
+  border-color: var(--palette-red-200);
+  color: var(--color-text-danger);
+}
+
+.banner__body {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  min-width: 0;
+}
+
+.banner__title {
+  margin: 0;
+  font-size: var(--font-size-text);
+  font-weight: var(--font-weight-semibold);
+}
+
+.banner__detail {
+  margin: 0;
+  font-size: var(--font-size-caption);
+  line-height: var(--line-height-caption);
+  opacity: 0.9;
+  font-variant-numeric: tabular-nums;
+}
+
+.banner__detail--code {
+  font-family: var(--font-family-mono);
+  letter-spacing: var(--letter-spacing-caption);
+  opacity: 0.65;
+}
+
+.banner__detail s {
+  opacity: 0.6;
+}
+
+.banner__action {
+  flex: none;
+  min-height: var(--control-height-chip);
+  padding: 0 var(--space-5);
+  border-radius: var(--radius-sm);
+  border: var(--control-border-width) solid currentColor;
+  background: transparent;
+  color: inherit;
+  font-size: var(--font-size-caption);
+  font-weight: var(--font-weight-semibold);
+  transition: background var(--duration-fast) var(--ease-standard);
+}
+
+.banner__action:hover {
+  background: rgba(255, 255, 255, 0.6);
+}
+
+/* ==========================================================================
+   Submit
+   ========================================================================== */
+
+.submit {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+
+.submit__button {
+  width: 100%;
+  height: var(--control-height-submit);
+  border: none;
+  border-radius: var(--radius-lg);
+  background: var(--color-action-primary);
+  color: var(--color-action-primary-fg);
+  font-size: var(--font-size-section);
+  font-weight: var(--font-weight-semibold);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--space-4);
+  transition:
+    background var(--duration-fast) var(--ease-standard),
+    transform var(--duration-instant) var(--ease-standard);
+}
+
+.submit__button:hover:not(:disabled) {
+  background: var(--color-action-primary-hover);
+}
+
+.submit__button:active:not(:disabled) {
+  transform: translateY(1px);
+}
+
+.submit__button:disabled {
+  background: var(--color-action-primary-disabled);
+  color: var(--color-action-primary-fg-disabled);
+  cursor: not-allowed;
+}
+
+/* Invariant from the spec: a disabled primary button always carries a visible
+   reason. A grey button with no explanation is the most common dead end in a
+   form — the user sees they are blocked but not by what. */
+.submit__reason {
+  margin: 0;
+  min-height: var(--line-height-caption);
+  font-size: var(--font-size-caption);
+  line-height: var(--line-height-caption);
+  color: var(--color-text-secondary);
+  text-align: center;
+}
+
+.spinner {
+  width: var(--control-icon-sm);
+  height: var(--control-icon-sm);
+  border-radius: var(--radius-full);
+  border: 2px solid rgba(255, 255, 255, 0.4);
+  border-top-color: var(--color-text-inverse);
+  animation: spin 0.7s var(--ease-linear) infinite;
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .spinner {
+    animation-duration: 2s;
+  }
+}
+
+.legal {
+  margin: 0;
+  font-size: var(--font-size-caption);
+  line-height: var(--line-height-caption);
+  color: var(--color-text-secondary);
+  text-align: center;
+}
+
+/* ==========================================================================
+   Inline error
+   ========================================================================== */
+
+.inline-error {
+  margin: 0;
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  font-size: var(--font-size-caption);
+  line-height: var(--line-height-caption);
+  color: var(--color-text-danger);
+}
+
+/* ==========================================================================
+   Success / manual review
+   ========================================================================== */
+
+.success {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--space-5);
+  padding: var(--space-9) var(--space-6);
+  border: var(--control-border-width) solid var(--color-border-success);
+  border-radius: var(--radius-lg);
+  background: var(--color-surface-success);
+  text-align: center;
+  animation: banner-in var(--duration-slow) var(--ease-out);
+}
+
+.success--review {
+  background: var(--color-surface-warning);
+  border-color: var(--color-border-warning);
+}
+
+.success__icon {
+  color: var(--color-text-success);
+}
+
+.success--review .success__icon {
+  color: var(--color-text-warning);
+}
+
+.success__title {
+  margin: 0;
+  font-size: var(--font-size-section);
+  line-height: var(--line-height-section);
+  font-weight: var(--font-weight-bold);
+}
+
+.success__subtitle {
+  margin: 0;
+  font-size: var(--font-size-text);
+  color: var(--color-text-strong-muted);
+  max-width: 34ch;
+}
+
+.success__details {
+  width: 100%;
+  margin: var(--space-4) 0 0;
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: var(--space-4) var(--space-6);
+  text-align: left;
+  background: var(--color-surface);
+  border: var(--control-border-width) solid var(--color-border);
+  border-radius: var(--radius-sm);
+  padding: var(--space-5);
+}
+
+.success__details > div {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  min-width: 0;
+}
+
+.success__details-wide {
+  grid-column: 1 / -1;
+}
+
+.success__details dt {
+  font-size: var(--font-size-caption);
+  color: var(--color-text-secondary);
+}
+
+.success__details dd {
+  margin: 0;
+  font-size: var(--font-size-text);
+  font-weight: var(--font-weight-semibold);
+  font-variant-numeric: tabular-nums;
+  overflow-wrap: anywhere;
+}
+
+.success__details code {
+  font-family: var(--font-family-mono);
+  font-size: var(--font-size-caption);
+  background: var(--color-surface-muted);
+  border-radius: var(--radius-xs);
+  padding: var(--space-1) var(--space-3);
+}
+
+.status-pill {
+  display: inline-block;
+  padding: var(--space-1) var(--space-4);
+  border-radius: var(--radius-full);
+  font-size: var(--font-size-caption);
+  font-weight: var(--font-weight-semibold);
+}
+
+.status-pill--pending {
+  background: var(--color-surface-accent);
+  color: var(--color-text-accent);
+}
+
+.status-pill--review {
+  background: var(--color-surface-warning);
+  color: var(--color-text-warning);
+}
+
+.success__action {
+  min-height: var(--control-height-select);
+  padding: 0 var(--space-7);
+  border-radius: var(--radius-lg);
+  border: var(--control-border-width) solid var(--color-border);
+  background: var(--color-surface);
+  font-size: var(--font-size-text);
+  font-weight: var(--font-weight-semibold);
+}
+
+.success__action:hover {
+  border-color: var(--color-border-accent);
+  color: var(--color-text-accent);
+}
+
+/* ==========================================================================
+   Skeleton
+   ========================================================================== */
+
+.skeleton {
+  display: block;
+  background: linear-gradient(
+    90deg,
+    var(--palette-gray-100) 25%,
+    var(--palette-gray-50) 50%,
+    var(--palette-gray-100) 75%
+  );
+  background-size: 200% 100%;
+  animation: shimmer var(--duration-shimmer) var(--ease-standard) infinite;
+}
+
+@keyframes shimmer {
+  from {
+    background-position: 200% 0;
+  }
+  to {
+    background-position: -200% 0;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .skeleton {
+    animation: none;
+  }
+}
+
+/* ==========================================================================
+   Asset select — custom combobox with balances (UX spec §22)
+   The native <select> is gone; keyboard, type-ahead, focus and the mobile
+   picker are now hand-built. See §22.3–22.4 before touching this.
+   ========================================================================== */
+
+.asset-select {
+  position: relative;
+  flex: none;
+}
+
+/* ---- Trigger ------------------------------------------------------------ */
+.asset-select__trigger {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-4);
+  min-height: var(--control-height-select);
+  padding: var(--space-2) var(--space-4) var(--space-2) var(--space-2);
+  background: var(--color-surface);
+  border: var(--control-border-width) solid var(--color-border);
+  border-radius: var(--radius-md);
+  box-shadow: var(--shadow-xs);
+  cursor: pointer;
+  transition:
+    border-color var(--duration-fast) var(--ease-standard),
+    background var(--duration-fast) var(--ease-standard);
+}
+
+/* 44 px hit area without growing the 40 px box (§14.6). */
+.asset-select__trigger::before {
+  content: '';
+  position: absolute;
+  inset: -2px 0;
+}
+
+@media (hover: hover) and (pointer: fine) {
+  .asset-select__trigger:hover:not(:disabled) {
+    background: var(--color-surface-sunken);
+    border-color: var(--color-border-strong);
+  }
+}
+
+.asset-select__trigger[aria-expanded='true'] {
+  border-color: var(--color-border-accent);
+}
+
+.asset-select--error .asset-select__trigger {
+  border-color: var(--color-border-danger);
+}
+
+.asset-select__trigger:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+.asset-select__glyph {
+  width: var(--control-icon-asset);
+  height: var(--control-icon-asset);
+  border-radius: var(--radius-full);
+  display: grid;
+  place-items: center;
+  color: var(--color-text-inverse);
+  font-size: var(--font-size-caption);
+  font-weight: var(--font-weight-semibold);
+  flex: none;
+}
+
+.asset-select__label {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  line-height: 1.1;
+}
+
+.asset-select__ticker {
+  font-size: var(--font-size-text);
+  font-weight: var(--font-weight-semibold);
+  color: var(--color-text-primary);
+}
+
+.asset-select__network {
+  font-size: 10px;
+  letter-spacing: var(--letter-spacing-overline);
+  color: var(--color-text-secondary);
+  text-transform: uppercase;
+}
+
+.asset-select__caret {
+  width: var(--control-icon-sm);
+  height: var(--control-icon-sm);
+  color: var(--color-text-secondary);
+  flex: none;
+  transition: transform var(--duration-base) var(--ease-standard);
+}
+
+.asset-select__trigger[aria-expanded='true'] .asset-select__caret {
+  transform: rotate(180deg);
+}
+
+/* ---- Panel: dropdown at 481 px and up ----------------------------------- */
+.asset-select__panel {
+  position: absolute;
+  z-index: var(--z-dropdown);
+  top: calc(100% + var(--space-2));
+  left: 0;
+  margin: 0;
+  padding: var(--space-2);
+  list-style: none;
+  min-width: 100%;
+  width: max(100%, 260px);
+  max-height: var(--dropdown-max-height);
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  background: var(--color-surface);
+  border: var(--control-border-width) solid var(--color-border);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-md);
+  animation: asset-panel-in var(--duration-base) var(--ease-out);
+}
+
+/* Not enough room below: flip up rather than squash (§22.8). */
+.asset-select__panel--above {
+  top: auto;
+  bottom: calc(100% + var(--space-2));
+}
+
+@keyframes asset-panel-in {
+  from {
+    opacity: 0;
+    transform: translateY(-4px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+/* ---- Option row --------------------------------------------------------- */
+.asset-select__option {
+  display: grid;
+  grid-template-columns: var(--control-icon-asset) minmax(0, 1fr) auto;
+  align-items: center;
+  gap: var(--space-5);
+  width: 100%;
+  min-height: var(--control-height-option);
+  padding: var(--space-3) var(--space-5);
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  transition: background var(--duration-instant) var(--ease-standard);
+}
+
+.asset-select__option-name {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  text-align: left;
+}
+
+.asset-select__option-primary {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  font-size: var(--font-size-text);
+  line-height: var(--line-height-text);
+  font-weight: var(--font-weight-medium);
+  color: var(--color-text-primary);
+  white-space: nowrap;
+}
+
+.asset-select__option-secondary {
+  font-size: var(--font-size-caption);
+  line-height: var(--line-height-caption);
+  color: var(--color-text-secondary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.asset-select__option-meta {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+/* #4B5563 rather than #6B7280: the balance sits on white, on #F3F4F6 and on
+   #EFF6FF, and #6B7280 scores only 4.39:1 on the hover fill (§22.9). */
+.asset-select__option-balance {
+  font-size: var(--font-size-text);
+  line-height: var(--line-height-text);
+  font-weight: var(--font-weight-medium);
+  color: var(--color-text-strong-muted);
+}
+
+.asset-select__option-held {
+  font-size: var(--font-size-caption);
+  line-height: var(--line-height-caption);
+  color: var(--color-text-warning);
+}
+
+/* A zero balance stays selectable: the asset exists, and INSUFFICIENT_FUNDS at
+   the field explains the situation better than a mute disabled row (§22.5). */
+.asset-select__option--empty .asset-select__option-balance {
+  color: var(--color-text-secondary);
+}
+
+.asset-select__option-note {
+  font-size: var(--font-size-caption);
+  line-height: var(--line-height-caption);
+  color: var(--color-text-secondary);
+}
+
+.asset-select__check {
+  width: var(--control-icon-sm);
+  height: var(--control-icon-sm);
+  color: var(--color-text-accent);
+  flex: none;
+}
+
+.asset-select__option--active,
+.asset-select__option:hover:not([aria-disabled='true']) {
+  background: var(--color-surface-muted);
+}
+
+.asset-select__option--active .asset-select__option-secondary,
+.asset-select__option:hover:not([aria-disabled='true']) .asset-select__option-secondary {
+  color: var(--color-text-strong-muted);
+}
+
+.asset-select__option[aria-selected='true'] {
+  background: var(--color-surface-accent);
+}
+
+/* No opacity here on purpose: the reason text is the only explanation of why
+   the option cannot be picked, so it has to stay readable (M-2, §22.9). */
+.asset-select__option[aria-disabled='true'] {
+  cursor: not-allowed;
+  background: transparent;
+}
+
+.asset-select__option[aria-disabled='true'] .asset-select__option-primary {
+  color: var(--color-text-secondary);
+  font-weight: var(--font-weight-regular);
+}
+
+/* Escape hatch for the dead end where every option is unavailable (R-11). */
+.asset-select__footer {
+  margin-top: var(--space-2);
+  padding-top: var(--space-2);
+  border-top: var(--control-border-width) solid var(--color-border);
+}
+
+.asset-select__footer button {
+  width: 100%;
+  min-height: var(--control-height-option);
+  border: none;
+  background: transparent;
+  border-radius: var(--radius-sm);
+  color: var(--color-text-accent);
+  font-size: var(--font-size-text);
+  font-weight: var(--font-weight-medium);
+}
+
+.asset-select__footer button:hover {
+  background: var(--color-surface-accent);
+}
+
+/* ---- Bottom sheet at 480 px and below -----------------------------------
+   An anchored dropdown loses to the on-screen keyboard and lands outside thumb
+   reach on a 360 px screen (§22.4). */
+.asset-select__overlay {
+  position: fixed;
+  inset: 0;
+  z-index: var(--z-overlay);
+  background: rgba(17, 24, 39, 0.32);
+  animation: asset-overlay-in var(--duration-base) var(--ease-out);
+}
+
+@keyframes asset-overlay-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+.asset-select__sheet {
+  position: fixed;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  z-index: calc(var(--z-overlay) + 1);
+  margin: 0;
+  padding: var(--space-4) var(--space-4) max(var(--space-8), env(safe-area-inset-bottom));
+  list-style: none;
+  max-height: var(--sheet-max-height);
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  background: var(--color-surface);
+  border-radius: var(--radius-xl) var(--radius-xl) 0 0;
+  box-shadow: var(--shadow-md);
+  animation: asset-sheet-in var(--duration-slow) var(--ease-out);
+}
+
+.asset-select__sheet:focus {
+  outline: none;
+}
+
+@keyframes asset-sheet-in {
+  from {
+    transform: translateY(100%);
+  }
+  to {
+    transform: translateY(0);
+  }
+}
+
+.asset-select__handle {
+  width: 36px;
+  height: 4px;
+  margin: 0 auto var(--space-4);
+  border-radius: var(--radius-full);
+  background: var(--color-border-strong);
+}
+
+.asset-select__sheet .asset-select__option {
+  min-height: 48px;
+}
+
+/* Motion is never the only signal: the open border, the rotated caret and the
+   highlight fill all survive without animation (§14.7). */
+@media (prefers-reduced-motion: reduce) {
+  .asset-select__panel,
+  .asset-select__sheet,
+  .asset-select__overlay {
+    animation: none;
+  }
+
+  .asset-select__caret {
+    transition: none;
+  }
+}

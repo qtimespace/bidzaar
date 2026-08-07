@@ -1,0 +1,2680 @@
+openapi: 3.1.0
+
+info:
+  title: Accounting Service (S6) — Inbound Contract Stub
+  version: "1.0.0"
+  summary: Балансы кошелька, резервы средств (holds) и ledger-записи.
+  description: |
+    # Назначение
+
+    Это **стаб внешнего сервиса S6 «Accounting Service»** (в BRD §10 он назван
+    *Wallet Service*). Контракт описывает **входящую к нам информацию**: что именно
+    наше приложение (**Exchange BFF**) получает от бухгалтерского ядра. Сам сервис мы
+    **не реализуем** — он принадлежит смежной команде. Файл фиксирует форму данных,
+    правила идемпотентности, коды ошибок и — главное — поведение при таймауте
+    финансовой мутации.
+
+    Источник истины по доменным именам, деньгам, порядку валидации, каталогу ошибок
+    и фикстурам — `docs/00-canonical-model.md` (далее «канон»). Расхождение = дефект.
+
+    # Что мы получаем
+
+    * **Балансы** (`GET /v1/wallets/{walletId}/balances`,
+      `GET /v1/wallets/{walletId}/balances/{assetId}`) — `total`, `held`, `available`,
+      точность актива и версия строки баланса (канон §4.2).
+    * **Резерв средств** (`POST /v1/holds`, `GET /v1/holds`, `GET /v1/holds/{holdId}`,
+      `DELETE /v1/holds/{holdId}`) — создание, поиск, чтение и снятие блокировки
+      на балансе списания.
+    * **Ledger-записи** (`GET /v1/wallets/{walletId}/ledger-entries`) — журнал проводок
+      с cursor-пагинацией. Используется для сверки и разбора инцидентов.
+
+    Это **единственная интеграция в нашем скоупе, которая мутирует состояние**
+    (`POST /v1/holds`, `DELETE /v1/holds/{holdId}`). Отсюда все особые правила ниже.
+
+    # Критичность (канон §3)
+
+    Класс критичности — **Blocking**. Без успешного резерва заявка не создаётся:
+    шаг 18 цепочки валидации возвращает `HOLD_FAILED` (409).
+
+    # Таймауты и ретраи (канон §11)
+
+    | Параметр | Значение |
+    |---|---|
+    | Таймаут одного вызова | **1 500 мс** — финансовая операция, ретрай опасен |
+    | Ретраи на `GET` / `DELETE` | 2 попытки, экспоненциальный backoff + jitter |
+    | Ретраи на **`POST /v1/holds`** | **ЗАПРЕЩЕНЫ.** Ни одной автоматической повторной попытки |
+    | Circuit breaker | порог 50 % ошибок на окне 20 запросов, open 30 с |
+
+    Формулировка канона §11 буквальна: «Ретраи — только для идемпотентных `GET`…
+    Ретрай `POST` без идемпотентности = двойное списание». `POST /v1/holds`
+    идемпотентен по `Idempotency-Key`, но при **таймауте** клиент не знает, дошёл ли
+    запрос до сервера, поэтому слепой повтор запрещён даже здесь: правильное действие —
+    **сверка**, а не ретрай (см. раздел «Таймаут POST /v1/holds» ниже).
+
+    `DELETE /v1/holds/{holdId}` идемпотентен по природе (повторное снятие уже снятого
+    резерва возвращает `200` с тем же телом), поэтому ретрай на нём разрешён.
+
+    # Кеширование
+
+    **Балансы не кешируются вообще** (канон §11, строка «Балансы — не кешируется,
+    всегда свежие»). Причины:
+
+    * `available` меняется от любой параллельной операции пользователя, и устаревшее
+      значение приводит к отказу на шаге 18 уже после того, как пользователь увидел
+      «средств достаточно»;
+    * решение о достаточности средств — финансовое, а не отображательное; принимать
+      его по устаревшим данным недопустимо;
+    * `version` строки баланса используется для оптимистичной блокировки — кеш сделал
+      бы её бессмысленной.
+
+    Резервы и ledger-записи также не кешируются. Условные запросы (`If-None-Match`)
+    сервис не поддерживает.
+
+    # Поведение при недоступности
+
+    | Ситуация | Действие BFF |
+    |---|---|
+    | Таймаут / 5xx на `GET .../balances` | ретрай (до 2), затем `EXCHANGE_SERVICE_UNAVAILABLE` (503); |
+    |  | подстановка старого баланса **запрещена** |
+    | Таймаут на `POST /v1/holds` | **сверка** через `GET /v1/holds?idempotencyKey=…`, ретрай запрещён |
+    | 5xx на `POST /v1/holds` (ответ получен) | заявка не создаётся, наружу `HOLD_FAILED` (409, retryable) — |
+    |  | пользователь может нажать «повторить», BFF пошлёт **тот же** `Idempotency-Key` |
+    | Таймаут / 5xx на `DELETE /v1/holds/{holdId}` | ретрай (до 2), затем постановка в очередь компенсации: |
+    |  | «висящий» резерв обязан быть снят фоновым процессом, иначе средства заперты |
+    | Circuit breaker open | исходящих вызовов нет, сразу `EXCHANGE_SERVICE_UNAVAILABLE` (503) |
+
+    # Таймаут `POST /v1/holds` — ключевой сценарий
+
+    Это самое опасное место всей интеграции, поэтому оно описано отдельно и подробно.
+
+    **Проблема.** Таймаут — это отсутствие ответа, а не признак отказа. Резерв мог быть
+    создан на стороне S6 и просто не успел вернуться в ответе. Три ошибочные реакции:
+
+    1. слепой повтор `POST` — при **другом** `Idempotency-Key` создаст **второй** резерв
+       и запрёт средства дважды;
+    2. трактовка таймаута как отказа и возврат ошибки пользователю — оставит «висящий»
+       резерв, уменьшающий `available` без видимой причины;
+    3. трактовка таймаута как успеха — создаст заявку без реального обеспечения.
+
+    **Правильный порядок действий BFF:**
+
+    ```
+    POST /v1/holds  (Idempotency-Key: 8f7d2e1a-…)
+        └── таймаут 1500 мс, ответа нет
+              │
+              ├─ 1. НЕ ретраить POST. Ни с тем же ключом, ни тем более с новым.
+              │
+              ├─ 2. Сверочный запрос:
+              │       GET /v1/holds?idempotencyKey=8f7d2e1a-…&walletId=wlt_…
+              │       (идемпотентный GET, таймаут 1500 мс, до 2 попыток)
+              │
+              ├─ 3a. Ответ содержит hold со статусом ACTIVE
+              │       → резерв ВСЁ-ТАКИ создан. Продолжаем шаг 19: регистрируем заявку
+              │         с этим holdId. Пользователь ничего не заметил.
+              │
+              ├─ 3b. Ответ пустой (holds: [])
+              │       → резерв НЕ создан. Заявка не создаётся, наружу HOLD_FAILED (409,
+              │         retryable, баннер «Could not reserve funds. Try again.»).
+              │         Повторная попытка пользователя идёт с ТЕМ ЖЕ Idempotency-Key.
+              │
+              └─ 3c. Сверочный GET тоже не отвечает
+                      → состояние НЕИЗВЕСТНО. Наружу UPSTREAM_TIMEOUT (504, retryable).
+                        Одновременно ключ 8f7d2e1a-… ставится в очередь отложенной
+                        сверки: фоновый процесс повторяет GET с backoff до получения
+                        определённости и снимает осиротевший резерв через
+                        DELETE /v1/holds/{holdId}, если заявка так и не была создана.
+    ```
+
+    **Почему сверка возможна.** Именно ради неё существует эндпоинт `GET /v1/holds`
+    с фильтром `idempotencyKey`: `Idempotency-Key` — это ключ, который **клиент**
+    сгенерировал до отправки, поэтому он известен даже когда ответ потерян.
+    Без такого фильтра восстановить состояние после таймаута было бы невозможно.
+
+    **Требования к ключу.** `Idempotency-Key` — UUIDv4, обязателен, окно хранения
+    на стороне S6 — **24 часа** (канон §9). Ключ выводится детерминированно из
+    `quoteId` пользовательской попытки, чтобы повтор после ошибки давал тот же ключ,
+    а новая котировка — новый.
+
+    # Где используется в цепочке валидации (канон §6)
+
+    | Шаг | Проверка | Эндпоинт |
+    |---|---|---|
+    | **13** | Кошелёк не заморожен → `WALLET_FROZEN` (403) | `GET /v1/wallets/{walletId}/balances` (флаг `walletStatus`) |
+    | **17** | Достаточно **available** баланса → `INSUFFICIENT_FUNDS` (422) | `GET /v1/wallets/{walletId}/balances/{assetId}` |
+    | **18** | Резерв успешно создан → `HOLD_FAILED` (409) | `POST /v1/holds` |
+
+    Все проверки достаточности средств ведутся **только по `available`**
+    (канон §2, инвариант I3: `fromAmount ≤ balance.available(fromAsset)`).
+    Значение `total` показывается пользователю справочно и в проверках не участвует.
+
+    Компенсация: если шаг 19 (регистрация заявки в S8) провалился, BFF **обязан**
+    снять резерв через `DELETE /v1/holds/{holdId}`, иначе средства останутся запертыми.
+
+    # Деньги
+
+    Все суммы и балансы — **строки** с десятичной записью (канон §5.1). Двоичные
+    `float`/`double` запрещены на всём пути. Регулярное выражение валидации:
+    `^(0|[1-9]\d{0,18})(\.\d{1,18})?$`. Точность значения не должна превышать
+    `decimals` актива (инвариант I5 канона §5.4).
+
+    # Время
+
+    ISO-8601 UTC с миллисекундами и суффиксом `Z` (канон §9).
+
+    # PII и приватность
+
+    Это **самый чувствительный** из трёх интеграционных контрактов: он содержит
+    финансовое состояние конкретного человека.
+
+    * `walletId`, `userId`, все суммы (`total`, `held`, `available`, `amount`,
+      `balanceAfter`) — **персональные финансовые данные**.
+    * Запрещено: писать суммы в общие журналы приложения; включать тела ответов S6
+      в трассировки, отправляемые в APM; кешировать балансы в любом виде;
+      возвращать наружу баланс актива, который пользователь не запрашивал.
+    * Разрешено: писать в аудит-лог с ограниченным доступом связку
+      `correlationId + walletId + holdId + entryId` (без сумм) и хранить её
+      столько, сколько требует финансовый регламент.
+    * В тексте ошибки наружу попадает только `available` того актива, который
+      пользователь сам ввёл: `Not enough {asset}. Available: {available}`
+      (канон §7) — это не утечка, потому что пользователь и так видит свой баланс.
+    * Ledger-записи — материал финансового аудита; доступ к
+      `GET /v1/wallets/{walletId}/ledger-entries` из BFF ограничен разбором инцидентов
+      и не используется на пользовательском пути.
+
+    # Безопасность транспорта
+
+    Service-to-service: **mTLS** на транспорте плюс **Bearer JWT** сервисного аккаунта
+    (см. `components.securitySchemes`). Мутирующие эндпоинты требуют отдельного
+    scope `holds:write`.
+
+  contact:
+    name: Wallet Platform / Accounting Core Team
+    email: accounting@wallet.internal
+  license:
+    name: Proprietary — internal use only
+    identifier: LicenseRef-Wallet-Internal
+
+servers:
+  - url: https://accounting.internal.wallet
+    description: |
+      Production. Внутренний контур, доступ только из service mesh, обязателен mTLS.
+      Версия API входит в путь (`/v1/...`), поэтому базовый URL версии не содержит.
+  - url: https://accounting.staging.internal.wallet
+    description: Staging. Реальная механика проводок на синтетических кошельках.
+  - url: https://accounting.mock.internal.wallet
+    description: |
+      Mock. Балансы из канона §10.2 — те же, что использует прототип.
+      `ETH` имеет ненулевой `held`, `EUR` нулевой — для демонстрации разницы
+      `total` / `available` и empty-state.
+
+security:
+  - bearerAuth: []
+
+tags:
+  - name: Balances
+    description: |
+      Балансы кошелька по активам (канон §4.2). Инвариант `available = total − held ≥ 0`.
+      **Не кешируются** — всегда свежие (канон §11). Содержат персональные финансовые
+      данные.
+  - name: Holds
+    description: |
+      Резервы средств на балансе списания. Создание идемпотентно по заголовку
+      `Idempotency-Key`; снятие — только через `DELETE`. Единственная мутирующая
+      область контракта, ретраи на создании запрещены.
+  - name: Ledger
+    description: |
+      Журнал бухгалтерских проводок с cursor-пагинацией. Материал финансового аудита;
+      на пользовательском пути создания заявки не используется.
+
+paths:
+
+  /v1/wallets/{walletId}/balances:
+    get:
+      operationId: listWalletBalances
+      summary: Балансы кошелька по всем активам
+      description: |
+        Возвращает балансы кошелька: `total`, `held`, `available` по каждому активу
+        и сети.
+
+        Используется на **шаге 13** цепочки валидации (канон §6): поле `walletStatus`
+        показывает, не заморожен ли кошелёк — при `FROZEN` наружу уходит
+        `WALLET_FROZEN` (403).
+
+        **Кеширование запрещено** (канон §11): любое значение старше момента ответа
+        может привести к отказу уже после того, как пользователь увидел «средств
+        достаточно». Заголовок ответа — `Cache-Control: no-store`.
+
+        Активы с нулевым балансом **возвращаются** (в фикстурах это `EUR`) — это нужно
+        для корректного empty-state в UI: «актив есть, средств нет» и «актива нет
+        вовсе» — разные состояния.
+      tags: [Balances]
+      parameters:
+        - $ref: '#/components/parameters/CorrelationId'
+        - $ref: '#/components/parameters/RequestId'
+        - $ref: '#/components/parameters/WalletIdPath'
+        - $ref: '#/components/parameters/IncludeZeroQuery'
+      responses:
+        '200':
+          description: Балансы получены.
+          headers:
+            X-Correlation-Id:
+              $ref: '#/components/headers/XCorrelationId'
+            X-Request-Id:
+              $ref: '#/components/headers/XRequestId'
+            Cache-Control:
+              $ref: '#/components/headers/CacheControlNoStore'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BalancesResponse'
+              examples:
+                fixtureWallet:
+                  $ref: '#/components/examples/BalancesFixture'
+                frozenWallet:
+                  $ref: '#/components/examples/BalancesFrozenWallet'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+        '504':
+          $ref: '#/components/responses/GatewayTimeout'
+
+  /v1/wallets/{walletId}/balances/{assetId}:
+    get:
+      operationId: getWalletBalance
+      summary: Баланс кошелька по одному активу
+      description: |
+        Возвращает одну строку баланса. Это **основной** вызов на пользовательском пути:
+        на **шаге 17** цепочки валидации проверяется инвариант I3 канона §5.4 —
+        `fromAmount ≤ balance.available(fromAsset)`. При нарушении наружу уходит
+        `INSUFFICIENT_FUNDS` (422) с сообщением
+        `Not enough {asset}. Available: {available}`.
+
+        Параметр `network` **обязателен для крипто-активов**: `USDT@TRON` и
+        `USDT@ETHEREUM` — разные балансы (канон §2). Для фиата параметр не передаётся;
+        передача сети для фиата даёт `400`.
+
+        Из ответа берётся также `version` — она передаётся в `POST /v1/holds` как
+        `expectedBalanceVersion` для оптимистичной блокировки. Между чтением баланса
+        и созданием резерва должно пройти как можно меньше времени: чем больше окно,
+        тем выше вероятность `BALANCE_VERSION_CONFLICT`.
+
+        Кеширование запрещено, `Cache-Control: no-store`.
+      tags: [Balances]
+      parameters:
+        - $ref: '#/components/parameters/CorrelationId'
+        - $ref: '#/components/parameters/RequestId'
+        - $ref: '#/components/parameters/WalletIdPath'
+        - $ref: '#/components/parameters/AssetIdPath'
+        - $ref: '#/components/parameters/NetworkQuery'
+      responses:
+        '200':
+          description: Баланс получен.
+          headers:
+            X-Correlation-Id:
+              $ref: '#/components/headers/XCorrelationId'
+            X-Request-Id:
+              $ref: '#/components/headers/XRequestId'
+            Cache-Control:
+              $ref: '#/components/headers/CacheControlNoStore'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Balance'
+              examples:
+                rubBalance:
+                  $ref: '#/components/examples/BalanceRub'
+                ethWithHeld:
+                  $ref: '#/components/examples/BalanceEthWithHeld'
+                eurZero:
+                  $ref: '#/components/examples/BalanceEurZero'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          description: |
+            Кошелёк существует, но запрошенного актива на нём нет.
+            Маппинг: `ASSET_NOT_ON_WALLET` → наш `ASSET_NOT_SUPPORTED` (422),
+            не retryable, сообщение `This asset is not available for exchange`,
+            крепится к селектору.
+          headers:
+            X-Correlation-Id:
+              $ref: '#/components/headers/XCorrelationId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AccountingServiceError'
+              examples:
+                assetNotOnWallet:
+                  $ref: '#/components/examples/ErrorAssetNotOnWallet'
+                walletUnknown:
+                  $ref: '#/components/examples/ErrorWalletUnknown'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+        '504':
+          $ref: '#/components/responses/GatewayTimeout'
+
+  /v1/holds:
+    post:
+      operationId: createHold
+      summary: Создать резерв средств
+      description: |
+        Создаёт блокировку средств на балансе списания. Это **шаг 18** цепечки
+        валидации (канон §6); при отказе наружу уходит `HOLD_FAILED` (409, retryable).
+
+        ## Идемпотентность
+
+        Заголовок `Idempotency-Key` (UUIDv4) **обязателен**. Окно хранения ключа —
+        **24 часа** (канон §9). Поведение:
+
+        | Ситуация | Ответ |
+        |---|---|
+        | Ключ встречен впервые | `201 Created`, новый `holdId` |
+        | Повтор с **тем же** телом | `201 Created`, **тот же** `holdId` и то же тело; |
+        |  | новый резерв **не** создаётся, средства не блокируются повторно |
+        | Повтор с **другим** телом | `409 Conflict`, код `HOLD_ALREADY_EXISTS_DIFFERENT_BODY`, |
+        |  | → наш `IDEMPOTENCY_CONFLICT` (409), **не** retryable |
+        | Запрос в обработке (гонка) | `409 Conflict`, код `IDEMPOTENT_REQUEST_IN_PROGRESS`, |
+        |  | → наш `HOLD_FAILED` (409), retryable после паузы |
+
+        Сравнение тел ведётся по каноническому представлению JSON (сортировка ключей,
+        нормализация десятичных строк без изменения значения), поэтому порядок полей
+        и незначащие пробелы на результат не влияют. `expectedBalanceVersion`
+        **входит** в сравниваемое тело: повтор с другой версией — это другой запрос.
+
+        ## Ретраи
+
+        **Автоматические ретраи запрещены** (канон §11). При таймауте выполняется
+        **сверка** через `GET /v1/holds?idempotencyKey=…` — полный алгоритм описан
+        в разделе «Таймаут POST /v1/holds» в `info.description`.
+        Повтор допускается только как явное действие пользователя («Try again»),
+        и он идёт с **тем же** `Idempotency-Key`.
+
+        ## Оптимистичная блокировка
+
+        `expectedBalanceVersion` — версия строки баланса, прочитанная непосредственно
+        перед запросом. Если к моменту обработки версия на сервере изменилась
+        (параллельная операция пользователя), возвращается `409`
+        `BALANCE_VERSION_CONFLICT` → наш `HOLD_FAILED` (409, retryable): BFF
+        перечитывает баланс и повторяет цикл с новым ключом идемпотентности.
+
+        ## Срок жизни резерва
+
+        `expiresInSeconds` ограничивает время, на которое блокируются средства.
+        Резерв, не переведённый в `CAPTURED` до `expiresAt`, автоматически переходит
+        в `EXPIRED`, и средства освобождаются — это защита от «висящих» резервов
+        при сбое оркестрации.
+      tags: [Holds]
+      parameters:
+        - $ref: '#/components/parameters/CorrelationId'
+        - $ref: '#/components/parameters/RequestId'
+        - $ref: '#/components/parameters/IdempotencyKeyHeader'
+      requestBody:
+        required: true
+        description: Параметры создаваемого резерва.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/HoldCreateRequest'
+            examples:
+              rubHoldForExchange:
+                $ref: '#/components/examples/HoldCreateRequestRub'
+      responses:
+        '201':
+          description: |
+            Резерв создан. Тот же ответ возвращается при повторе с тем же
+            `Idempotency-Key` и тем же телом — повторной блокировки средств не происходит.
+          headers:
+            X-Correlation-Id:
+              $ref: '#/components/headers/XCorrelationId'
+            X-Request-Id:
+              $ref: '#/components/headers/XRequestId'
+            Location:
+              $ref: '#/components/headers/Location'
+            Idempotency-Replayed:
+              $ref: '#/components/headers/IdempotencyReplayed'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Hold'
+              examples:
+                created:
+                  $ref: '#/components/examples/HoldActive'
+                replayed:
+                  $ref: '#/components/examples/HoldActiveReplayed'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/WalletFrozen'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/UnprocessableEntity'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+        '504':
+          $ref: '#/components/responses/GatewayTimeoutOnMutation'
+
+    get:
+      operationId: listHolds
+      summary: Найти резервы по фильтру (в т.ч. сверка после таймаута)
+      description: |
+        Возвращает резервы, подходящие под фильтр. **Это сверочный эндпоинт** — он
+        существует прежде всего ради восстановления состояния после таймаута
+        `POST /v1/holds`.
+
+        ## Основной сценарий: сверка после таймаута
+
+        ```
+        GET /v1/holds?idempotencyKey=8f7d2e1a-4c5b-4d6e-9f01-2a3b4c5d6e7f&walletId=wlt_…
+        ```
+
+        * массив `holds` **не пуст** → резерв создан, берём `holdId` и продолжаем
+          регистрацию заявки (шаг 19);
+        * массив `holds` **пуст** → резерв не создан, наружу `HOLD_FAILED` (409,
+          retryable);
+        * сам сверочный запрос не ответил → состояние неизвестно, наружу
+          `UPSTREAM_TIMEOUT` (504) и постановка ключа в очередь отложенной сверки.
+
+        Полный алгоритм — в разделе «Таймаут POST /v1/holds» в `info.description`.
+
+        Фильтр `idempotencyKey` работает в течение окна хранения ключа — **24 часа**
+        (канон §9). После истечения окна ответ будет пустым даже для существующего
+        резерва, поэтому сверка обязана происходить в пределах этого окна.
+
+        ## Прочие сценарии
+
+        Фильтры `walletId`, `status`, `referenceId` используются при разборе
+        инцидентов и фоновой уборкой «висящих» резервов. Пагинация — cursor-based.
+
+        `GET` идемпотентен, ретраи разрешены (до 2 попыток).
+      tags: [Holds]
+      parameters:
+        - $ref: '#/components/parameters/CorrelationId'
+        - $ref: '#/components/parameters/RequestId'
+        - $ref: '#/components/parameters/IdempotencyKeyQuery'
+        - $ref: '#/components/parameters/WalletIdQuery'
+        - $ref: '#/components/parameters/HoldStatusQuery'
+        - $ref: '#/components/parameters/ReferenceIdQuery'
+        - $ref: '#/components/parameters/CursorQuery'
+        - $ref: '#/components/parameters/LimitQuery'
+      responses:
+        '200':
+          description: |
+            Список резервов. **Пустой массив — валидный и значимый ответ**: при сверке
+            по `idempotencyKey` он означает «резерв не был создан».
+          headers:
+            X-Correlation-Id:
+              $ref: '#/components/headers/XCorrelationId'
+            X-Request-Id:
+              $ref: '#/components/headers/XRequestId'
+            Cache-Control:
+              $ref: '#/components/headers/CacheControlNoStore'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HoldsResponse'
+              examples:
+                reconciliationFound:
+                  $ref: '#/components/examples/HoldsReconciliationFound'
+                reconciliationNotFound:
+                  $ref: '#/components/examples/HoldsReconciliationEmpty'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+        '504':
+          $ref: '#/components/responses/GatewayTimeout'
+
+  /v1/holds/{holdId}:
+    get:
+      operationId: getHold
+      summary: Прочитать резерв по идентификатору
+      description: |
+        Возвращает текущее состояние резерва. Используется для проверки статуса перед
+        компенсацией, при разборе инцидентов и фоновой уборкой просроченных резервов.
+
+        Идемпотентный `GET`, ретраи разрешены (до 2 попыток).
+      tags: [Holds]
+      parameters:
+        - $ref: '#/components/parameters/CorrelationId'
+        - $ref: '#/components/parameters/RequestId'
+        - $ref: '#/components/parameters/HoldIdPath'
+      responses:
+        '200':
+          description: Резерв найден.
+          headers:
+            X-Correlation-Id:
+              $ref: '#/components/headers/XCorrelationId'
+            X-Request-Id:
+              $ref: '#/components/headers/XRequestId'
+            Cache-Control:
+              $ref: '#/components/headers/CacheControlNoStore'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Hold'
+              examples:
+                active:
+                  $ref: '#/components/examples/HoldActive'
+                released:
+                  $ref: '#/components/examples/HoldReleased'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+        '504':
+          $ref: '#/components/responses/GatewayTimeout'
+
+    delete:
+      operationId: releaseHold
+      summary: Снять резерв (release)
+      description: |
+        Снимает блокировку: сумма возвращается в `available`, статус резерва
+        становится `RELEASED`, в журнал пишется запись `HOLD_RELEASED`.
+
+        ## Почему `DELETE`, а не `POST /v1/holds/{holdId}/release`
+
+        Вариант `POST .../release` рассматривался и **отвергнут**. Причины:
+
+        1. **Ресурсный REST, а не RPC.** `release` — глагол; путь с глаголом
+           превращает ресурс в набор процедур. Канон §9 фиксирует ресурсное
+           именование (множественное число, `kebab-case`), и действие «убрать
+           резерв» — это ровно семантика удаления ресурса `hold`.
+        2. **Идемпотентность бесплатно.** `DELETE` идемпотентен по спецификации HTTP:
+           повторный вызов на уже снятом резерве возвращает `200` с тем же телом,
+           а не ошибку. Это критично, потому что снятие резерва — компенсирующее
+           действие, которое выполняется в ретрай-цикле после сбоя шага 19, и оно
+           обязано быть безопасным при многократном исполнении. С `POST` пришлось бы
+           вводить отдельный `Idempotency-Key` для компенсации.
+        3. **Прозрачность для инфраструктуры.** Прокси, service mesh и клиентские
+           библиотеки знают, что `DELETE` идемпотентен, и корректно ретраят его
+           автоматически; `POST` они (правильно) ретраить отказываются.
+
+        Поэтому в контракте **только** `DELETE /v1/holds/{holdId}`.
+        Эндпоинт `POST /v1/holds/{holdId}/release` не существует и не будет добавлен.
+
+        ## Ответы
+
+        * `200` — резерв снят либо уже был снят ранее (идемпотентный повтор);
+        * `404` — резерва не существует; для компенсирующего процесса это
+          **не ошибка**: цель достигнута, средства не заперты;
+        * `409` `HOLD_NOT_RELEASABLE` — резерв уже переведён в `CAPTURED`
+          (средства списаны, снимать нечего) → наш `HOLD_FAILED` (409).
+
+        Ретраи разрешены (до 2 попыток). При исчерпании — постановка в очередь
+        компенсации: «висящий» резерв обязан быть снят, иначе средства пользователя
+        останутся заблокированными.
+      tags: [Holds]
+      parameters:
+        - $ref: '#/components/parameters/CorrelationId'
+        - $ref: '#/components/parameters/RequestId'
+        - $ref: '#/components/parameters/HoldIdPath'
+        - $ref: '#/components/parameters/ReleaseReasonQuery'
+      responses:
+        '200':
+          description: |
+            Резерв снят. Повторный вызов на уже снятом резерве возвращает то же тело
+            со статусом `RELEASED` — операция идемпотентна.
+          headers:
+            X-Correlation-Id:
+              $ref: '#/components/headers/XCorrelationId'
+            X-Request-Id:
+              $ref: '#/components/headers/XRequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Hold'
+              examples:
+                released:
+                  $ref: '#/components/examples/HoldReleased'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/WalletFrozen'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+        '504':
+          $ref: '#/components/responses/GatewayTimeout'
+
+  /v1/wallets/{walletId}/ledger-entries:
+    get:
+      operationId: listLedgerEntries
+      summary: Ledger-записи кошелька
+      description: |
+        Возвращает журнал бухгалтерских проводок по кошельку с **cursor-пагинацией**
+        (канон §9: `cursor`, `limit`). Порядок — по возрастанию `sequence`,
+        то есть в порядке фиксации проводок.
+
+        Cursor-пагинация выбрана вместо offset намеренно: журнал непрерывно пополняется,
+        и offset давал бы дубликаты и пропуски при параллельной записи.
+        `cursor` — непрозрачная строка; клиент обязан передавать её без изменений
+        и не пытаться разобрать.
+
+        Эндпоинт **не используется на пользовательском пути** создания заявки: он нужен
+        для сверки, финансового аудита и разбора инцидентов. Содержит персональные
+        финансовые данные — доступ ограничен (см. раздел PII в `info.description`).
+
+        Идемпотентный `GET`, ретраи разрешены.
+      tags: [Ledger]
+      parameters:
+        - $ref: '#/components/parameters/CorrelationId'
+        - $ref: '#/components/parameters/RequestId'
+        - $ref: '#/components/parameters/WalletIdPath'
+        - $ref: '#/components/parameters/AssetIdQuery'
+        - $ref: '#/components/parameters/EntryTypeQuery'
+        - $ref: '#/components/parameters/CursorQuery'
+        - $ref: '#/components/parameters/LimitQuery'
+      responses:
+        '200':
+          description: Страница ledger-записей получена.
+          headers:
+            X-Correlation-Id:
+              $ref: '#/components/headers/XCorrelationId'
+            X-Request-Id:
+              $ref: '#/components/headers/XRequestId'
+            Cache-Control:
+              $ref: '#/components/headers/CacheControlNoStore'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LedgerEntriesResponse'
+              examples:
+                holdLifecycle:
+                  $ref: '#/components/examples/LedgerHoldLifecycle'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+        '504':
+          $ref: '#/components/responses/GatewayTimeout'
+
+components:
+
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: |
+        **Service-to-service JWT.** BFF предъявляет короткоживущий токен сервисного
+        аккаунта (`sub = svc:exchange-bff`, TTL ≤ 300 с, подпись `RS256`, обязательные
+        claims `iss`, `aud = accounting`, `exp`, `jti`) в заголовке
+        `Authorization: Bearer <token>`.
+
+        Токен **дополняет**, а не заменяет транспортную аутентификацию: соединение
+        обязано быть установлено по **mTLS**, клиентский сертификат выдаётся внутренним
+        CA service mesh, CN сертификата обязан совпадать с `sub` токена. Запрос без
+        валидного клиентского сертификата отбрасывается на уровне mesh.
+
+        **Scopes.** Чтение балансов и журнала — `balances:read` / `ledger:read`.
+        Мутирующие операции (`POST /v1/holds`, `DELETE /v1/holds/{holdId}`) требуют
+        отдельного scope **`holds:write`**, который выдаётся только BFF и только на
+        продовом окружении. Отсутствие scope даёт `403 FORBIDDEN`.
+
+        Пользовательский JWT в S6 **не передаётся**: сервис доверяет BFF и работает
+        с `walletId` как с параметром пути. Проверка принадлежности кошелька
+        пользователю — ответственность BFF (данные из S1).
+
+  parameters:
+
+    CorrelationId:
+      name: X-Correlation-Id
+      in: header
+      required: false
+      description: |
+        Сквозной идентификатор бизнес-операции (канон §9). Записывается сервисом
+        в ledger-запись (`LedgerEntry.correlationId`), что позволяет связать проводку
+        с конкретной заявкой при аудите. Возвращается эхом в ответе и во всех ошибках.
+        Формат — ULID (26 символов Crockford Base32) либо UUIDv4.
+      schema:
+        type: string
+        minLength: 26
+        maxLength: 36
+        pattern: '^([0-9A-HJKMNP-TV-Z]{26}|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$'
+        examples:
+          - "01J9X2C4K7QF8N3M5T6V7W8Y9Z"
+
+    RequestId:
+      name: X-Request-Id
+      in: header
+      required: false
+      description: |
+        Идентификатор конкретной HTTP-попытки. Меняется на каждом ретрае. Для
+        `POST /v1/holds` особенно важен: он позволяет при разборе инцидента отличить
+        сверочный запрос от исходного, у которых одинаковый `X-Correlation-Id`.
+      schema:
+        type: string
+        format: uuid
+        minLength: 36
+        maxLength: 36
+        pattern: '^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$'
+        examples:
+          - "3f2504e0-4f89-41d3-9a0c-0305e82c3301"
+
+    IdempotencyKeyHeader:
+      name: Idempotency-Key
+      in: header
+      required: true
+      description: |
+        **Обязательный** ключ идемпотентности в формате UUIDv4 (канон §9).
+        Окно хранения на стороне S6 — 24 часа.
+
+        * повтор с **тем же** телом → тот же `201` и тот же `holdId`,
+          повторной блокировки средств не происходит;
+        * повтор с **другим** телом → `409` `HOLD_ALREADY_EXISTS_DIFFERENT_BODY`
+          → наш `IDEMPOTENCY_CONFLICT` (409), не retryable.
+
+        Ключ генерируется BFF **до** отправки запроса и выводится детерминированно
+        из `quoteId` попытки. Благодаря этому он известен даже при потере ответа —
+        и именно по нему выполняется сверка через `GET /v1/holds?idempotencyKey=…`.
+      schema:
+        $ref: '#/components/schemas/IdempotencyKey'
+
+    IdempotencyKeyQuery:
+      name: idempotencyKey
+      in: query
+      required: false
+      description: |
+        Фильтр по ключу идемпотентности. **Главный параметр сверки после таймаута**
+        `POST /v1/holds`: непустой результат означает «резерв создан», пустой —
+        «не создан». Работает в пределах окна хранения ключа (24 часа).
+      schema:
+        $ref: '#/components/schemas/IdempotencyKey'
+
+    WalletIdPath:
+      name: walletId
+      in: path
+      required: true
+      description: |
+        Идентификатор кошелька. Принадлежность кошелька пользователю проверяет BFF
+        по данным S1 — сервис S6 этого не делает.
+      schema:
+        $ref: '#/components/schemas/WalletId'
+
+    WalletIdQuery:
+      name: walletId
+      in: query
+      required: false
+      description: |
+        Фильтр по кошельку. При сверке передаётся вместе с `idempotencyKey`,
+        чтобы сузить выборку и ускорить ответ в пределах таймаута 1 500 мс.
+      schema:
+        $ref: '#/components/schemas/WalletId'
+
+    AssetIdPath:
+      name: assetId
+      in: path
+      required: true
+      description: |
+        Код актива (канон §4.1). Вместе с `network` однозначно определяет строку
+        баланса.
+      schema:
+        $ref: '#/components/schemas/AssetId'
+
+    AssetIdQuery:
+      name: assetId
+      in: query
+      required: false
+      description: Фильтр ledger-записей по активу.
+      schema:
+        $ref: '#/components/schemas/AssetId'
+
+    NetworkQuery:
+      name: network
+      in: query
+      required: false
+      description: |
+        Блокчейн-сеть актива. **Обязателен для крипто-активов**: `USDT@TRON` и
+        `USDT@ETHEREUM` — разные балансы (канон §2). Для фиатных активов параметр
+        не передаётся; его передача для фиата даёт `400 VALIDATION_FAILED`.
+      schema:
+        type: string
+        enum: ["TRON", "ETHEREUM", "BITCOIN"]
+        examples:
+          - "TRON"
+
+    HoldIdPath:
+      name: holdId
+      in: path
+      required: true
+      description: Идентификатор резерва, выданный сервисом при создании.
+      schema:
+        $ref: '#/components/schemas/HoldId'
+
+    HoldStatusQuery:
+      name: status
+      in: query
+      required: false
+      description: |
+        Фильтр по статусу резерва. Фоновая уборка «висящих» резервов запрашивает
+        `status=ACTIVE` вместе с `referenceId` заявки, которая не была создана.
+      schema:
+        $ref: '#/components/schemas/HoldStatus'
+
+    ReferenceIdQuery:
+      name: referenceId
+      in: query
+      required: false
+      description: |
+        Фильтр по идентификатору связанной сущности нашего домена — `orderId`
+        или `quoteId`. Используется при компенсации и разборе инцидентов.
+      schema:
+        $ref: '#/components/schemas/ReferenceId'
+
+    ReleaseReasonQuery:
+      name: reason
+      in: query
+      required: false
+      description: |
+        Причина снятия резерва. Попадает в ledger-запись `HOLD_RELEASED` и в аудит.
+        Наиболее частое значение на нашем пути — `ORDER_CREATION_FAILED`: заявка
+        не зарегистрировалась на шаге 19, и резерв компенсируется.
+      schema:
+        type: string
+        enum:
+          - "ORDER_CREATION_FAILED"
+          - "USER_CANCELLED"
+          - "QUOTE_EXPIRED"
+          - "COMPENSATION"
+          - "OPERATOR_ACTION"
+        examples:
+          - "ORDER_CREATION_FAILED"
+
+    EntryTypeQuery:
+      name: entryType
+      in: query
+      required: false
+      description: Фильтр ledger-записей по типу проводки.
+      schema:
+        $ref: '#/components/schemas/LedgerEntryType'
+
+    IncludeZeroQuery:
+      name: includeZero
+      in: query
+      required: false
+      description: |
+        Включать ли активы с нулевым балансом. По умолчанию `true`: нулевой `EUR`
+        в фикстурах канона §10.2 нужен для проверки empty-state в UI —
+        «актив есть, средств нет» и «актива нет» это разные состояния.
+      schema:
+        type: boolean
+        default: true
+        examples:
+          - true
+
+    CursorQuery:
+      name: cursor
+      in: query
+      required: false
+      description: |
+        Курсор следующей страницы (канон §9, cursor-based пагинация). Непрозрачная
+        строка: клиент передаёт её без изменений и не пытается разобрать.
+        Отсутствие параметра означает «первая страница».
+      schema:
+        type: string
+        minLength: 1
+        maxLength: 512
+        pattern: '^[A-Za-z0-9_=-]{1,512}$'
+        examples:
+          - "eyJzZXEiOjE0MjA5OH0"
+
+    LimitQuery:
+      name: limit
+      in: query
+      required: false
+      description: |
+        Размер страницы. По умолчанию 50, максимум 200 — верхняя граница подобрана
+        так, чтобы ответ гарантированно укладывался в таймаут 1 500 мс.
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 200
+        default: 50
+        examples:
+          - 50
+
+  headers:
+
+    XCorrelationId:
+      description: Сквозной идентификатор бизнес-операции, эхом возвращается сервисом.
+      required: true
+      schema:
+        type: string
+        minLength: 26
+        maxLength: 36
+        examples:
+          - "01J9X2C4K7QF8N3M5T6V7W8Y9Z"
+
+    XRequestId:
+      description: Идентификатор конкретной HTTP-попытки, эхом возвращается сервисом.
+      required: false
+      schema:
+        type: string
+        format: uuid
+        minLength: 36
+        maxLength: 36
+        examples:
+          - "3f2504e0-4f89-41d3-9a0c-0305e82c3301"
+
+    Location:
+      description: URI созданного резерва. Возвращается при `201 Created`.
+      required: false
+      schema:
+        type: string
+        format: uri-reference
+        minLength: 1
+        maxLength: 256
+        examples:
+          - "/v1/holds/hld_01J9X3D5M8RG9P4Q6T7V8W9YAB"
+
+    IdempotencyReplayed:
+      description: |
+        `true`, если ответ воспроизведён из журнала идемпотентности, а не создан
+        заново. Позволяет BFF отличить настоящее создание резерва от повтора и
+        не дублировать метрики и события.
+      required: false
+      schema:
+        type: boolean
+        examples:
+          - true
+
+    CacheControlNoStore:
+      description: |
+        Всегда `no-store`. Балансы, резервы и ledger-записи **не кешируются**
+        (канон §11) — решение о достаточности средств принимается только по свежим
+        данным.
+      required: false
+      schema:
+        type: string
+        maxLength: 100
+        examples:
+          - "no-store"
+
+    RetryAfter:
+      description: |
+        Через сколько секунд разрешено повторить запрос. Возвращается при `429` и `503`.
+        Для `POST /v1/holds` заголовок **не означает разрешения на автоматический
+        ретрай** — повтор допускается только как явное действие пользователя.
+      required: false
+      schema:
+        type: integer
+        minimum: 0
+        maximum: 3600
+        examples:
+          - 2
+
+  schemas:
+
+    DecimalString:
+      type: string
+      description: |
+        Денежная величина в виде **строки** с десятичной записью (канон §5.1).
+        Двоичные `float`/`double` запрещены на всём пути. Значение неотрицательное
+        (инвариант I4 канона §5.4). Целая часть — до 19 цифр, дробная — до 18 знаков.
+        Точность значения не должна превышать `decimals` актива (инвариант I5).
+      minLength: 1
+      maxLength: 40
+      pattern: '^(0|[1-9]\d{0,18})(\.\d{1,18})?$'
+      examples:
+        - "25450.00"
+        - "0.10000000"
+        - "0.00"
+
+    Timestamp:
+      type: string
+      format: date-time
+      description: |
+        Момент времени в ISO-8601, зона UTC, обязательные миллисекунды и суффикс `Z`
+        (канон §9). Смещения вида `+03:00` не допускаются.
+      minLength: 24
+      maxLength: 24
+      pattern: '^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$'
+      examples:
+        - "2026-08-07T10:15:32.117Z"
+
+    WalletId:
+      type: string
+      description: |
+        Идентификатор кошелька: префикс `wlt_` плюс ULID (26 символов Crockford
+        Base32). Персональный идентификатор — обращаться как с PII.
+      minLength: 30
+      maxLength: 30
+      pattern: '^wlt_[0-9A-HJKMNP-TV-Z]{26}$'
+      examples:
+        - "wlt_01J8ZQ5B2P4R6T8V9X0Y1Z2A3B"
+
+    HoldId:
+      type: string
+      description: |
+        Идентификатор резерва: префикс `hld_` плюс ULID (26 символов Crockford
+        Base32). Устойчиво сортируется по времени создания.
+      minLength: 30
+      maxLength: 30
+      pattern: '^hld_[0-9A-HJKMNP-TV-Z]{26}$'
+      examples:
+        - "hld_01J9X3D5M8RG9P4Q6T7V8W9YAB"
+
+    LedgerEntryId:
+      type: string
+      description: |
+        Идентификатор ledger-записи: префикс `led_` плюс ULID (26 символов Crockford
+        Base32).
+      minLength: 30
+      maxLength: 30
+      pattern: '^led_[0-9A-HJKMNP-TV-Z]{26}$'
+      examples:
+        - "led_01J9X3D5M9SH0Q5R7V8W9X0YBC"
+
+    IdempotencyKey:
+      type: string
+      format: uuid
+      description: |
+        Ключ идемпотентности в формате UUIDv4 (канон §9). Генерируется BFF **до**
+        отправки запроса, детерминированно выводится из `quoteId`. Окно хранения
+        на стороне S6 — 24 часа.
+      minLength: 36
+      maxLength: 36
+      pattern: '^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$'
+      examples:
+        - "8f7d2e1a-4c5b-4d6e-9f01-2a3b4c5d6e7f"
+
+    AssetId:
+      type: string
+      description: |
+        Код учётной единицы баланса (канон §4.1). Уникален в пределах кошелька
+        вместе с `network`.
+      minLength: 2
+      maxLength: 12
+      pattern: '^[A-Z0-9]{2,12}$'
+      examples:
+        - "RUB"
+        - "USDT"
+
+    Network:
+      type: [string, 'null']
+      description: |
+        Блокчейн-сеть крипто-актива (канон §2). Обязательна для крипто, для фиата —
+        `null`. `USDT@TRON` и `USDT@ETHEREUM` — **разные балансы**, и это ключевое
+        свойство модели: смешивать их в одну строку нельзя.
+      enum: ["TRON", "ETHEREUM", "BITCOIN", null]
+      examples:
+        - null
+        - "TRON"
+
+    WalletStatus:
+      type: string
+      description: |
+        Состояние кошелька. `FROZEN` → шаг 13 цепочки валидации возвращает наружу
+        `WALLET_FROZEN` (403), сообщение `Wallet is temporarily frozen`.
+        `CLOSED` — терминальное состояние, операции невозможны.
+      enum: ["ACTIVE", "FROZEN", "CLOSED"]
+      examples:
+        - "ACTIVE"
+
+    HoldStatus:
+      type: string
+      description: |
+        Жизненный цикл резерва:
+
+        * `ACTIVE` — средства заблокированы, вычтены из `available`;
+        * `RELEASED` — снят, средства вернулись в `available` (наш путь компенсации);
+        * `CAPTURED` — исполнен, средства списаны окончательно (вне скоупа задания —
+          происходит при исполнении заявки);
+        * `EXPIRED` — истёк `expiresAt`, средства освобождены автоматически.
+
+        Терминальные статусы — `RELEASED`, `CAPTURED`, `EXPIRED`.
+      enum: ["ACTIVE", "RELEASED", "CAPTURED", "EXPIRED"]
+      examples:
+        - "ACTIVE"
+
+    HoldReason:
+      type: string
+      description: |
+        Назначение резерва. В рамках нашего скоупа возможно единственное значение:
+        блокировка под создаваемую заявку на обмен.
+      enum: ["EXCHANGE_ORDER"]
+      examples:
+        - "EXCHANGE_ORDER"
+
+    ReferenceType:
+      type: string
+      description: |
+        Тип связанной сущности **нашего** домена.
+
+        * `EXCHANGE_ORDER` — `referenceId` содержит `orderId` (`ord_` + ULID,
+          канон §4.5). BFF генерирует `orderId` **до** создания резерва, чтобы связь
+          существовала уже в момент блокировки;
+        * `EXCHANGE_QUOTE` — `referenceId` содержит `quoteId` (UUID). Используется,
+          если резерв создаётся раньше присвоения `orderId`.
+      enum: ["EXCHANGE_ORDER", "EXCHANGE_QUOTE"]
+      examples:
+        - "EXCHANGE_ORDER"
+
+    ReferenceId:
+      type: string
+      description: |
+        Идентификатор связанной сущности нашего домена: `ord_` + ULID для
+        `EXCHANGE_ORDER` либо UUID котировки для `EXCHANGE_QUOTE`.
+      minLength: 30
+      maxLength: 36
+      pattern: '^(ord_[0-9A-HJKMNP-TV-Z]{26}|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$'
+      examples:
+        - "ord_01J9X3D5M7QF8N3M5T6V7W8Y9Z"
+        - "c0ffee00-1234-4abc-8def-1234567890ab"
+
+    LedgerDirection:
+      type: string
+      description: |
+        Направление проводки: `DEBIT` — уменьшение доступных средств по строке
+        баланса, `CREDIT` — увеличение.
+      enum: ["DEBIT", "CREDIT"]
+      examples:
+        - "DEBIT"
+
+    LedgerEntryType:
+      type: string
+      description: |
+        Тип бухгалтерской проводки:
+
+        * `HOLD_PLACED` — установлен резерв, `held` вырос, `available` уменьшился;
+        * `HOLD_RELEASED` — резерв снят, `held` уменьшился, `available` вырос;
+        * `HOLD_CAPTURED` — резерв исполнен, `held` и `total` уменьшились;
+        * `EXCHANGE_DEBIT` — списание актива при обмене;
+        * `EXCHANGE_CREDIT` — зачисление актива при обмене;
+        * `FEE` — удержание комиссии в валюте списания (канон §5.3,
+          режим `INCLUDED_IN_SOURCE`).
+
+        В нашем скоупе (до статуса `PENDING`) реально возникают только
+        `HOLD_PLACED` и — при компенсации — `HOLD_RELEASED`.
+      enum:
+        - "HOLD_PLACED"
+        - "HOLD_RELEASED"
+        - "HOLD_CAPTURED"
+        - "EXCHANGE_DEBIT"
+        - "EXCHANGE_CREDIT"
+        - "FEE"
+      examples:
+        - "HOLD_PLACED"
+
+    Balance:
+      type: object
+      description: |
+        Строка баланса кошелька по одному активу и сети (канон §4.2).
+
+        **Инвариант: `available = total − held`, и `available ≥ 0` всегда.**
+        Нарушение инварианта — критический дефект бухгалтерского ядра; BFF обязан
+        отклонить такой ответ, залогировать инцидент и вернуть наружу
+        `EXCHANGE_SERVICE_UNAVAILABLE` (503), а не пытаться «починить» данные.
+
+        Все проверки достаточности средств ведутся **только по `available`**
+        (канон §2). `total` — справочная величина для отображения.
+      additionalProperties: false
+      required: [assetId, network, total, held, available, decimals, version, updatedAt]
+      properties:
+        assetId:
+          $ref: '#/components/schemas/AssetId'
+        network:
+          $ref: '#/components/schemas/Network'
+        total:
+          allOf:
+            - $ref: '#/components/schemas/DecimalString'
+          description: |
+            Полный баланс актива, включая заблокированную часть. Показывается
+            пользователю справочно; в проверках достаточности средств **не участвует**.
+        held:
+          allOf:
+            - $ref: '#/components/schemas/DecimalString'
+          description: |
+            Сумма, заблокированная активными резервами. Растёт при `HOLD_PLACED`,
+            уменьшается при `HOLD_RELEASED` / `HOLD_CAPTURED` / истечении резерва.
+        available:
+          allOf:
+            - $ref: '#/components/schemas/DecimalString'
+          description: |
+            Доступный остаток: **`available = total − held`**, всегда `≥ 0`
+            (канон §2, §4.2). Именно с этим значением сравнивается `fromAmount`
+            на шаге 17 цепочки валидации (инвариант I3:
+            `fromAmount ≤ balance.available(fromAsset)`); при нарушении наружу
+            уходит `INSUFFICIENT_FUNDS` (422) с сообщением
+            `Not enough {asset}. Available: {available}`.
+        decimals:
+          type: integer
+          description: |
+            Точность актива (канон §4.1): `RUB` = 2, `EUR` = 2, `USDT` = 6,
+            `BTC` = 8, `ETH` = 8. Все суммы по этой строке имеют ровно столько
+            знаков после запятой (инвариант I5 канона §5.4).
+          minimum: 0
+          maximum: 18
+          examples:
+            - 2
+            - 8
+        version:
+          type: integer
+          description: |
+            **Версия строки баланса для оптимистичной блокировки.** Монотонно растёт
+            при каждом изменении `total` или `held`.
+
+            Механика:
+
+            1. BFF читает баланс на шаге 17 и запоминает `version`;
+            2. при создании резерва передаёт её в `POST /v1/holds` как
+               `expectedBalanceVersion`;
+            3. S6 в одной транзакции сверяет версию и создаёт резерв;
+            4. если версия на сервере уже другая — значит между чтением и записью
+               прошла параллельная операция пользователя, и решение о достаточности
+               средств принято по устаревшим данным. Тогда возвращается `409`
+               `BALANCE_VERSION_CONFLICT` → наш `HOLD_FAILED` (409, retryable);
+            5. BFF перечитывает баланс и повторяет цикл с новым ключом идемпотентности.
+
+            Именно ради работоспособности этого механизма балансы **запрещено
+            кешировать** (канон §11): закешированная `version` заведомо приведёт
+            к конфликту.
+          minimum: 0
+          maximum: 9007199254740991
+          examples:
+            - 1042
+        updatedAt:
+          allOf:
+            - $ref: '#/components/schemas/Timestamp'
+          description: Момент последнего изменения этой строки баланса.
+
+    BalancesResponse:
+      type: object
+      description: |
+        Обёртка списка балансов кошелька. Помимо самих балансов несёт статус кошелька,
+        который проверяется на шаге 13 цепочки валидации.
+      additionalProperties: false
+      required: [walletId, walletStatus, balances, evaluatedAt]
+      properties:
+        walletId:
+          $ref: '#/components/schemas/WalletId'
+        walletStatus:
+          allOf:
+            - $ref: '#/components/schemas/WalletStatus'
+          description: |
+            Состояние кошелька. Проверяется **до** сумм: при `FROZEN` наружу уходит
+            `WALLET_FROZEN` (403) независимо от остатков — шаг 13 цепочки валидации.
+        balances:
+          type: array
+          description: |
+            Строки баланса по всем активам кошелька. Активы с нулевым остатком
+            включены по умолчанию (см. параметр `includeZero`).
+          minItems: 0
+          maxItems: 500
+          items:
+            $ref: '#/components/schemas/Balance'
+        evaluatedAt:
+          allOf:
+            - $ref: '#/components/schemas/Timestamp'
+          description: |
+            Момент, на который построен снимок. Снимок консистентен между строками:
+            все балансы прочитаны в одной транзакции.
+
+    HoldCreateRequest:
+      type: object
+      description: |
+        Запрос на создание резерва. Идемпотентность обеспечивается заголовком
+        `Idempotency-Key`; тело участвует в сравнении при повторе.
+      additionalProperties: false
+      required:
+        - walletId
+        - assetId
+        - network
+        - amount
+        - reason
+        - referenceType
+        - referenceId
+        - expectedBalanceVersion
+        - expiresInSeconds
+      properties:
+        walletId:
+          $ref: '#/components/schemas/WalletId'
+        assetId:
+          allOf:
+            - $ref: '#/components/schemas/AssetId'
+          description: Актив списания, на котором блокируются средства.
+        network:
+          $ref: '#/components/schemas/Network'
+        amount:
+          allOf:
+            - $ref: '#/components/schemas/DecimalString'
+          description: |
+            Резервируемая сумма в валюте списания. Это полная `fromAmount` котировки,
+            **включая комиссию**: режим комиссии — `INCLUDED_IN_SOURCE`, комиссия
+            удерживается внутри введённой суммы (канон §5.3). Точность не должна
+            превышать `decimals` актива.
+        reason:
+          $ref: '#/components/schemas/HoldReason'
+        referenceType:
+          $ref: '#/components/schemas/ReferenceType'
+        referenceId:
+          $ref: '#/components/schemas/ReferenceId'
+        expectedBalanceVersion:
+          type: integer
+          description: |
+            Версия строки баланса, прочитанная непосредственно перед этим запросом
+            (поле `Balance.version`). Механизм оптимистичной блокировки: при
+            несовпадении сервис возвращает `409 BALANCE_VERSION_CONFLICT` →
+            наш `HOLD_FAILED` (409, retryable).
+
+            Значение **входит** в тело, сравниваемое при повторе с тем же
+            `Idempotency-Key`: повтор с другой версией считается другим запросом
+            и даёт `409 HOLD_ALREADY_EXISTS_DIFFERENT_BODY`.
+          minimum: 0
+          maximum: 9007199254740991
+          examples:
+            - 1042
+        expiresInSeconds:
+          type: integer
+          description: |
+            Срок жизни резерва в секундах. По истечении статус автоматически
+            становится `EXPIRED` и средства освобождаются — защита от «висящих»
+            резервов при сбое оркестрации.
+
+            Ориентир: не меньше Rate Lock TTL котировки (**15 с**, канон §2) плюс
+            бюджет регистрации заявки в S8 (2 000 мс). Практическое значение — 300 с,
+            чтобы покрыть в том числе разбор `MANUAL_REVIEW`.
+          minimum: 30
+          maximum: 86400
+          default: 300
+          examples:
+            - 300
+
+    Hold:
+      type: object
+      description: |
+        Резерв средств на балансе списания. Создание блокирует сумму: `held` растёт,
+        `available` уменьшается на ту же величину, `total` не меняется.
+      additionalProperties: false
+      required:
+        - holdId
+        - walletId
+        - assetId
+        - network
+        - amount
+        - status
+        - reason
+        - referenceType
+        - referenceId
+        - idempotencyKey
+        - createdAt
+        - expiresAt
+        - releasedAt
+        - balanceVersionBefore
+        - balanceVersionAfter
+      properties:
+        holdId:
+          $ref: '#/components/schemas/HoldId'
+        walletId:
+          $ref: '#/components/schemas/WalletId'
+        assetId:
+          $ref: '#/components/schemas/AssetId'
+        network:
+          $ref: '#/components/schemas/Network'
+        amount:
+          allOf:
+            - $ref: '#/components/schemas/DecimalString'
+          description: |
+            Заблокированная сумма в валюте списания. Соответствует `fromAmount`
+            котировки (включая комиссию, канон §5.3).
+        status:
+          $ref: '#/components/schemas/HoldStatus'
+        reason:
+          $ref: '#/components/schemas/HoldReason'
+        referenceType:
+          $ref: '#/components/schemas/ReferenceType'
+        referenceId:
+          $ref: '#/components/schemas/ReferenceId'
+        idempotencyKey:
+          allOf:
+            - $ref: '#/components/schemas/IdempotencyKey'
+          description: |
+            Ключ, с которым резерв был создан. Возвращается в теле, чтобы результат
+            сверки `GET /v1/holds?idempotencyKey=…` можно было однозначно сопоставить
+            с исходным запросом.
+        createdAt:
+          allOf:
+            - $ref: '#/components/schemas/Timestamp'
+          description: Момент создания резерва.
+        expiresAt:
+          allOf:
+            - $ref: '#/components/schemas/Timestamp'
+          description: |
+            `createdAt + expiresInSeconds`. После этого момента резерв автоматически
+            переходит в `EXPIRED`, средства возвращаются в `available`.
+        releasedAt:
+          oneOf:
+            - $ref: '#/components/schemas/Timestamp'
+            - type: 'null'
+          description: |
+            Момент снятия резерва. `null`, пока статус `ACTIVE`. Заполняется при
+            переходе в `RELEASED`, `CAPTURED` или `EXPIRED`.
+        balanceVersionBefore:
+          type: integer
+          description: |
+            Версия строки баланса до применения резерва. Совпадает с
+            `expectedBalanceVersion` запроса — доказательство, что оптимистичная
+            блокировка сработала на ожидаемой версии.
+          minimum: 0
+          maximum: 9007199254740991
+          examples:
+            - 1042
+        balanceVersionAfter:
+          type: integer
+          description: |
+            Версия строки баланса после применения резерва. BFF использует её как
+            новую отправную точку, не перечитывая баланс дополнительным запросом
+            (экономия на бюджете 1 500 мс).
+          minimum: 0
+          maximum: 9007199254740991
+          examples:
+            - 1043
+
+    HoldsResponse:
+      type: object
+      description: |
+        Страница списка резервов. **Пустой массив — значимый ответ**: при сверке
+        по `idempotencyKey` он означает, что резерв не был создан.
+      additionalProperties: false
+      required: [holds, nextCursor, hasMore]
+      properties:
+        holds:
+          type: array
+          description: Найденные резервы, отсортированные по `createdAt` по убыванию.
+          minItems: 0
+          maxItems: 200
+          items:
+            $ref: '#/components/schemas/Hold'
+        nextCursor:
+          type: [string, 'null']
+          description: |
+            Курсор следующей страницы. `null`, если страниц больше нет. Непрозрачная
+            строка — передавать без изменений.
+          minLength: 1
+          maxLength: 512
+          pattern: '^[A-Za-z0-9_=-]{1,512}$'
+          examples:
+            - null
+            - "eyJzZXEiOjE0MjA5OH0"
+        hasMore:
+          type: boolean
+          description: |
+            Есть ли следующая страница. Эквивалентно `nextCursor != null`;
+            продублировано, чтобы клиент мог ветвиться одним сравнением.
+          examples:
+            - false
+
+    LedgerEntry:
+      type: object
+      description: |
+        Бухгалтерская проводка по строке баланса. Записи неизменяемы: исправление
+        оформляется встречной проводкой, а не редактированием существующей.
+      additionalProperties: false
+      required:
+        - entryId
+        - walletId
+        - assetId
+        - network
+        - direction
+        - amount
+        - balanceAfter
+        - entryType
+        - referenceType
+        - referenceId
+        - correlationId
+        - postedAt
+        - sequence
+      properties:
+        entryId:
+          $ref: '#/components/schemas/LedgerEntryId'
+        walletId:
+          $ref: '#/components/schemas/WalletId'
+        assetId:
+          $ref: '#/components/schemas/AssetId'
+        network:
+          $ref: '#/components/schemas/Network'
+        direction:
+          $ref: '#/components/schemas/LedgerDirection'
+        amount:
+          allOf:
+            - $ref: '#/components/schemas/DecimalString'
+          description: |
+            Сумма проводки, всегда положительная. Знак операции задаётся полем
+            `direction`, а не знаком суммы — так исключаются отрицательные строки
+            и связанные с ними ошибки округления.
+        balanceAfter:
+          allOf:
+            - $ref: '#/components/schemas/DecimalString'
+          description: |
+            Значение `available` по этой строке баланса **после** применения проводки.
+            Позволяет восстановить состояние на любой момент, не пересчитывая журнал
+            с начала.
+        entryType:
+          $ref: '#/components/schemas/LedgerEntryType'
+        referenceType:
+          $ref: '#/components/schemas/ReferenceType'
+        referenceId:
+          $ref: '#/components/schemas/ReferenceId'
+        correlationId:
+          type: string
+          description: |
+            Сквозной идентификатор бизнес-операции, с которым BFF выполнял вызов
+            (канон §9). Связывает проводку с конкретной заявкой при аудите.
+          minLength: 26
+          maxLength: 36
+          pattern: '^([0-9A-HJKMNP-TV-Z]{26}|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$'
+          examples:
+            - "01J9X2C4K7QF8N3M5T6V7W8Y9Z"
+        postedAt:
+          allOf:
+            - $ref: '#/components/schemas/Timestamp'
+          description: Момент фиксации проводки в журнале.
+        sequence:
+          type: integer
+          description: |
+            Монотонный номер проводки в пределах кошелька, без пропусков.
+            По нему строится cursor-пагинация и проверяется целостность журнала:
+            разрыв в последовательности означает потерю данных и является инцидентом.
+          minimum: 1
+          maximum: 9007199254740991
+          examples:
+            - 142098
+
+    LedgerEntriesResponse:
+      type: object
+      description: Страница журнала проводок с cursor-пагинацией (канон §9).
+      additionalProperties: false
+      required: [entries, nextCursor, hasMore]
+      properties:
+        entries:
+          type: array
+          description: Проводки, отсортированные по возрастанию `sequence`.
+          minItems: 0
+          maxItems: 200
+          items:
+            $ref: '#/components/schemas/LedgerEntry'
+        nextCursor:
+          type: [string, 'null']
+          description: |
+            Курсор следующей страницы. `null`, если страниц больше нет.
+            Непрозрачная строка — передавать без изменений.
+          minLength: 1
+          maxLength: 512
+          pattern: '^[A-Za-z0-9_=-]{1,512}$'
+          examples:
+            - "eyJzZXEiOjE0MjA5OH0"
+            - null
+        hasMore:
+          type: boolean
+          description: Есть ли следующая страница.
+          examples:
+            - true
+
+    AccountingServiceErrorCode:
+      type: string
+      description: |
+        Код ошибки **сервиса S6**. Это не наш код: BFF обязан отобразить его в код
+        каталога канона §7 перед отдачей наружу. Таблица маппинга:
+
+        | Код S6 | HTTP S6 | → наш код (канон §7) | HTTP наружу | Retryable |
+        |---|---|---|---|---|
+        | `VALIDATION_FAILED` | 400 | → `VALIDATION_ERROR` | 400 | нет |
+        | `IDEMPOTENCY_KEY_MISSING` | 400 | → `VALIDATION_ERROR` | 400 | нет |
+        | `UNAUTHENTICATED` | 401 | → `EXCHANGE_SERVICE_UNAVAILABLE` | 503 | да |
+        | `FORBIDDEN` | 403 | → `EXCHANGE_SERVICE_UNAVAILABLE` | 503 | да |
+        | `WALLET_FROZEN` | 403 | → **`WALLET_FROZEN`** | 403 | нет |
+        | `WALLET_UNKNOWN` | 404 | → `EXCHANGE_SERVICE_UNAVAILABLE` | 503 | да |
+        | `ASSET_NOT_ON_WALLET` | 404 | → `ASSET_NOT_SUPPORTED` | 422 | нет |
+        | `HOLD_UNKNOWN` | 404 | → `HOLD_FAILED` | 409 | да |
+        | `BALANCE_VERSION_CONFLICT` | 409 | → **`HOLD_FAILED`** | 409 | да |
+        | `HOLD_ALREADY_EXISTS_DIFFERENT_BODY` | 409 | → **`IDEMPOTENCY_CONFLICT`** | 409 | нет |
+        | `IDEMPOTENT_REQUEST_IN_PROGRESS` | 409 | → `HOLD_FAILED` | 409 | да |
+        | `HOLD_NOT_RELEASABLE` | 409 | → `HOLD_FAILED` | 409 | нет |
+        | `INSUFFICIENT_AVAILABLE_BALANCE` | 422 | → **`INSUFFICIENT_FUNDS`** | 422 | нет |
+        | `AMOUNT_PRECISION_INVALID` | 422 | → `VALIDATION_ERROR` | 400 | нет |
+        | `RATE_LIMITED` | 429 | → `RATE_LIMITED` | 429 | да |
+        | `INTERNAL_ERROR` | 500 | → `EXCHANGE_SERVICE_UNAVAILABLE` | 503 | да |
+        | `SERVICE_UNAVAILABLE` | 503 | → `EXCHANGE_SERVICE_UNAVAILABLE` | 503 | да |
+        | `UPSTREAM_TIMEOUT` | 504 | → `UPSTREAM_TIMEOUT` | 504 | да |
+        | *(таймаут клиента 1 500 мс на `GET`/`DELETE`)* | — | → `UPSTREAM_TIMEOUT` | 504 | да |
+        | *(таймаут клиента на **`POST /v1/holds`**)* | — | сначала **сверка**, см. ниже | — | — |
+
+        **Особые случаи:**
+
+        * **`WALLET_FROZEN`** — единственный код S6, который отображается один-в-один
+          в наш код (канон §7, 403, `Wallet is temporarily frozen`). Проверяется на
+          шаге 13, то есть **до** проверки баланса: пользователь с замороженным
+          кошельком не должен узнавать состояние своих средств (принцип
+          Compliance First, канон §6).
+        * **`INSUFFICIENT_AVAILABLE_BALANCE`** — шаг 17. Сравнение ведётся строго
+          по `available`, не по `total` (канон §2, инвариант I3).
+        * **`BALANCE_VERSION_CONFLICT`** — конфликт оптимистичной блокировки;
+          retryable, но повтор обязан начинаться с перечитывания баланса и нового
+          `Idempotency-Key`.
+        * **`HOLD_ALREADY_EXISTS_DIFFERENT_BODY`** — тот же ключ идемпотентности
+          с другим телом; **не** retryable, наружу `IDEMPOTENCY_CONFLICT` (409),
+          сообщение `Conflicting request`.
+        * **Таймаут `POST /v1/holds`** — ретрай запрещён. Выполняется сверка
+          `GET /v1/holds?idempotencyKey=…`: найден резерв → продолжаем;
+          не найден → `HOLD_FAILED` (409); сверка тоже не ответила →
+          `UPSTREAM_TIMEOUT` (504) плюс постановка в очередь отложенной сверки.
+          Полный алгоритм — в `info.description`.
+
+        Ни при каких обстоятельствах код S6 не должен утечь во внешний ответ BFF.
+      enum:
+        - "VALIDATION_FAILED"
+        - "IDEMPOTENCY_KEY_MISSING"
+        - "UNAUTHENTICATED"
+        - "FORBIDDEN"
+        - "WALLET_FROZEN"
+        - "WALLET_UNKNOWN"
+        - "ASSET_NOT_ON_WALLET"
+        - "HOLD_UNKNOWN"
+        - "BALANCE_VERSION_CONFLICT"
+        - "HOLD_ALREADY_EXISTS_DIFFERENT_BODY"
+        - "IDEMPOTENT_REQUEST_IN_PROGRESS"
+        - "HOLD_NOT_RELEASABLE"
+        - "INSUFFICIENT_AVAILABLE_BALANCE"
+        - "AMOUNT_PRECISION_INVALID"
+        - "RATE_LIMITED"
+        - "INTERNAL_ERROR"
+        - "SERVICE_UNAVAILABLE"
+        - "UPSTREAM_TIMEOUT"
+      examples:
+        - "INSUFFICIENT_AVAILABLE_BALANCE"
+        - "BALANCE_VERSION_CONFLICT"
+
+    AccountingServiceError:
+      type: object
+      description: |
+        Собственный конверт ошибки сервиса S6. Отличается от нашего RFC 9457
+        Problem Details (канон §7) — BFF обязан выполнить преобразование, а не
+        пробрасывать этот объект наружу.
+      additionalProperties: false
+      required: [error, message, traceId, timestamp]
+      properties:
+        error:
+          $ref: '#/components/schemas/AccountingServiceErrorCode'
+        message:
+          type: string
+          description: |
+            Человекочитаемое техническое описание на английском. Для инженеров и
+            логов, **не** для показа пользователю: наружу идёт текст из каталога
+            канона §7. Может содержать суммы — поэтому не пишется в общие журналы.
+          minLength: 1
+          maxLength: 512
+          examples:
+            - "Available balance 25450.00 RUB is less than requested 30000.00 RUB"
+        traceId:
+          type: string
+          description: |
+            Идентификатор трассировки на стороне S6. Логируется BFF рядом со своим
+            `correlationId`, чтобы связать инцидент между сервисами.
+          minLength: 8
+          maxLength: 64
+          pattern: '^[0-9a-zA-Z_-]{8,64}$'
+          examples:
+            - "d8e3f1c25b74a069"
+        timestamp:
+          allOf:
+            - $ref: '#/components/schemas/Timestamp'
+          description: Момент формирования ошибки на стороне S6.
+        details:
+          type: [object, 'null']
+          description: |
+            Структурированный контекст ошибки: доступный остаток, запрошенная сумма,
+            версии баланса, идентификатор конфликтующего резерва. Ключи и значения —
+            строки, чтобы суммы не потеряли точность (канон §5.1). Может быть `null`.
+
+            **Содержит персональные финансовые данные** — в общие журналы не пишется,
+            наружу пробрасывается только `available` того актива, который пользователь
+            сам ввёл.
+          additionalProperties:
+            type: string
+            maxLength: 256
+          examples:
+            - available: "25450.00"
+              requested: "30000.00"
+              assetId: "RUB"
+            - expectedBalanceVersion: "1042"
+              actualBalanceVersion: "1044"
+
+  responses:
+
+    BadRequest:
+      description: |
+        Некорректный запрос: неверный формат идентификатора, отсутствует обязательный
+        заголовок `Idempotency-Key`, передана `network` для фиатного актива,
+        точность суммы превышает `decimals` актива.
+        Маппинг: `VALIDATION_FAILED` / `IDEMPOTENCY_KEY_MISSING` → наш
+        `VALIDATION_ERROR` (400), не retryable. Это дефект BFF, а не пользователя.
+      headers:
+        X-Correlation-Id:
+          $ref: '#/components/headers/XCorrelationId'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/AccountingServiceError'
+          examples:
+            validationFailed:
+              $ref: '#/components/examples/ErrorValidationFailed'
+            idempotencyKeyMissing:
+              $ref: '#/components/examples/ErrorIdempotencyKeyMissing'
+
+    Unauthorized:
+      description: |
+        Сервисный JWT отсутствует, просрочен или подпись неверна.
+        Маппинг: `UNAUTHENTICATED` → наш `EXCHANGE_SERVICE_UNAVAILABLE` (503).
+        Ретрай запрещён до обновления токена; событие эскалируется дежурному.
+      headers:
+        X-Correlation-Id:
+          $ref: '#/components/headers/XCorrelationId'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/AccountingServiceError'
+          examples:
+            unauthenticated:
+              $ref: '#/components/examples/ErrorUnauthenticated'
+
+    Forbidden:
+      description: |
+        Сервисному аккаунту не хватает прав (например нет scope `holds:write`).
+        Маппинг: `FORBIDDEN` → наш `EXCHANGE_SERVICE_UNAVAILABLE` (503).
+      headers:
+        X-Correlation-Id:
+          $ref: '#/components/headers/XCorrelationId'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/AccountingServiceError'
+          examples:
+            forbidden:
+              $ref: '#/components/examples/ErrorForbidden'
+
+    WalletFrozen:
+      description: |
+        Кошелёк заморожен либо у сервисного аккаунта нет прав.
+
+        * `WALLET_FROZEN` → наш **`WALLET_FROZEN`** (403), **не** retryable,
+          баннер `Wallet is temporarily frozen`. Это шаг 13 цепочки валидации,
+          выполняемый до проверки баланса (Compliance First, канон §6).
+        * `FORBIDDEN` → наш `EXCHANGE_SERVICE_UNAVAILABLE` (503), retryable.
+      headers:
+        X-Correlation-Id:
+          $ref: '#/components/headers/XCorrelationId'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/AccountingServiceError'
+          examples:
+            walletFrozen:
+              $ref: '#/components/examples/ErrorWalletFrozen'
+            forbidden:
+              $ref: '#/components/examples/ErrorForbidden'
+
+    NotFound:
+      description: |
+        Ресурс не найден. Маппинг зависит от кода:
+
+        * `ASSET_NOT_ON_WALLET` → наш `ASSET_NOT_SUPPORTED` (422), не retryable;
+        * `WALLET_UNKNOWN` → наш `EXCHANGE_SERVICE_UNAVAILABLE` (503): пользователь
+          прошёл аутентификацию, значит отсутствие кошелька — рассинхронизация
+          S1 и S6, а не ошибка клиента;
+        * `HOLD_UNKNOWN` → наш `HOLD_FAILED` (409). Исключение: для
+          **компенсирующего** `DELETE /v1/holds/{holdId}` этот ответ трактуется как
+          **успех** — резерва нет, средства не заперты, цель достигнута.
+      headers:
+        X-Correlation-Id:
+          $ref: '#/components/headers/XCorrelationId'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/AccountingServiceError'
+          examples:
+            assetNotOnWallet:
+              $ref: '#/components/examples/ErrorAssetNotOnWallet'
+            walletUnknown:
+              $ref: '#/components/examples/ErrorWalletUnknown'
+            holdUnknown:
+              $ref: '#/components/examples/ErrorHoldUnknown'
+
+    Conflict:
+      description: |
+        Конфликт состояния. Четыре разных кода с разными последствиями:
+
+        | Код S6 | → наш код | Retryable | Действие BFF |
+        |---|---|---|---|
+        | `BALANCE_VERSION_CONFLICT` | `HOLD_FAILED` (409) | да | перечитать баланс, |
+        |  |  |  | новый `Idempotency-Key`, повтор цикла |
+        | `HOLD_ALREADY_EXISTS_DIFFERENT_BODY` | `IDEMPOTENCY_CONFLICT` (409) | нет | отказ, |
+        |  |  |  | `Conflicting request` |
+        | `IDEMPOTENT_REQUEST_IN_PROGRESS` | `HOLD_FAILED` (409) | да | пауза, затем **сверка** |
+        |  |  |  | `GET /v1/holds?idempotencyKey=…` |
+        | `HOLD_NOT_RELEASABLE` | `HOLD_FAILED` (409) | нет | резерв уже `CAPTURED`, |
+        |  |  |  | снимать нечего |
+      headers:
+        X-Correlation-Id:
+          $ref: '#/components/headers/XCorrelationId'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/AccountingServiceError'
+          examples:
+            balanceVersionConflict:
+              $ref: '#/components/examples/ErrorBalanceVersionConflict'
+            idempotencyConflict:
+              $ref: '#/components/examples/ErrorIdempotencyConflict'
+            requestInProgress:
+              $ref: '#/components/examples/ErrorRequestInProgress'
+            holdNotReleasable:
+              $ref: '#/components/examples/ErrorHoldNotReleasable'
+
+    UnprocessableEntity:
+      description: |
+        Доменный отказ.
+
+        * `INSUFFICIENT_AVAILABLE_BALANCE` → наш **`INSUFFICIENT_FUNDS`** (422),
+          не retryable, шаг 17, сообщение `Not enough {asset}. Available: {available}`,
+          крепится к полю «You Pay». Сравнение ведётся строго по `available`
+          (инвариант I3 канона §5.4).
+        * `AMOUNT_PRECISION_INVALID` → наш `VALIDATION_ERROR` (400): сумма имеет
+          больше знаков после запятой, чем `decimals` актива (инвариант I5).
+      headers:
+        X-Correlation-Id:
+          $ref: '#/components/headers/XCorrelationId'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/AccountingServiceError'
+          examples:
+            insufficientFunds:
+              $ref: '#/components/examples/ErrorInsufficientFunds'
+            amountPrecisionInvalid:
+              $ref: '#/components/examples/ErrorAmountPrecisionInvalid'
+
+    TooManyRequests:
+      description: |
+        Превышен лимит частоты запросов сервисного аккаунта.
+        Маппинг: `RATE_LIMITED` → наш `RATE_LIMITED` (429), retryable.
+        BFF уважает `Retry-After` и не засчитывает ответ circuit breaker'у.
+        Для `POST /v1/holds` автоматический повтор всё равно запрещён — только
+        явное действие пользователя с тем же `Idempotency-Key`.
+      headers:
+        X-Correlation-Id:
+          $ref: '#/components/headers/XCorrelationId'
+        Retry-After:
+          $ref: '#/components/headers/RetryAfter'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/AccountingServiceError'
+          examples:
+            rateLimited:
+              $ref: '#/components/examples/ErrorRateLimited'
+
+    InternalServerError:
+      description: |
+        Внутренний сбой S6.
+        Маппинг: `INTERNAL_ERROR` → наш `EXCHANGE_SERVICE_UNAVAILABLE` (503).
+
+        Важно: ответ **получен**, значит состояние определено — резерв не создан.
+        Поэтому для `POST /v1/holds` сверка не нужна, наружу уходит `HOLD_FAILED`
+        (409, retryable): пользователь может нажать «повторить», BFF пошлёт тот же
+        `Idempotency-Key`. Для `GET` — обычный ретрай.
+        Балансы подставлять из старых данных **запрещено** (канон §11).
+      headers:
+        X-Correlation-Id:
+          $ref: '#/components/headers/XCorrelationId'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/AccountingServiceError'
+          examples:
+            internalError:
+              $ref: '#/components/examples/ErrorInternal'
+
+    ServiceUnavailable:
+      description: |
+        S6 временно недоступен (деплой, перегрузка, отказ хранилища).
+        Маппинг: `SERVICE_UNAVAILABLE` → наш `EXCHANGE_SERVICE_UNAVAILABLE` (503),
+        retryable. Кеша балансов нет и быть не может — заявка не создаётся.
+        Сценарий прототипа — `EXCHANGE_DOWN` (канон §10.6).
+      headers:
+        X-Correlation-Id:
+          $ref: '#/components/headers/XCorrelationId'
+        Retry-After:
+          $ref: '#/components/headers/RetryAfter'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/AccountingServiceError'
+          examples:
+            serviceUnavailable:
+              $ref: '#/components/examples/ErrorServiceUnavailable'
+
+    GatewayTimeout:
+      description: |
+        S6 не ответил в отведённые **1 500 мс** (канон §11).
+        Маппинг: `UPSTREAM_TIMEOUT` → наш `UPSTREAM_TIMEOUT` (504), retryable.
+
+        Для `GET` и `DELETE` ретрай безопасен (идемпотентные операции, до 2 попыток,
+        экспоненциальный backoff + jitter). Для `DELETE` при исчерпании попыток
+        резерв ставится в очередь компенсации — «висящий» резерв обязан быть снят.
+      headers:
+        X-Correlation-Id:
+          $ref: '#/components/headers/XCorrelationId'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/AccountingServiceError'
+          examples:
+            upstreamTimeout:
+              $ref: '#/components/examples/ErrorUpstreamTimeout'
+
+    GatewayTimeoutOnMutation:
+      description: |
+        **Таймаут мутации — ключевой сценарий контракта.**
+
+        S6 не ответил в отведённые 1 500 мс на `POST /v1/holds`. Ответа нет, значит
+        **состояние неизвестно**: резерв мог быть создан и не успеть вернуться.
+
+        **Ретрай `POST` запрещён** (канон §11: «Ретрай `POST` без идемпотентности =
+        двойное списание»; здесь идемпотентность есть, но слепой повтор всё равно
+        не даёт информации о том, что произошло).
+
+        Обязательный порядок действий BFF:
+
+        1. **Не ретраить `POST`** — ни с тем же ключом, ни тем более с новым.
+        2. Выполнить **сверочный запрос**
+           `GET /v1/holds?idempotencyKey={тот же ключ}&walletId={walletId}`
+           (идемпотентный `GET`, таймаут 1 500 мс, до 2 попыток).
+        3. Разобрать результат:
+           * **найден `hold` со статусом `ACTIVE`** → резерв всё-таки создан.
+             Берём `holdId`, продолжаем шаг 19 (регистрация заявки в S8).
+             Пользователь ничего не заметил;
+           * **`holds: []`** → резерв не создан. Наружу `HOLD_FAILED` (409, retryable),
+             баннер `Could not reserve funds. Try again.`. Повторная попытка
+             пользователя идёт с **тем же** `Idempotency-Key`;
+           * **сверочный `GET` тоже не ответил** → состояние остаётся неизвестным.
+             Наружу `UPSTREAM_TIMEOUT` (504, retryable). Ключ ставится в **очередь
+             отложенной сверки**: фоновый процесс повторяет `GET` с backoff до
+             получения определённости и снимает осиротевший резерв через
+             `DELETE /v1/holds/{holdId}`, если заявка так и не была создана.
+
+        Сверка возможна только потому, что `Idempotency-Key` генерируется клиентом
+        **до** отправки и потому известен даже при потере ответа. Окно сверки —
+        24 часа (канон §9).
+
+        Тело ответа при таймауте, разумеется, отсутствует; схема ниже описывает
+        случай, когда `504` пришёл от промежуточного шлюза с телом.
+      headers:
+        X-Correlation-Id:
+          $ref: '#/components/headers/XCorrelationId'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/AccountingServiceError'
+          examples:
+            upstreamTimeoutOnHold:
+              $ref: '#/components/examples/ErrorUpstreamTimeoutOnHold'
+
+  examples:
+
+    BalancesFixture:
+      summary: Балансы кошелька — фикстуры канона §10.2
+      description: |
+        Все пять строк. `ETH` намеренно имеет ненулевой `held` (`0.10000000`) — чтобы
+        демонстрировать разницу между `total` и `available`. `EUR` намеренно нулевой —
+        для проверки empty-state. Инвариант `available = total − held` выполняется
+        в каждой строке.
+      value:
+        walletId: "wlt_01J8ZQ5B2P4R6T8V9X0Y1Z2A3B"
+        walletStatus: "ACTIVE"
+        balances:
+          - assetId: "RUB"
+            network: null
+            total: "25450.00"
+            held: "0.00"
+            available: "25450.00"
+            decimals: 2
+            version: 1042
+            updatedAt: "2026-08-07T09:58:11.004Z"
+          - assetId: "USDT"
+            network: "TRON"
+            total: "135.270000"
+            held: "0.000000"
+            available: "135.270000"
+            decimals: 6
+            version: 318
+            updatedAt: "2026-08-06T18:22:40.771Z"
+          - assetId: "BTC"
+            network: "BITCOIN"
+            total: "0.01420000"
+            held: "0.00000000"
+            available: "0.01420000"
+            decimals: 8
+            version: 77
+            updatedAt: "2026-08-05T12:03:59.512Z"
+          - assetId: "ETH"
+            network: "ETHEREUM"
+            total: "0.86000000"
+            held: "0.10000000"
+            available: "0.76000000"
+            decimals: 8
+            version: 205
+            updatedAt: "2026-08-07T08:41:02.330Z"
+          - assetId: "EUR"
+            network: null
+            total: "0.00"
+            held: "0.00"
+            available: "0.00"
+            decimals: 2
+            version: 1
+            updatedAt: "2026-07-30T00:00:00.000Z"
+        evaluatedAt: "2026-08-07T10:15:32.117Z"
+
+    BalancesFrozenWallet:
+      summary: Кошелёк заморожен — шаг 13 цепочки валидации
+      description: |
+        `walletStatus: FROZEN`. BFF прекращает цепочку **до** проверки баланса и
+        возвращает наружу `WALLET_FROZEN` (403), баннер `Wallet is temporarily frozen`.
+        Суммы в ответе присутствуют, но в решении не участвуют.
+      value:
+        walletId: "wlt_01J8ZQ5B2P4R6T8V9X0Y1Z2A3B"
+        walletStatus: "FROZEN"
+        balances:
+          - assetId: "RUB"
+            network: null
+            total: "25450.00"
+            held: "0.00"
+            available: "25450.00"
+            decimals: 2
+            version: 1042
+            updatedAt: "2026-08-07T09:58:11.004Z"
+        evaluatedAt: "2026-08-07T10:15:32.117Z"
+
+    BalanceRub:
+      summary: Баланс RUB — фикстура канона §10.2
+      description: |
+        `available = total − held = 25450.00 − 0.00`. Именно `available` сравнивается
+        с `fromAmount` на шаге 17 (инвариант I3). `version: 1042` передаётся
+        в `POST /v1/holds` как `expectedBalanceVersion`.
+      value:
+        assetId: "RUB"
+        network: null
+        total: "25450.00"
+        held: "0.00"
+        available: "25450.00"
+        decimals: 2
+        version: 1042
+        updatedAt: "2026-08-07T09:58:11.004Z"
+
+    BalanceEthWithHeld:
+      summary: Баланс ETH с ненулевым held — разница total и available
+      description: |
+        Фикстура канона §10.2: `total = 0.86000000`, `held = 0.10000000`,
+        `available = 0.76000000`. Попытка обменять `0.80000000 ETH` пройдёт
+        по `total`, но провалится по `available` — и правильным исходом будет
+        `INSUFFICIENT_FUNDS` (422). Именно ради этой демонстрации `held` намеренно
+        сделан ненулевым.
+      value:
+        assetId: "ETH"
+        network: "ETHEREUM"
+        total: "0.86000000"
+        held: "0.10000000"
+        available: "0.76000000"
+        decimals: 8
+        version: 205
+        updatedAt: "2026-08-07T08:41:02.330Z"
+
+    BalanceEurZero:
+      summary: Нулевой баланс EUR — empty-state
+      description: |
+        Фикстура канона §10.2: `EUR` намеренно нулевой. Строка возвращается, а не
+        опускается: «актив есть, средств нет» и «актива нет вовсе» — разные состояния,
+        и UI показывает для них разные экраны.
+      value:
+        assetId: "EUR"
+        network: null
+        total: "0.00"
+        held: "0.00"
+        available: "0.00"
+        decimals: 2
+        version: 1
+        updatedAt: "2026-07-30T00:00:00.000Z"
+
+    HoldCreateRequestRub:
+      summary: Запрос на резерв 10000.00 RUB под заявку на обмен
+      description: |
+        Сумма — полная `fromAmount` котировки, **включая комиссию** (режим
+        `INCLUDED_IN_SOURCE`, канон §5.3). `expectedBalanceVersion: 1042` совпадает
+        с `version`, прочитанной на шаге 17. Заголовок
+        `Idempotency-Key: 8f7d2e1a-4c5b-4d6e-9f01-2a3b4c5d6e7f` обязателен.
+      value:
+        walletId: "wlt_01J8ZQ5B2P4R6T8V9X0Y1Z2A3B"
+        assetId: "RUB"
+        network: null
+        amount: "10000.00"
+        reason: "EXCHANGE_ORDER"
+        referenceType: "EXCHANGE_ORDER"
+        referenceId: "ord_01J9X3D5M7QF8N3M5T6V7W8Y9Z"
+        expectedBalanceVersion: 1042
+        expiresInSeconds: 300
+
+    HoldActive:
+      summary: 201 — резерв создан
+      description: |
+        `held` по строке `RUB` вырос на `10000.00`, `available` уменьшился до
+        `15450.00`, `total` не изменился. Версия баланса поднялась с `1042` до `1043`.
+        Дальше BFF переходит к шагу 19 — регистрации заявки в S8.
+      value:
+        holdId: "hld_01J9X3D5M8RG9P4Q6T7V8W9YAB"
+        walletId: "wlt_01J8ZQ5B2P4R6T8V9X0Y1Z2A3B"
+        assetId: "RUB"
+        network: null
+        amount: "10000.00"
+        status: "ACTIVE"
+        reason: "EXCHANGE_ORDER"
+        referenceType: "EXCHANGE_ORDER"
+        referenceId: "ord_01J9X3D5M7QF8N3M5T6V7W8Y9Z"
+        idempotencyKey: "8f7d2e1a-4c5b-4d6e-9f01-2a3b4c5d6e7f"
+        createdAt: "2026-08-07T10:15:32.400Z"
+        expiresAt: "2026-08-07T10:20:32.400Z"
+        releasedAt: null
+        balanceVersionBefore: 1042
+        balanceVersionAfter: 1043
+
+    HoldActiveReplayed:
+      summary: 201 — повтор с тем же ключом и тем же телом
+      description: |
+        Тот же `holdId`, то же тело, заголовок `Idempotency-Replayed: true`.
+        Повторной блокировки средств **не произошло**: `balanceVersionBefore` и
+        `balanceVersionAfter` те же, что при первом вызове. Именно это поведение
+        делает безопасным повтор после ошибки на стороне пользователя.
+      value:
+        holdId: "hld_01J9X3D5M8RG9P4Q6T7V8W9YAB"
+        walletId: "wlt_01J8ZQ5B2P4R6T8V9X0Y1Z2A3B"
+        assetId: "RUB"
+        network: null
+        amount: "10000.00"
+        status: "ACTIVE"
+        reason: "EXCHANGE_ORDER"
+        referenceType: "EXCHANGE_ORDER"
+        referenceId: "ord_01J9X3D5M7QF8N3M5T6V7W8Y9Z"
+        idempotencyKey: "8f7d2e1a-4c5b-4d6e-9f01-2a3b4c5d6e7f"
+        createdAt: "2026-08-07T10:15:32.400Z"
+        expiresAt: "2026-08-07T10:20:32.400Z"
+        releasedAt: null
+        balanceVersionBefore: 1042
+        balanceVersionAfter: 1043
+
+    HoldReleased:
+      summary: 200 — резерв снят (DELETE)
+      description: |
+        Статус `RELEASED`, заполнен `releasedAt`, средства вернулись в `available`.
+        Типичный контекст — компенсация после провала шага 19
+        (`ORDER_CREATION_FAILED`). Повторный `DELETE` вернёт **это же** тело:
+        операция идемпотентна.
+      value:
+        holdId: "hld_01J9X3D5M8RG9P4Q6T7V8W9YAB"
+        walletId: "wlt_01J8ZQ5B2P4R6T8V9X0Y1Z2A3B"
+        assetId: "RUB"
+        network: null
+        amount: "10000.00"
+        status: "RELEASED"
+        reason: "EXCHANGE_ORDER"
+        referenceType: "EXCHANGE_ORDER"
+        referenceId: "ord_01J9X3D5M7QF8N3M5T6V7W8Y9Z"
+        idempotencyKey: "8f7d2e1a-4c5b-4d6e-9f01-2a3b4c5d6e7f"
+        createdAt: "2026-08-07T10:15:32.400Z"
+        expiresAt: "2026-08-07T10:20:32.400Z"
+        releasedAt: "2026-08-07T10:15:34.902Z"
+        balanceVersionBefore: 1042
+        balanceVersionAfter: 1044
+
+    HoldsReconciliationFound:
+      summary: Сверка после таймаута — резерв ВСЁ-ТАКИ создан
+      description: |
+        Ответ на `GET /v1/holds?idempotencyKey=8f7d2e1a-…&walletId=wlt_…`
+        после таймаута `POST /v1/holds`.
+
+        Массив непуст, статус `ACTIVE` → резерв существует. BFF берёт `holdId`
+        и продолжает шаг 19 (регистрация заявки). Пользователь таймаута не заметил.
+        Повторять `POST` **нельзя** — это создало бы вторую блокировку.
+      value:
+        holds:
+          - holdId: "hld_01J9X3D5M8RG9P4Q6T7V8W9YAB"
+            walletId: "wlt_01J8ZQ5B2P4R6T8V9X0Y1Z2A3B"
+            assetId: "RUB"
+            network: null
+            amount: "10000.00"
+            status: "ACTIVE"
+            reason: "EXCHANGE_ORDER"
+            referenceType: "EXCHANGE_ORDER"
+            referenceId: "ord_01J9X3D5M7QF8N3M5T6V7W8Y9Z"
+            idempotencyKey: "8f7d2e1a-4c5b-4d6e-9f01-2a3b4c5d6e7f"
+            createdAt: "2026-08-07T10:15:32.400Z"
+            expiresAt: "2026-08-07T10:20:32.400Z"
+            releasedAt: null
+            balanceVersionBefore: 1042
+            balanceVersionAfter: 1043
+        nextCursor: null
+        hasMore: false
+
+    HoldsReconciliationEmpty:
+      summary: Сверка после таймаута — резерв НЕ создан
+      description: |
+        Пустой массив по тому же `idempotencyKey` → запрос до сервера не дошёл или
+        не был применён. Средства не заблокированы.
+
+        BFF возвращает наружу `HOLD_FAILED` (409, retryable), баннер
+        `Could not reserve funds. Try again.`. Повторная попытка пользователя идёт
+        с **тем же** `Idempotency-Key` — так гарантируется, что даже при гонке
+        двойного резерва не возникнет.
+      value:
+        holds: []
+        nextCursor: null
+        hasMore: false
+
+    LedgerHoldLifecycle:
+      summary: Журнал — установка и снятие резерва
+      description: |
+        Две проводки одной заявки: `HOLD_PLACED` (`DEBIT`, `available` упал до
+        `15450.00`) и компенсирующая `HOLD_RELEASED` (`CREDIT`, `available` вернулся
+        к `25450.00`) после провала регистрации заявки в S8.
+        Обе связаны общим `correlationId` и `referenceId`.
+      value:
+        entries:
+          - entryId: "led_01J9X3D5M9SH0Q5R7V8W9X0YBC"
+            walletId: "wlt_01J8ZQ5B2P4R6T8V9X0Y1Z2A3B"
+            assetId: "RUB"
+            network: null
+            direction: "DEBIT"
+            amount: "10000.00"
+            balanceAfter: "15450.00"
+            entryType: "HOLD_PLACED"
+            referenceType: "EXCHANGE_ORDER"
+            referenceId: "ord_01J9X3D5M7QF8N3M5T6V7W8Y9Z"
+            correlationId: "01J9X2C4K7QF8N3M5T6V7W8Y9Z"
+            postedAt: "2026-08-07T10:15:32.400Z"
+            sequence: 142098
+          - entryId: "led_01J9X3D5MASJ1R6S8W9X0Y1ZCD"
+            walletId: "wlt_01J8ZQ5B2P4R6T8V9X0Y1Z2A3B"
+            assetId: "RUB"
+            network: null
+            direction: "CREDIT"
+            amount: "10000.00"
+            balanceAfter: "25450.00"
+            entryType: "HOLD_RELEASED"
+            referenceType: "EXCHANGE_ORDER"
+            referenceId: "ord_01J9X3D5M7QF8N3M5T6V7W8Y9Z"
+            correlationId: "01J9X2C4K7QF8N3M5T6V7W8Y9Z"
+            postedAt: "2026-08-07T10:15:34.902Z"
+            sequence: 142099
+        nextCursor: null
+        hasMore: false
+
+    ErrorValidationFailed:
+      summary: 400 — некорректный параметр
+      description: "Маппинг: `VALIDATION_FAILED` → наш `VALIDATION_ERROR` (400), не retryable."
+      value:
+        error: "VALIDATION_FAILED"
+        message: "Query parameter 'network' must not be provided for fiat asset RUB"
+        traceId: "11aa22bb33cc44dd"
+        timestamp: "2026-08-07T10:15:32.117Z"
+        details:
+          parameter: "network"
+          assetId: "RUB"
+
+    ErrorIdempotencyKeyMissing:
+      summary: 400 — отсутствует обязательный заголовок Idempotency-Key
+      description: |
+        Маппинг: `IDEMPOTENCY_KEY_MISSING` → наш `VALIDATION_ERROR` (400), не retryable.
+        Это дефект BFF: канон §9 делает заголовок обязательным, и без него сверка
+        после таймаута была бы невозможна.
+      value:
+        error: "IDEMPOTENCY_KEY_MISSING"
+        message: "Header 'Idempotency-Key' is required for POST /v1/holds"
+        traceId: "22bb33cc44dd55ee"
+        timestamp: "2026-08-07T10:15:32.117Z"
+        details: null
+
+    ErrorUnauthenticated:
+      summary: 401 — сервисный токен невалиден
+      description: "Маппинг: `UNAUTHENTICATED` → наш `EXCHANGE_SERVICE_UNAVAILABLE` (503)."
+      value:
+        error: "UNAUTHENTICATED"
+        message: "Service JWT expired at 2026-08-07T10:14:00Z"
+        traceId: "33cc44dd55ee66ff"
+        timestamp: "2026-08-07T10:15:32.117Z"
+        details: null
+
+    ErrorForbidden:
+      summary: 403 — недостаточно прав сервисного аккаунта
+      description: |
+        Маппинг: `FORBIDDEN` → наш `EXCHANGE_SERVICE_UNAVAILABLE` (503).
+        Типичная причина — отсутствие scope `holds:write` на окружении.
+      value:
+        error: "FORBIDDEN"
+        message: "Service account svc:exchange-bff lacks scope holds:write"
+        traceId: "44dd55ee66ff7700"
+        timestamp: "2026-08-07T10:15:32.117Z"
+        details:
+          requiredScope: "holds:write"
+
+    ErrorWalletFrozen:
+      summary: 403 — кошелёк заморожен
+      description: |
+        Маппинг: `WALLET_FROZEN` → наш **`WALLET_FROZEN`** (403), не retryable.
+        Единственный код S6, отображающийся один-в-один. Шаг 13 цепочки валидации,
+        выполняется **до** проверки баланса (Compliance First, канон §6).
+        Баннер `Wallet is temporarily frozen`.
+      value:
+        error: "WALLET_FROZEN"
+        message: "Wallet wlt_01J8ZQ5B2P4R6T8V9X0Y1Z2A3B is frozen by compliance hold"
+        traceId: "55ee66ff77008811"
+        timestamp: "2026-08-07T10:15:32.117Z"
+        details:
+          walletId: "wlt_01J8ZQ5B2P4R6T8V9X0Y1Z2A3B"
+          walletStatus: "FROZEN"
+
+    ErrorWalletUnknown:
+      summary: 404 — кошелёк неизвестен сервису
+      description: |
+        Маппинг: `WALLET_UNKNOWN` → наш `EXCHANGE_SERVICE_UNAVAILABLE` (503).
+        Пользователь прошёл аутентификацию, значит отсутствие кошелька — признак
+        рассинхронизации S1 и S6, а не ошибки клиента. Событие эскалируется дежурному.
+      value:
+        error: "WALLET_UNKNOWN"
+        message: "Wallet wlt_01J8ZQ5B2P4R6T8V9X0Y1Z2A3B does not exist"
+        traceId: "66ff770088112233"
+        timestamp: "2026-08-07T10:15:32.117Z"
+        details:
+          walletId: "wlt_01J8ZQ5B2P4R6T8V9X0Y1Z2A3B"
+
+    ErrorAssetNotOnWallet:
+      summary: 404 — актива нет на кошельке
+      description: |
+        Маппинг: `ASSET_NOT_ON_WALLET` → наш `ASSET_NOT_SUPPORTED` (422), не retryable.
+        Сообщение `This asset is not available for exchange`, крепится к селектору.
+        Не путать с нулевым балансом: нулевой `EUR` из фикстур §10.2 существует
+        и возвращается как обычная строка.
+      value:
+        error: "ASSET_NOT_ON_WALLET"
+        message: "Asset USDT@ETHEREUM is not present on wallet wlt_01J8ZQ5B2P4R6T8V9X0Y1Z2A3B"
+        traceId: "770088112233aabb"
+        timestamp: "2026-08-07T10:15:32.117Z"
+        details:
+          assetId: "USDT"
+          network: "ETHEREUM"
+
+    ErrorHoldUnknown:
+      summary: 404 — резерв не найден
+      description: |
+        Маппинг: `HOLD_UNKNOWN` → наш `HOLD_FAILED` (409).
+        **Исключение:** для компенсирующего `DELETE /v1/holds/{holdId}` этот ответ
+        трактуется как **успех** — резерва нет, средства не заперты, цель достигнута.
+      value:
+        error: "HOLD_UNKNOWN"
+        message: "Hold hld_01J9X3D5M8RG9P4Q6T7V8W9YAB does not exist"
+        traceId: "88112233aabbccdd"
+        timestamp: "2026-08-07T10:15:32.117Z"
+        details:
+          holdId: "hld_01J9X3D5M8RG9P4Q6T7V8W9YAB"
+
+    ErrorBalanceVersionConflict:
+      summary: 409 — конфликт оптимистичной блокировки
+      description: |
+        Маппинг: `BALANCE_VERSION_CONFLICT` → наш **`HOLD_FAILED`** (409), retryable.
+        Между чтением баланса (`version: 1042`) и созданием резерва прошла
+        параллельная операция, и версия стала `1044`.
+        Действие BFF: перечитать баланс, сгенерировать **новый** `Idempotency-Key`
+        и повторить цикл. Слепой повтор с тем же ключом даст ту же ошибку.
+      value:
+        error: "BALANCE_VERSION_CONFLICT"
+        message: "Balance version mismatch: expected 1042, actual 1044"
+        traceId: "112233aabbccddee"
+        timestamp: "2026-08-07T10:15:32.117Z"
+        details:
+          assetId: "RUB"
+          expectedBalanceVersion: "1042"
+          actualBalanceVersion: "1044"
+
+    ErrorIdempotencyConflict:
+      summary: 409 — тот же ключ идемпотентности с другим телом
+      description: |
+        Маппинг: `HOLD_ALREADY_EXISTS_DIFFERENT_BODY` → наш **`IDEMPOTENCY_CONFLICT`**
+        (409), **не** retryable, баннер `Conflicting request`.
+        Канон §9: повтор с тем же телом → тот же `201`; с другим телом → `409`.
+        Здесь изменилась сумма — значит это другая операция, и переиспользовать
+        ключ нельзя.
+      value:
+        error: "HOLD_ALREADY_EXISTS_DIFFERENT_BODY"
+        message: "Idempotency-Key 8f7d2e1a-4c5b-4d6e-9f01-2a3b4c5d6e7f was used with a different request body"
+        traceId: "2233aabbccddeeff"
+        timestamp: "2026-08-07T10:15:32.117Z"
+        details:
+          idempotencyKey: "8f7d2e1a-4c5b-4d6e-9f01-2a3b4c5d6e7f"
+          existingHoldId: "hld_01J9X3D5M8RG9P4Q6T7V8W9YAB"
+          conflictingField: "amount"
+
+    ErrorRequestInProgress:
+      summary: 409 — запрос с этим ключом уже обрабатывается
+      description: |
+        Маппинг: `IDEMPOTENT_REQUEST_IN_PROGRESS` → наш `HOLD_FAILED` (409), retryable.
+        Гонка: предыдущий `POST` с тем же ключом ещё в обработке.
+        Действие BFF: короткая пауза, затем **сверка** через
+        `GET /v1/holds?idempotencyKey=…`, а не повторный `POST`.
+      value:
+        error: "IDEMPOTENT_REQUEST_IN_PROGRESS"
+        message: "A request with Idempotency-Key 8f7d2e1a-4c5b-4d6e-9f01-2a3b4c5d6e7f is currently in progress"
+        traceId: "33aabbccddeeff00"
+        timestamp: "2026-08-07T10:15:32.117Z"
+        details:
+          idempotencyKey: "8f7d2e1a-4c5b-4d6e-9f01-2a3b4c5d6e7f"
+          retryAfterMs: "200"
+
+    ErrorHoldNotReleasable:
+      summary: 409 — резерв уже исполнен, снять нельзя
+      description: |
+        Маппинг: `HOLD_NOT_RELEASABLE` → наш `HOLD_FAILED` (409), не retryable.
+        Резерв переведён в `CAPTURED`: средства списаны окончательно, снимать нечего.
+        Это состояние лежит уже за границей скоупа задания (канон §8) и на пути
+        создания заявки возникать не должно — его появление означает дефект
+        оркестрации.
+      value:
+        error: "HOLD_NOT_RELEASABLE"
+        message: "Hold hld_01J9X3D5M8RG9P4Q6T7V8W9YAB is in status CAPTURED and cannot be released"
+        traceId: "aabbccddeeff0011"
+        timestamp: "2026-08-07T10:15:32.117Z"
+        details:
+          holdId: "hld_01J9X3D5M8RG9P4Q6T7V8W9YAB"
+          status: "CAPTURED"
+
+    ErrorInsufficientFunds:
+      summary: 422 — недостаточно доступного баланса
+      description: |
+        Маппинг: `INSUFFICIENT_AVAILABLE_BALANCE` → наш **`INSUFFICIENT_FUNDS`** (422),
+        **не** retryable. Шаг 17 цепочки валидации, инвариант I3
+        (`fromAmount ≤ balance.available`). Сообщение
+        `Not enough RUB. Available: 25450.00`, крепится к полю «You Pay».
+
+        Сравнение ведётся строго по `available`, не по `total` (канон §2).
+        Значения совпадают с примером из каталога ошибок канона §7.
+      value:
+        error: "INSUFFICIENT_AVAILABLE_BALANCE"
+        message: "Available balance 25450.00 RUB is less than requested 30000.00 RUB"
+        traceId: "bbccddeeff001122"
+        timestamp: "2026-08-07T10:15:32.117Z"
+        details:
+          assetId: "RUB"
+          available: "25450.00"
+          requested: "30000.00"
+          total: "25450.00"
+          held: "0.00"
+
+    ErrorAmountPrecisionInvalid:
+      summary: 422 — точность суммы превышает decimals актива
+      description: |
+        Маппинг: `AMOUNT_PRECISION_INVALID` → наш `VALIDATION_ERROR` (400), не retryable.
+        Нарушен инвариант I5 канона §5.4: `decimals(value) ≤ decimals(asset)`.
+        Для `RUB` допустимо 2 знака, передано 4.
+      value:
+        error: "AMOUNT_PRECISION_INVALID"
+        message: "Amount 10000.1234 has 4 decimals, asset RUB allows 2"
+        traceId: "ccddeeff00112233"
+        timestamp: "2026-08-07T10:15:32.117Z"
+        details:
+          assetId: "RUB"
+          amount: "10000.1234"
+          allowedDecimals: "2"
+
+    ErrorRateLimited:
+      summary: 429 — превышена частота запросов
+      description: |
+        Маппинг: `RATE_LIMITED` → наш `RATE_LIMITED` (429), retryable.
+        Для `POST /v1/holds` автоматический повтор всё равно запрещён — только
+        явное действие пользователя с тем же `Idempotency-Key`.
+      value:
+        error: "RATE_LIMITED"
+        message: "Rate limit of 300 rps exceeded for service account svc:exchange-bff"
+        traceId: "ddeeff0011223344"
+        timestamp: "2026-08-07T10:15:32.117Z"
+        details:
+          limit: "300"
+          window: "1s"
+          retryAfterSeconds: "2"
+
+    ErrorInternal:
+      summary: 500 — внутренний сбой S6
+      description: |
+        Маппинг: `INTERNAL_ERROR` → наш `EXCHANGE_SERVICE_UNAVAILABLE` (503).
+        Ответ **получен**, значит состояние определено: резерв не создан.
+        Сверка не нужна; наружу `HOLD_FAILED` (409, retryable) для `POST`
+        или `EXCHANGE_SERVICE_UNAVAILABLE` (503) для чтений.
+      value:
+        error: "INTERNAL_ERROR"
+        message: "Ledger transaction rolled back due to deadlock"
+        traceId: "eeff001122334455"
+        timestamp: "2026-08-07T10:15:32.117Z"
+        details: null
+
+    ErrorServiceUnavailable:
+      summary: 503 — сервис временно недоступен
+      description: |
+        Маппинг: `SERVICE_UNAVAILABLE` → наш `EXCHANGE_SERVICE_UNAVAILABLE` (503),
+        retryable. Кеша балансов нет и быть не может (канон §11) — заявка
+        не создаётся. Сценарий прототипа — `EXCHANGE_DOWN` (канон §10.6).
+      value:
+        error: "SERVICE_UNAVAILABLE"
+        message: "Accounting core is failing over to standby replica"
+        traceId: "ff00112233445566"
+        timestamp: "2026-08-07T10:15:32.117Z"
+        details:
+          retryAfterSeconds: "5"
+
+    ErrorUpstreamTimeout:
+      summary: 504 — превышен таймаут 1500 мс на чтении
+      description: |
+        Маппинг: `UPSTREAM_TIMEOUT` → наш `UPSTREAM_TIMEOUT` (504), retryable.
+        Для `GET` и `DELETE` ретрай безопасен (до 2 попыток, экспоненциальный
+        backoff + jitter).
+      value:
+        error: "UPSTREAM_TIMEOUT"
+        message: "Ledger storage did not respond within 1500 ms"
+        traceId: "0011223344556677"
+        timestamp: "2026-08-07T10:15:32.117Z"
+        details:
+          timeoutMs: "1500"
+
+    ErrorUpstreamTimeoutOnHold:
+      summary: 504 — таймаут на POST /v1/holds, состояние НЕИЗВЕСТНО
+      description: |
+        Маппинг: `UPSTREAM_TIMEOUT` → наш `UPSTREAM_TIMEOUT` (504).
+
+        **Ретрай `POST` запрещён.** Обязательная последовательность:
+
+        1. не ретраить `POST` ни с каким ключом;
+        2. выполнить сверку
+           `GET /v1/holds?idempotencyKey=8f7d2e1a-4c5b-4d6e-9f01-2a3b4c5d6e7f&walletId=wlt_…`;
+        3. найден `ACTIVE` hold → продолжить шаг 19 с этим `holdId`;
+           пустой массив → наружу `HOLD_FAILED` (409, retryable);
+           сверка не ответила → наружу `UPSTREAM_TIMEOUT` (504) и постановка ключа
+           в очередь отложенной сверки с последующим `DELETE` осиротевшего резерва.
+
+        Полный алгоритм — в разделе «Таймаут POST /v1/holds» в `info.description`.
+      value:
+        error: "UPSTREAM_TIMEOUT"
+        message: "Hold creation did not complete within 1500 ms; hold state is unknown, reconcile by Idempotency-Key"
+        traceId: "1122334455667788"
+        timestamp: "2026-08-07T10:15:32.117Z"
+        details:
+          timeoutMs: "1500"
+          idempotencyKey: "8f7d2e1a-4c5b-4d6e-9f01-2a3b4c5d6e7f"
+          reconcileVia: "GET /v1/holds?idempotencyKey=8f7d2e1a-4c5b-4d6e-9f01-2a3b4c5d6e7f"
+          retryPostAllowed: "false"

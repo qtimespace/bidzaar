@@ -1,0 +1,2527 @@
+openapi: 3.1.0
+
+info:
+  title: S8 Order Service API (inbound contract stub)
+  version: "1.0.0"
+  summary: Контракт регистрации заявки на обмен, чтения её состояния и приёма событий смены статуса.
+  description: |
+    # S8 — Order Service
+
+    ## Что это за документ
+
+    Это **стаб контракта ВХОДЯЩЕЙ информации**. Он описывает не то, что мы реализуем,
+    а то, что наше приложение — **Exchange BFF** — *получает* от внешнего сервиса заявок:
+    какой ответ приходит на регистрацию заявки, какие ошибки возможны и какие события
+    прилетают к нам вебхуком. Реализация S8 вне нашего скоупа.
+
+    ## Назначение
+
+    S8 — система записи (system of record) для заявок на обмен. От него мы получаем:
+
+    * присвоенный `orderId` и текущий `status` (канон §3, S8: «Регистрация заявки,
+      присвоение `orderId`, статус»);
+    * подтверждение идемпотентности повторного вызова;
+    * состояние заявки по запросу и список заявок для процедуры сверки;
+    * асинхронные события смены статуса через вебхук `order.status.changed`.
+
+    ## Критичность: Blocking (канон §3)
+
+    Правило класса из §3: «Отказ → заявка не создаётся, пользователю показывается ошибка
+    сервиса (`503`)». S8 стоит на **шаге 19** — последнем шаге цепочки валидации канона §6:
+
+    > | Шаг | Проверка | Источник данных | Код ошибки при провале |
+    > |---|---|---|---|
+    > | 19 | Заявка зарегистрирована | **S8** | `ORDER_CREATION_FAILED` |
+
+    Шаг 19 идёт **после** шага 18 (`HOLD_FAILED`, создание резерва в S6). Это критично
+    для понимания компенсаций: к моменту вызова S8 средства пользователя **уже
+    заблокированы**. Любой неуспех S8 обязан сопровождаться освобождением холда —
+    см. раздел «Компенсация» ниже.
+
+    ## Граница скоупа
+
+    Канон §1: терминальное состояние для этого задания — **`PENDING`** (принята, средства
+    зарезервированы, ожидает исполнения). Исполнение заявки, matching, проводки — вне работ.
+    Статусы `EXECUTING` / `COMPLETED` / `FAILED` / `EXPIRED` описаны в контракте, потому что
+    они приходят к нам вебхуком, но **на пути создания заявки не возникают**.
+
+    Статус `VALIDATING` из диаграммы §8 — **внутренний, наружу не отдаётся**, поэтому
+    его нет в enum `OrderStatus`.
+
+    ## Таймауты, ретраи, идемпотентность (канон §11)
+
+    | Параметр | Значение |
+    |---|---|
+    | Таймаут S8 | **2 000 мс** (канон §11: «Запись, идемпотентна») |
+    | Ретраи `GET` | 2 попытки, экспоненциальный backoff + jitter |
+    | Ретраи `POST /v1/orders` | **ЗАПРЕЩЕНЫ** автоматически — см. ниже |
+    | Circuit breaker | 50 % ошибок на окне 20 запросов, `open` 30 с |
+    | Бюджет `POST /exchange-orders` | p95 ≤ 900 мс, p99 ≤ 2 000 мс |
+
+    ### Почему `POST` не ретраится, хотя он идемпотентен
+
+    Канон §11 прямо запрещает автоматический ретрай `POST`: «Ретрай `POST` без
+    идемпотентности = двойное списание». Здесь идемпотентность есть — по заголовку
+    `Idempotency-Key`. Но она гарантирует безопасность **осознанного** повтора с тем же
+    телом, а не безопасность слепого ретрая по таймауту: при таймауте мы **не знаем**,
+    дошёл ли запрос. Поэтому вместо ретрая выполняется **процедура сверки**:
+
+    1. Таймаут `POST /v1/orders` (2 000 мс) → **не** повторяем `POST`.
+    2. Выполняем `GET /v1/orders?idempotencyKey={ключ}` — это безопасное чтение,
+       ему ретраи разрешены.
+    3. Заявка найдена → операция на самом деле удалась, работаем с ней как с успехом.
+    4. Заявка не найдена → отдаём пользователю `UPSTREAM_TIMEOUT` (504)
+       **и освобождаем hold в S6**.
+
+    ### Компенсация (обязательна)
+
+    При исходах `ORDER_CREATION_FAILED` (500), `EXCHANGE_SERVICE_UNAVAILABLE` (503)
+    и подтверждённом сверкой `UPSTREAM_TIMEOUT` (504) BFF **обязан** выполнить
+    `release hold` в **S6 (Accounting Service)**. Иначе средства пользователя останутся
+    заблокированными под заявку, которой не существует. Компенсация ставится в надёжную
+    очередь и повторяется до успеха: это финансовая операция, потеря её недопустима.
+
+    ## Кеш и допустимость stale
+
+    | Данные | Кеш | Stale |
+    |---|---|---|
+    | `POST /v1/orders` | **не кешируется** | — (запись) |
+    | `GET /v1/orders/{orderId}` | не кешируется на пути создания заявки | **stale недопустим**: статус заявки — финансово значимое состояние, устаревший ответ может показать пользователю несуществующую картину. Ср. §11: «Балансы — не кешируется, всегда свежие»; тот же принцип |
+    | `GET /v1/orders` (сверка) | **не кешируется никогда** | смысл вызова — узнать факт на этот момент; кеш обессмысливает процедуру |
+    | Ответ по `Idempotency-Key` | хранится **на стороне S8**, окно **24 ч** (канон §9) | это не кеш BFF, а гарантия сервиса |
+
+    ## Поведение при недоступности
+
+    | Ситуация | Реакция BFF | Код §7 наружу | Компенсация |
+    |---|---|---|---|
+    | Таймаут 2 000 мс | сверка через `GET /v1/orders?idempotencyKey=…` | `UPSTREAM_TIMEOUT` (504), если сверка не нашла заявку | **да**, release hold |
+    | 5xx | без ретрая | `ORDER_CREATION_FAILED` (500) | **да**, release hold |
+    | Сервис недоступен / брейкер `open` | без вызова | `EXCHANGE_SERVICE_UNAVAILABLE` (503) | **да**, release hold |
+    | 409 по холду | без ретрая | `HOLD_FAILED` (409) | холд не наш — сверить состояние в S6 |
+    | 409 по идемпотентности | без ретрая | `IDEMPOTENCY_CONFLICT` (409) | нет: тело другое, это ошибка клиента |
+
+    Сценарий `EXCHANGE_DOWN` из dev-панели прототипа (канон §10.6) имитирует именно
+    отказ S8 при submit и ожидает код `EXCHANGE_SERVICE_UNAVAILABLE`.
+
+    ## PII
+
+    В S8 передаются и от него приходят **псевдонимизированные** идентификаторы:
+    `userId`, `walletId`, `deviceId`. Это не прямые персональные данные (нет имени, email,
+    телефона, номера документа), но в связке с суммами и временем они образуют финансовый
+    профиль — данные подлежат защите как персональные.
+
+    Что **запрещено** передавать в S8: имя и фамилию, email, телефон, номер счёта,
+    реквизиты карты, паспортные данные, результаты KYC и скоринга. S8 получает **вердикт**
+    цепочки валидации, а не её входные данные: причины ручной проверки передаются
+    как `reviewCaseId` — непрозрачная ссылка на кейс в S3, а не как текст с деталями скоринга.
+
+    Поле `statusReason` — **машиночитаемый код**, а не свободный текст, именно чтобы
+    в него нельзя было случайно записать PII.
+
+  contact:
+    name: Exchange BFF Team
+    email: exchange-bff@wallet.internal
+  license:
+    name: Proprietary (internal use only)
+    identifier: LicenseRef-Wallet-Internal
+
+servers:
+  - url: https://orders.internal.wallet
+    description: |
+      Продакшн-инстанс сервиса заявок. Полный базовый путь с учётом версии —
+      `https://orders.internal.wallet/v1`. Только внутренний периметр, mTLS обязателен.
+  - url: https://orders.staging.internal.wallet
+    description: |
+      Staging. Полный базовый путь — `https://orders.staging.internal.wallet/v1`.
+      Окно идемпотентности сокращено до 1 ч для удобства прогонов.
+  - url: https://orders.mock.internal.wallet
+    description: |
+      Mock-инстанс для контрактных тестов. Полный базовый путь —
+      `https://orders.mock.internal.wallet/v1`. Отдаёт фикстуры канона §10
+      и умеет воспроизводить сценарий `EXCHANGE_DOWN` (§10.6).
+
+security:
+  - bearerAuth: []
+
+tags:
+  - name: orders
+    description: |
+      Регистрация заявки на обмен, чтение её состояния и список заявок
+      для процедуры сверки после таймаута.
+  - name: compliance
+    description: |
+      Операции комплаенса над заявкой в статусе `MANUAL_REVIEW`. Выполняются
+      не нашим приложением; контракт описан для полноты картины жизненного цикла.
+  - name: webhooks
+    description: |
+      Асинхронные события смены статуса заявки, которые S8 доставляет в наш приёмник.
+
+paths:
+
+  /v1/orders:
+
+    post:
+      operationId: createOrder
+      summary: Register an exchange order
+      tags: [orders]
+      description: |
+        Регистрирует заявку на обмен и присваивает ей `orderId`. Это **шаг 19** цепочки
+        валидации канона §6 — последний и единственный шаг, где источником является S8.
+
+        ## Предусловия
+
+        К моменту вызова BFF уже прошёл шаги 1–18: котировка проверена, лимиты и комплаенс
+        пройдены, **hold создан в S6** (шаг 18). В теле передаётся `holdId` — S8 обязан
+        убедиться, что резерв существует и активен.
+
+        ## Идемпотентность
+
+        Заголовок **`Idempotency-Key` обязателен** (канон §9: «`Idempotency-Key` (UUIDv4)
+        **обязателен** для `POST /exchange-orders`; окно хранения 24 ч»). Правила:
+
+        | Ситуация | Поведение |
+        |---|---|
+        | Первый вызов с ключом | `201 Created`, заявка создана |
+        | Повтор с **тем же телом** в течение 24 ч | **тот же `201`** с идентичным телом ответа + заголовок **`X-Idempotent-Replay: true`**; вторая заявка **не создаётся** |
+        | Повтор с **другим телом** в течение 24 ч | **`409`** с кодом `DUPLICATE_IDEMPOTENCY_KEY_DIFFERENT_PAYLOAD` → наш `IDEMPOTENCY_CONFLICT` (409) |
+        | Тот же ключ спустя >24 ч | окно истекло, ключ считается новым → создаётся новая заявка |
+
+        Сравнение тел выполняется по канонической форме запроса (нормализованный JSON
+        без учёта порядка ключей и незначащих пробелов), а не по байтам: иначе смена
+        порядка полей сериализатором ложно давала бы конфликт. `clientMeta` в сравнение
+        **входит** — изменение устройства при том же ключе подозрительно и обязано
+        дать конфликт.
+
+        Повтор — операция **осознанная**: он инициируется пользователем (повторное нажатие
+        кнопки) или процедурой восстановления, но **не автоматическим ретраем по таймауту**
+        (канон §11, см. `info.description`).
+
+        ## Возможные успешные исходы
+
+        * **`201 Created`, `status: PENDING`** — нормальный путь. Терминальное состояние
+          для скоупа задания (канон §1).
+        * **`201 Created`, `status: MANUAL_REVIEW`** — скоринг вернул `REVIEW` (шаг 16
+          канона §6). Канон §7: «`SCORING_REVIEW_REQUIRED` возвращается с `202 Accepted`
+          и телом заявки в статусе `MANUAL_REVIEW` — это **не ошибка**, а альтернативный
+          успешный исход». Обратите внимание на разницу уровней: **S8 отвечает `201`**
+          (ресурс создан), а **наш внешний API отдаёт пользователю `202`**. Средства
+          в обоих случаях зарезервированы (канон §8).
+
+        ## Таймаут и сверка
+
+        Таймаут 2 000 мс. При его срабатывании `POST` **не повторяется**; выполняется
+        `GET /v1/orders?idempotencyKey={ключ}`. Подробности — в `info.description`.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKeyHeader'
+        - $ref: '#/components/parameters/CorrelationIdHeader'
+        - $ref: '#/components/parameters/RequestIdHeader'
+      requestBody:
+        required: true
+        description: |
+          Полный набор параметров заявки, вычисленный BFF по итогам шагов 1–18 цепочки §6.
+          Все денежные величины — строки (канон §5.1).
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/OrderCreateRequest'
+            examples:
+              rubToUsdt:
+                $ref: '#/components/examples/OrderCreateRequestRubUsdt'
+      responses:
+        '201':
+          description: |
+            Заявка зарегистрирована. Ответ идентичен для первого вызова и для повтора
+            с тем же телом; различить их можно по заголовку `X-Idempotent-Replay`.
+          headers:
+            Location:
+              $ref: '#/components/headers/Location'
+            X-Idempotent-Replay:
+              $ref: '#/components/headers/XIdempotentReplay'
+            X-Correlation-Id:
+              $ref: '#/components/headers/XCorrelationId'
+            X-Request-Id:
+              $ref: '#/components/headers/XRequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Order'
+              examples:
+                pending:
+                  $ref: '#/components/examples/OrderPending'
+                manualReview:
+                  $ref: '#/components/examples/OrderManualReview'
+                idempotentReplay:
+                  $ref: '#/components/examples/OrderPendingReplay'
+        '400':
+          $ref: '#/components/responses/ValidationFailed'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/UnprocessableOrder'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+        '504':
+          $ref: '#/components/responses/GatewayTimeout'
+
+    get:
+      operationId: listOrders
+      summary: List orders (reconciliation and history)
+      tags: [orders]
+      description: |
+        Возвращает страницу заявок с фильтрацией и курсорной пагинацией.
+
+        ## Главное назначение: сверка после таймаута `POST`
+
+        Фильтр **`idempotencyKey`** существует ради одного сценария, и это не «удобная
+        мелочь», а обязательный элемент безопасности денежного пути:
+
+        > `POST /v1/orders` не ответил за 2 000 мс. Мы **не знаем**, дошёл ли запрос
+        > до S8. Канон §11 запрещает автоматический ретрай `POST` («Ретрай `POST`
+        > без идемпотентности = двойное списание»), и даже наличие `Idempotency-Key`
+        > не превращает слепой повтор в безопасную операцию. Единственный корректный
+        > способ выяснить факт — **спросить**: выполнить безопасный `GET`
+        > `?idempotencyKey={ключ}`, которому ретраи разрешены.
+
+        Разбор исходов сверки:
+
+        | Результат сверки | Что это значит | Действие BFF |
+        |---|---|---|
+        | `items` содержит одну заявку | `POST` дошёл и был обработан; потерялся только ответ | работаем с найденной заявкой как с успехом; hold **не** освобождаем |
+        | `items` пуст | `POST` не дошёл или не был обработан | `UPSTREAM_TIMEOUT` (504) пользователю + **обязательный release hold в S6** |
+        | Сама сверка не ответила | состояние неизвестно | `UPSTREAM_TIMEOUT` (504); сверка ставится в очередь и повторяется; hold освобождается только после подтверждённого отсутствия заявки |
+
+        Пустой результат при живом сервисе — **надёжный** признак отсутствия заявки:
+        запись `Idempotency-Key` и запись заявки в S8 выполняются в одной транзакции.
+
+        Комбинация `idempotencyKey` даёт не более одного элемента: ключ уникален
+        в окне 24 ч.
+
+        ## Прочие фильтры
+
+        `userId` и `status` — для служебных задач и экранов истории. Канон §1 относит
+        историю операций к «вне скоупа», поэтому на пути создания заявки эти фильтры
+        не используются. `X-User-Id` от gateway при этом обязателен — см. `securitySchemes`.
+
+        ## Пагинация
+
+        Cursor-based (`cursor`, `limit`) — канон §9. Offset-пагинация не применяется:
+        на растущей таблице заявок она даёт пропуски и дубли между страницами.
+
+        ## Кеш
+
+        **Не кешируется никогда.** Смысл сверки — узнать факт на текущий момент;
+        кеш обессмысливает процедуру и может привести к ошибочному освобождению холда.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKeyQuery'
+        - $ref: '#/components/parameters/UserIdQuery'
+        - $ref: '#/components/parameters/StatusQuery'
+        - $ref: '#/components/parameters/CreatedFromQuery'
+        - $ref: '#/components/parameters/CreatedToQuery'
+        - $ref: '#/components/parameters/CursorQuery'
+        - $ref: '#/components/parameters/LimitQuery'
+        - $ref: '#/components/parameters/CorrelationIdHeader'
+        - $ref: '#/components/parameters/RequestIdHeader'
+      responses:
+        '200':
+          description: |
+            Страница заявок. Пустой `items` — валидный успешный ответ, а не `404`:
+            «ничего не найдено» это результат поиска, а не ошибка.
+          headers:
+            X-Correlation-Id:
+              $ref: '#/components/headers/XCorrelationId'
+            X-Request-Id:
+              $ref: '#/components/headers/XRequestId'
+            Cache-Control:
+              $ref: '#/components/headers/CacheControlNoStore'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OrderList'
+              examples:
+                reconciliationFound:
+                  $ref: '#/components/examples/OrderListReconciliationFound'
+                reconciliationEmpty:
+                  $ref: '#/components/examples/OrderListReconciliationEmpty'
+        '400':
+          $ref: '#/components/responses/ValidationFailed'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+        '504':
+          $ref: '#/components/responses/GatewayTimeout'
+
+  /v1/orders/{orderId}:
+    get:
+      operationId: getOrder
+      summary: Get an order by id
+      tags: [orders]
+      description: |
+        Возвращает текущее состояние заявки.
+
+        **Когда используется.** После успешного `POST` — для экрана подтверждения,
+        если ответ `POST` был потерян на транспорте, но `orderId` уже известен;
+        а также при обработке вебхука `order.status.changed`, если полученное событие
+        нужно верифицировать у источника (событие — уведомление, S8 — источник истины).
+
+        **Ретраи.** Безопасное чтение: 2 попытки с backoff + jitter (канон §11).
+
+        **Кеш.** Не кешируется, stale недопустим — статус заявки финансово значим.
+
+        **Согласованность.** `version` монотонно растёт при каждом изменении заявки.
+        Если после вебхука `GET` вернул меньший `version`, чем в событии, — это отставание
+        реплики чтения; следует повторить чтение, а не откатывать состояние.
+      parameters:
+        - $ref: '#/components/parameters/OrderIdPath'
+        - $ref: '#/components/parameters/CorrelationIdHeader'
+        - $ref: '#/components/parameters/RequestIdHeader'
+      responses:
+        '200':
+          description: Заявка найдена.
+          headers:
+            X-Correlation-Id:
+              $ref: '#/components/headers/XCorrelationId'
+            X-Request-Id:
+              $ref: '#/components/headers/XRequestId'
+            ETag:
+              $ref: '#/components/headers/ETag'
+            Cache-Control:
+              $ref: '#/components/headers/CacheControlNoStore'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Order'
+              examples:
+                pending:
+                  $ref: '#/components/examples/OrderPending'
+                manualReview:
+                  $ref: '#/components/examples/OrderManualReview'
+                rejected:
+                  $ref: '#/components/examples/OrderRejected'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/OrderNotFound'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+        '504':
+          $ref: '#/components/responses/GatewayTimeout'
+
+    patch:
+      operationId: reviewOrder
+      summary: Compliance decision on a MANUAL_REVIEW order
+      tags: [compliance]
+      description: |
+        Переводит заявку из `MANUAL_REVIEW` в `PENDING` (решение «одобрить») или
+        в `REJECTED` (решение «отклонить»).
+
+        ## Кто вызывает — не мы
+
+        **Этот эндпоинт вне нашего скоупа записи.** Его вызывает бэк-офис комплаенса
+        после разбора кейса. Контракт описан здесь по двум причинам: он замыкает ветку
+        `MANUAL_REVIEW` из диаграммы жизненного цикла (канон §8), и именно его вызов
+        порождает событие `order.status.changed`, которое **приходит к нам** вебхуком
+        и меняет то, что видит пользователь.
+
+        Exchange BFF **не имеет права** вызывать этот метод: попытка «самоодобрения»
+        заявки, отправленной на ручную проверку, обходила бы шаг 16 цепочки §6
+        (`SCORING_REVIEW_REQUIRED`). Разграничение обеспечивается скоупами
+        service-JWT: у токена BFF нет скоупа `orders:review`.
+
+        ## Разрешённые переходы
+
+        | Из | В | Условие |
+        |---|---|---|
+        | `MANUAL_REVIEW` | `PENDING` | комплаенс одобрил; hold сохраняется |
+        | `MANUAL_REVIEW` | `REJECTED` | комплаенс отклонил; hold **освобождается** сервисом |
+
+        Любой другой переход → `409 INVALID_STATUS_TRANSITION`. В частности, `PENDING`
+        нельзя перевести обратно в `MANUAL_REVIEW`: канон §8 не содержит такого ребра.
+
+        ## Оптимистическая блокировка
+
+        Поле `version` в теле обязательно и должно совпадать с текущей версией заявки.
+        Несовпадение → `409 VERSION_CONFLICT`. Это защищает от гонки двух операторов,
+        одновременно открывших один кейс.
+
+        **`PATCH`, а не `POST /orders/{id}/approve`.** Второй вариант — RPC-глагол
+        в пути, что противоречит ресурсной модели канона §9. Здесь изменяется часть
+        представления существующего ресурса — это ровно семантика `PATCH`.
+      parameters:
+        - $ref: '#/components/parameters/OrderIdPath'
+        - $ref: '#/components/parameters/CorrelationIdHeader'
+        - $ref: '#/components/parameters/RequestIdHeader'
+      requestBody:
+        required: true
+        description: Решение комплаенса и версия заявки для оптимистической блокировки.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/OrderReviewRequest'
+            examples:
+              approve:
+                $ref: '#/components/examples/OrderReviewApprove'
+              reject:
+                $ref: '#/components/examples/OrderReviewReject'
+      responses:
+        '200':
+          description: Решение применено, возвращено новое состояние заявки.
+          headers:
+            X-Correlation-Id:
+              $ref: '#/components/headers/XCorrelationId'
+            X-Request-Id:
+              $ref: '#/components/headers/XRequestId'
+            ETag:
+              $ref: '#/components/headers/ETag'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Order'
+              examples:
+                approvedToPending:
+                  $ref: '#/components/examples/OrderApprovedToPending'
+                rejectedByCompliance:
+                  $ref: '#/components/examples/OrderRejected'
+        '400':
+          $ref: '#/components/responses/ValidationFailed'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/OrderNotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+        '504':
+          $ref: '#/components/responses/GatewayTimeout'
+
+webhooks:
+
+  order.status.changed:
+    post:
+      operationId: onOrderStatusChanged
+      summary: Order status change event delivered to our receiver
+      tags: [webhooks]
+      description: |
+        S8 доставляет это событие **нам** при каждой смене статуса заявки. Наш приёмник
+        обязан принять его и ответить `2xx`.
+
+        ## Подпись запроса
+
+        Заголовок:
+
+        ```
+        X-Order-Signature: t=<unix_seconds>,v1=<hex HMAC-SHA256(t + "." + rawBody)>
+        ```
+
+        Алгоритм проверки на нашей стороне — строго в этом порядке:
+
+        1. Распарсить заголовок, извлечь `t` и `v1`. Отсутствие заголовка или любой
+           из частей → `401`, событие отбрасывается.
+        2. Проверить **окно 300 с**: `|now − t| ≤ 300`. Выход за окно → `401`.
+        3. Составить подписываемую строку: `t + "." + rawBody`, где `rawBody` — **байты
+           тела ровно как пришли**, до какой-либо десериализации. Пересериализованный
+           JSON даст другую подпись.
+        4. Вычислить `HMAC-SHA256` на общем секрете и сравнить с `v1`
+           **в постоянном времени** (`constant-time compare`) — обычное сравнение строк
+           даёт тайминг-атаку на секрет.
+        5. Расхождение → `401`, событие отбрасывается и логируется как инцидент
+           безопасности.
+
+        **Почему в подпись входит timestamp.** Подпись только тела была бы вечной:
+        перехватив один валидный запрос, атакующий мог бы бесконечно его переигрывать.
+        Включение `t` в подписываемую строку связывает подпись с моментом времени,
+        а **проверка окна 300 с превращает это в защиту от replay** — старый перехваченный
+        запрос отвергается по шагу 2, и переподписать его атакующий не может, не зная
+        секрета. 300 с выбрано как компромисс: достаточно, чтобы пережить расхождение
+        часов между сервисами (NTP-дрейф), и достаточно мало, чтобы окно переигрывания
+        было практически бесполезным.
+
+        Формат `t=…,v1=…` допускает несколько подписей (`v1=…,v1=…`) — так делается
+        ротация секрета без простоя: некоторое время события подписываются и старым,
+        и новым ключом. Достаточно совпадения **любой** из подписей.
+
+        ## Идемпотентность доставки
+
+        Доставка **at-least-once**: дубликаты не аномалия, а штатный режим. Наш приёмник
+        обязан быть к ним готов.
+
+        * Дедупликация по **`eventId`** (UUID). Окно хранения — **24 ч**.
+        * Повторное событие с уже виденным `eventId` → обработка пропускается,
+          ответ **`200`** (не ошибка: для отправителя это успешная доставка,
+          и повторять её не нужно).
+        * Обработка обязана быть безопасной при повторе даже без дедупликации —
+          дедуп это оптимизация, а не единственная линия защиты. Правило простое:
+          обработчик **устанавливает** состояние, а не **инкрементирует** его.
+
+        ## Порядок событий
+
+        Доставка **не гарантирует порядок**: события могут прийти переставленными.
+        Упорядочивание — по паре полей:
+
+        * **`sequence`** — целое, монотонно возрастает **в пределах одной заявки**
+          (не глобально). Позволяет обнаружить пропуск и перестановку.
+        * **`version`** — версия агрегата заявки, та же, что в `GET /v1/orders/{orderId}`.
+
+        > **Событие с `version` меньше уже сохранённого — ОТБРАСЫВАЕТСЯ.**
+
+        Это правило нормативно. Без него запоздавшее событие `PENDING` (version 1),
+        пришедшее после `MANUAL_REVIEW` (version 2), откатило бы состояние заявки
+        у пользователя. Разрыв в `sequence` (пришёл 5 при последнем виденном 3) —
+        сигнал о потере: следует запросить актуальное состояние через
+        `GET /v1/orders/{orderId}`, а не ждать пропущенное событие.
+
+        ## Ответ и ретраи
+
+        Наш приёмник обязан ответить **`2xx` в течение 5 с**. Любой другой исход
+        (не-2xx, таймаут, разрыв) считается неудачной доставкой.
+
+        Расписание повторов S8: **1 мин → 5 мин → 15 мин → 1 ч → 6 ч → 24 ч**,
+        после чего событие уходит в **DLQ** и требует ручного разбора.
+
+        Важно: `2xx` означает «принято к обработке», а не «обработано». Приёмник
+        обязан быстро записать событие в свою очередь и ответить, а разбирать —
+        асинхронно; иначе тяжёлая обработка упрётся в лимит 5 с и вызовет лавину повторов.
+
+        ## Влияние на скоуп
+
+        Канон §1: терминальное состояние задания — `PENDING`. События с
+        `currentStatus` из `EXECUTING` / `COMPLETED` / `FAILED` / `EXPIRED` приходят,
+        но относятся к работам за границей скоупа (канон §8) — приёмник обязан
+        их принять и не падать на них.
+      parameters:
+        - $ref: '#/components/parameters/OrderSignatureHeader'
+        - $ref: '#/components/parameters/WebhookDeliveryHeader'
+        - $ref: '#/components/parameters/CorrelationIdHeader'
+        - $ref: '#/components/parameters/RequestIdHeader'
+      requestBody:
+        required: true
+        description: |
+          Полезная нагрузка события. Сериализуется без изменений — именно эти байты
+          участвуют в вычислении подписи.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/OrderStatusChangedEvent'
+            examples:
+              validatingToPending:
+                $ref: '#/components/examples/EventOrderPending'
+              pendingToManualReview:
+                $ref: '#/components/examples/EventOrderManualReview'
+              rejectedByCompliance:
+                $ref: '#/components/examples/EventOrderRejected'
+      responses:
+        '200':
+          description: |
+            Событие принято к обработке (в том числе если оно оказалось дубликатом
+            по `eventId` или было отброшено по правилу `version`). S8 считает доставку
+            успешной и повторов не делает.
+          headers:
+            X-Correlation-Id:
+              $ref: '#/components/headers/XCorrelationId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WebhookAck'
+              examples:
+                accepted:
+                  $ref: '#/components/examples/WebhookAckAccepted'
+                duplicate:
+                  $ref: '#/components/examples/WebhookAckDuplicate'
+                staleVersion:
+                  $ref: '#/components/examples/WebhookAckStale'
+        '400':
+          description: |
+            Тело события не проходит схему. S8 будет повторять по расписанию —
+            и это правильно: невалидное тело почти всегда означает дефект на одной
+            из сторон, который должен быть замечен.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WebhookAck'
+        '401':
+          description: |
+            Подпись `X-Order-Signature` отсутствует, не сходится или timestamp вне
+            окна 300 с. Событие отбрасывается, инцидент безопасности логируется.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WebhookAck'
+        '500':
+          description: |
+            Внутренний сбой приёмника. Запускает расписание повторов
+            1 м / 5 м / 15 м / 1 ч / 6 ч / 24 ч, затем DLQ.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WebhookAck'
+
+components:
+
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: |
+        **Service-to-service JWT.** BFF предъявляет машинный токен
+        (`Authorization: Bearer <jwt>`), подписанный `RS256`, TTL 300 с. Обязательные
+        клеймы: `iss`, `sub` (`svc:exchange-bff`), `aud` (`svc:order-service`), `exp`,
+        `iat`, `jti`.
+
+        **Скоупы.** У токена BFF есть `orders:write` и `orders:read`, но **нет**
+        `orders:review` — именно поэтому `PATCH /v1/orders/{orderId}` для нас закрыт
+        (`403`). Разграничение на уровне токена, а не на уровне договорённости.
+
+        **`X-User-Id` от gateway.** Канон §9: аутентификация в контракте описана
+        (`Bearer` JWT + `X-User-Id` от gateway), в прототипе не используется. Заголовок
+        передаётся вместе с service-JWT: JWT отвечает на вопрос «какой сервис зовёт»,
+        `X-User-Id` — «от чьего имени». S8 обязан сверить `X-User-Id` с `userId` в теле
+        запроса; расхождение → `403`.
+
+        **mTLS.** Канал защищён взаимным TLS 1.3 на сертификатах внутреннего PKI
+        с проверкой SAN по имени сервиса. Для **входящих вебхуков** направление обратное:
+        клиентский сертификат предъявляет S8, а наш приёмник его проверяет — и это
+        **дополняет**, а не заменяет проверку HMAC-подписи `X-Order-Signature`. mTLS
+        подтверждает канал, подпись — целостность и свежесть конкретного сообщения.
+
+  headers:
+    XCorrelationId:
+      description: |
+        Сквозной идентификатор бизнес-операции (канон §9). Возвращается в каждом ответе
+        и в каждой ошибке.
+      required: true
+      schema:
+        $ref: '#/components/schemas/CorrelationId'
+    XRequestId:
+      description: |
+        Идентификатор конкретной HTTP-попытки. Меняется на каждой попытке, включая
+        повторы, — по нему различают ретраи в логах.
+      required: true
+      schema:
+        $ref: '#/components/schemas/Uuid'
+    XIdempotentReplay:
+      description: |
+        `true`, если ответ отдан из журнала идемпотентности, а новая заявка **не**
+        создавалась. Заголовок отсутствует или равен `false` при первичной обработке.
+        BFF использует его для метрик и для того, чтобы не дублировать уведомление
+        в S9 при повторном submit.
+      required: false
+      schema:
+        type: boolean
+        description: Признак идемпотентного повтора.
+        examples: [true, false]
+    Location:
+      description: URI созданного ресурса заявки.
+      required: false
+      schema:
+        type: string
+        format: uri-reference
+        minLength: 1
+        maxLength: 256
+        description: Относительный путь к заявке.
+        examples: ["/v1/orders/ord_01J9X2C4K7QF8N3M5T6V7W8Y9Z"]
+    ETag:
+      description: |
+        Версия представления заявки. Совпадает по смыслу с полем `version` в теле
+        и может использоваться для условных запросов.
+      required: false
+      schema:
+        type: string
+        minLength: 3
+        maxLength: 64
+        description: Значение ETag в кавычках.
+        examples: ["\"1\"", "\"2\""]
+    RetryAfter:
+      description: Через сколько секунд имеет смысл повторить запрос.
+      required: false
+      schema:
+        type: integer
+        minimum: 0
+        maximum: 3600
+        description: Задержка перед повтором, секунды.
+        examples: [5]
+    CacheControlNoStore:
+      description: |
+        Запрет кеширования. Состояние заявки финансово значимо, устаревший ответ
+        недопустим.
+      required: false
+      schema:
+        type: string
+        minLength: 1
+        maxLength: 128
+        description: Значение заголовка `Cache-Control`.
+        examples: ["no-store"]
+
+  parameters:
+
+    OrderIdPath:
+      name: orderId
+      in: path
+      required: true
+      description: Идентификатор заявки (канон §4.5).
+      schema:
+        $ref: '#/components/schemas/OrderId'
+
+    IdempotencyKeyHeader:
+      name: Idempotency-Key
+      in: header
+      required: true
+      description: |
+        Ключ идемпотентности, **UUIDv4**, обязателен (канон §9). Окно хранения — 24 ч.
+        Генерируется BFF один раз на попытку пользователя подтвердить обмен и сохраняется
+        до получения окончательного исхода: при повторном нажатии кнопки используется
+        **тот же** ключ, иначе идемпотентность не сработает и возникнет вторая заявка.
+
+        Тот же ключ передаётся в фильтр `idempotencyKey` при сверке после таймаута.
+      schema:
+        $ref: '#/components/schemas/IdempotencyKey'
+
+    IdempotencyKeyQuery:
+      name: idempotencyKey
+      in: query
+      required: false
+      description: |
+        Фильтр по ключу идемпотентности. **Основной инструмент сверки после таймаута
+        `POST`** (см. описание операции `listOrders`). Возвращает не более одного элемента:
+        ключ уникален в окне 24 ч.
+      schema:
+        $ref: '#/components/schemas/IdempotencyKey'
+
+    UserIdQuery:
+      name: userId
+      in: query
+      required: false
+      description: |
+        Фильтр по владельцу заявки. На пути создания заявки не используется:
+        история операций — вне скоупа (канон §1).
+      schema:
+        $ref: '#/components/schemas/UserId'
+
+    StatusQuery:
+      name: status
+      in: query
+      required: false
+      description: |
+        Фильтр по статусу. Допускается повторение параметра для нескольких статусов
+        (`?status=PENDING&status=MANUAL_REVIEW`).
+      schema:
+        type: array
+        minItems: 1
+        maxItems: 7
+        description: Набор статусов для фильтрации.
+        items:
+          $ref: '#/components/schemas/OrderStatus'
+      style: form
+      explode: true
+
+    CreatedFromQuery:
+      name: createdFrom
+      in: query
+      required: false
+      description: Нижняя граница `createdAt`, включительно.
+      schema:
+        $ref: '#/components/schemas/Timestamp'
+
+    CreatedToQuery:
+      name: createdTo
+      in: query
+      required: false
+      description: Верхняя граница `createdAt`, исключительно.
+      schema:
+        $ref: '#/components/schemas/Timestamp'
+
+    CursorQuery:
+      name: cursor
+      in: query
+      required: false
+      description: |
+        Непрозрачный курсор следующей страницы — значение `nextCursor` из предыдущего
+        ответа. Структуру курсора разбирать нельзя: она принадлежит сервису и может
+        измениться без предупреждения.
+      schema:
+        type: string
+        pattern: '^[A-Za-z0-9_-]{1,512}$'
+        minLength: 1
+        maxLength: 512
+        description: Курсор в base64url без набивки.
+        examples: ["eyJjcmVhdGVkQXQiOiIyMDI2LTA4LTA3VDEwOjE1OjMyLjExN1oifQ"]
+
+    LimitQuery:
+      name: limit
+      in: query
+      required: false
+      description: Размер страницы.
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 100
+        default: 20
+        description: Количество элементов на странице.
+        examples: [1, 20, 100]
+
+    CorrelationIdHeader:
+      name: X-Correlation-Id
+      in: header
+      required: true
+      description: |
+        Сквозной идентификатор бизнес-операции (канон §9). Один и тот же для всех вызовов
+        в рамках одной попытки создать заявку, включая сверку после таймаута — это
+        позволяет собрать всю историю инцидента одним запросом к логам.
+      schema:
+        $ref: '#/components/schemas/CorrelationId'
+
+    RequestIdHeader:
+      name: X-Request-Id
+      in: header
+      required: false
+      description: |
+        Идентификатор конкретной HTTP-попытки. Меняется на каждой попытке — в отличие
+        от `X-Correlation-Id`.
+      schema:
+        $ref: '#/components/schemas/Uuid'
+
+    OrderSignatureHeader:
+      name: X-Order-Signature
+      in: header
+      required: true
+      description: |
+        HMAC-подпись вебхука в формате `t=<unix_seconds>,v1=<hex>`, где подписываемая
+        строка — `t + "." + rawBody`, алгоритм — `HMAC-SHA256`, кодировка подписи —
+        нижний регистр hex (64 символа). Окно валидности `t` — **300 с**.
+        Допускается несколько частей `v1` для ротации секрета.
+        Подробности проверки — в описании вебхука `order.status.changed`.
+      schema:
+        type: string
+        pattern: '^t=\d{10},v1=[0-9a-f]{64}(,v1=[0-9a-f]{64})*$'
+        minLength: 80
+        maxLength: 512
+        description: Значение заголовка подписи.
+        examples: ["t=1786205732,v1=5d41402abc4b2a76b9719d911017c592a1b2c3d4e5f60718293a4b5c6d7e8f90"]
+
+    WebhookDeliveryHeader:
+      name: X-Order-Delivery-Attempt
+      in: header
+      required: false
+      description: |
+        Номер попытки доставки, начиная с 1. Позволяет приёмнику отличить первую доставку
+        от повтора по расписанию 1 м / 5 м / 15 м / 1 ч / 6 ч / 24 ч и не поднимать
+        лишний алерт на штатном повторе.
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 7
+        description: Порядковый номер попытки доставки.
+        examples: [1, 3]
+
+  schemas:
+
+    DecimalString:
+      type: string
+      pattern: '^(0|[1-9]\d{0,18})(\.\d{1,18})?$'
+      minLength: 1
+      maxLength: 40
+      description: |
+        Неотрицательная десятичная величина в строковом виде (канон §5.1). Двоичные
+        `float`/`double` запрещены на всём пути: API, BFF, состояние фронтенда,
+        отображение.
+      examples: ["25450.00", "10000.00", "35.00", "106.010638", "0.010638297872"]
+
+    Timestamp:
+      type: string
+      format: date-time
+      pattern: '^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$'
+      minLength: 24
+      maxLength: 24
+      description: |
+        Момент времени в ISO-8601 UTC с миллисекундами и суффиксом `Z` (канон §9).
+      examples: ["2026-08-07T10:15:32.117Z"]
+
+    Uuid:
+      type: string
+      format: uuid
+      pattern: '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+      minLength: 36
+      maxLength: 36
+      description: Идентификатор в формате UUID, нижний регистр.
+      examples: ["7c9e6679-7425-40de-944b-e07fc1f90ae7"]
+
+    IdempotencyKey:
+      type: string
+      format: uuid
+      pattern: '^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$'
+      minLength: 36
+      maxLength: 36
+      description: |
+        Ключ идемпотентности, **UUIDv4** (канон §9). Паттерн жёстче обычного UUID:
+        зафиксирована версия `4` и вариант `[89ab]`. Причина строгости — UUIDv1 содержит
+        MAC-адрес и метку времени, то есть утекает информацию об инфраструктуре,
+        а последовательные ключи предсказуемы и допускают подбор чужого ответа
+        из журнала идемпотентности.
+      examples: ["3f1a7c58-2b64-4e9a-9d31-8a5f0c7b2e14"]
+
+    CorrelationId:
+      type: string
+      pattern: '^[0-9A-HJKMNP-TV-Z]{26}$'
+      minLength: 26
+      maxLength: 26
+      description: |
+        Сквозной идентификатор операции, ULID (канон §7, пример
+        `"01J9X2C4K7QF8N3M5T6V7W8Y9Z"`). Crockford Base32 без `I`, `L`, `O`, `U`.
+      examples: ["01J9X2C4K7QF8N3M5T6V7W8Y9Z"]
+
+    OrderId:
+      type: string
+      pattern: '^ord_[0-9A-HJKMNP-TV-Z]{26}$'
+      minLength: 30
+      maxLength: 30
+      description: |
+        Идентификатор заявки: префикс `ord_` + ULID (канон §4.5: «`"ord_"` + ULID,
+        устойчиво сортируется по времени»). Префикс делает идентификатор самоописывающим
+        в логах, ULID даёт сортировку по времени создания без отдельного индекса
+        и не раскрывает количество заявок в системе, в отличие от автоинкремента.
+      examples: ["ord_01J9X2C4K7QF8N3M5T6V7W8Y9Z"]
+
+    UserId:
+      type: string
+      pattern: '^usr_[0-9A-HJKMNP-TV-Z]{26}$'
+      minLength: 30
+      maxLength: 30
+      description: |
+        Идентификатор пользователя, префикс `usr_` + ULID. Псевдонимизированный
+        идентификатор: сам по себе не раскрывает личность, но подлежит защите
+        как персональные данные.
+      examples: ["usr_01J8ZQ4H9K2M3N4P5R6S7T8V9W"]
+
+    WalletId:
+      type: string
+      pattern: '^wlt_[0-9A-HJKMNP-TV-Z]{26}$'
+      minLength: 30
+      maxLength: 30
+      description: |
+        Идентификатор кошелька, префикс `wlt_` + ULID. Кошелёк — контейнер балансов,
+        с которого выполняется списание (канон §4.2).
+      examples: ["wlt_01J8ZQ4H9K2M3N4P5R6S7T8VAB"]
+
+    HoldId:
+      type: string
+      pattern: '^hld_[0-9A-HJKMNP-TV-Z]{26}$'
+      minLength: 30
+      maxLength: 30
+      description: |
+        Идентификатор резерва средств в **S6 (Accounting Service)**, префикс `hld_` + ULID.
+        Канон §4.5: «идентификатор резерва в Accounting». Создаётся на шаге 18 цепочки §6,
+        **до** обращения к S8. Именно этот резерв освобождается в рамках компенсации,
+        если регистрация заявки не удалась.
+      examples: ["hld_01J9X2C4K5QF8N3M5T6V7W8Y9Z"]
+
+    AssetId:
+      type: string
+      pattern: '^[A-Z0-9]{2,10}$'
+      minLength: 2
+      maxLength: 10
+      description: Код актива (канон §4.1).
+      examples: ["RUB", "USDT", "BTC", "ETH", "EUR"]
+
+    Network:
+      type: string
+      enum: [TRON, ETHEREUM, BITCOIN]
+      description: Блокчейн-сеть крипто-актива (канон §2, §4.1).
+      examples: ["TRON", "ETHEREUM", "BITCOIN"]
+
+    AssetRef:
+      type: object
+      description: |
+        Ссылка на актив. Канон §2: `USDT@TRON` и `USDT@ETHEREUM` — **разные балансы**,
+        поэтому актив без сети для крипто неоднозначен.
+      additionalProperties: false
+      required: [assetId, network]
+      properties:
+        assetId:
+          $ref: '#/components/schemas/AssetId'
+          description: Код актива.
+          examples: ["USDT"]
+        network:
+          oneOf:
+            - $ref: '#/components/schemas/Network'
+            - type: 'null'
+          description: |
+            Сеть актива. Обязательна для `type: CRYPTO`, **`null` для фиата**
+            (канон §4.1: «обязателен для CRYPTO»). Записано как `oneOf` с `type: 'null'`,
+            а не через `nullable`, — в OpenAPI 3.1 (JSON Schema 2020-12) `nullable`
+            отменено.
+          examples: ["TRON", null]
+
+    OrderStatus:
+      type: string
+      enum:
+        - PENDING
+        - MANUAL_REVIEW
+        - REJECTED
+        - EXECUTING
+        - COMPLETED
+        - FAILED
+        - EXPIRED
+      description: |
+        Статус заявки. Перечень соответствует канону §8 — таблице «Отдаётся наружу».
+
+        **`VALIDATING` в перечне отсутствует намеренно.** Канон §8 помечает его как
+        «внутреннее, наружу не отдаётся»: пока идёт цепочка проверок §6, заявки для
+        внешнего мира ещё не существует. Клиент никогда не должен уметь получить
+        это значение — поэтому его нет и в схеме.
+
+        **Граница скоупа задания — `PENDING`** (канон §1: «Терминальное состояние для
+        этого задания — заявка в статусе `PENDING`»). Значения `EXECUTING`, `COMPLETED`,
+        `FAILED`, `EXPIRED` лежат за пунктирной линией диаграммы §8 и на пути создания
+        заявки не возникают; они описаны, потому что приходят вебхуком, и приёмник
+        обязан их корректно принять.
+
+        | Статус | Средства | Терминальный | В скоупе задания |
+        |---|---|---|---|
+        | `PENDING` | зарезервированы (hold) | нет | **да, целевой исход** |
+        | `MANUAL_REVIEW` | зарезервированы | нет | **да, альтернативный исход** |
+        | `REJECTED` | не тронуты / hold снят | да | **да** |
+        | `EXECUTING` | зарезервированы | нет | нет |
+        | `COMPLETED` | списаны и зачислены | да | нет |
+        | `FAILED` | hold снят | да | нет |
+        | `EXPIRED` | hold снят | да | нет |
+      examples: ["PENDING", "MANUAL_REVIEW", "REJECTED"]
+
+    StatusReason:
+      type: [string, 'null']
+      pattern: '^[A-Z][A-Z0-9_]{2,63}$'
+      minLength: 3
+      maxLength: 64
+      description: |
+        Машиночитаемый код причины текущего статуса. `null`, если причины нет
+        (нормальный переход в `PENDING`).
+
+        **Код, а не свободный текст** — сознательно, по двум причинам: свободный текст
+        нельзя надёжно локализовать, и в него неизбежно попадает PII (имя оператора,
+        фрагменты KYC-данных). Значения вроде `SCORING_REVIEW_REQUIRED`,
+        `COMPLIANCE_DECLINED`, `QUOTE_EXPIRED` соотносятся с каталогом §7, но
+        **не обязаны** совпадать с ним один в один: каталог §7 описывает ошибки нашего
+        внешнего API, а `statusReason` — состояние доменного объекта.
+
+        Тип записан как `type: [string, 'null']` (OpenAPI 3.1), а не `nullable`.
+      examples: ["SCORING_REVIEW_REQUIRED", "COMPLIANCE_DECLINED", null]
+
+    ClientMeta:
+      type: object
+      description: |
+        Контекст клиента, инициировавшего заявку. Передаётся для аудита и разбора
+        инцидентов.
+
+        **PII.** `deviceId` — псевдонимизированный идентификатор установки, не аппаратный
+        серийный номер и не рекламный идентификатор. IP-адрес, User-Agent, геолокация
+        и любые контактные данные сюда **не кладутся**: они не нужны S8 для регистрации
+        заявки, а их наличие расширяет поверхность утечки.
+
+        `clientMeta` **участвует** в сравнении тел при проверке идемпотентности:
+        тот же ключ с другого устройства обязан дать `409`.
+      additionalProperties: false
+      required: [source]
+      properties:
+        source:
+          type: string
+          enum: [IOS, ANDROID, WEB, API]
+          description: Канал, из которого пришёл запрос.
+          examples: ["IOS", "WEB"]
+        deviceId:
+          type: [string, 'null']
+          pattern: '^[A-Za-z0-9_-]{8,64}$'
+          minLength: 8
+          maxLength: 64
+          description: |
+            Псевдонимизированный идентификатор установки приложения. `null` для
+            `source: WEB` без постоянной идентификации и для `source: API`.
+          examples: ["dev_9f2b71ac04e3", null]
+        locale:
+          type: string
+          pattern: '^[a-z]{2}-[A-Z]{2}$'
+          minLength: 5
+          maxLength: 5
+          description: |
+            Локаль интерфейса в формате BCP 47 `язык-РЕГИОН`. Используется для выбора
+            языка уведомления, которое S9 отправит по факту создания заявки.
+          examples: ["en-US", "ru-RU"]
+
+    OrderCreateRequest:
+      type: object
+      description: |
+        Запрос на регистрацию заявки. Формируется BFF **после** успешного прохождения
+        шагов 1–18 цепочки §6 и содержит уже вычисленные и проверенные величины.
+
+        **Инварианты канона §5.4**, которые S8 обязан перепроверить на своей стороне
+        (доверять расчёту вызывающей стороны в финансовой системе нельзя):
+
+        ```
+        I1: feeAmount + netFromAmount == fromAmount      (точное равенство)
+        I2: toAmount ≤ netFromAmount × rate
+        I4: все величины ≥ 0
+        I5: decimals(value) ≤ decimals(asset)
+        ```
+
+        Инвариант `I3` (`fromAmount ≤ balance.available`) проверяется не здесь,
+        а в S6 на шагах 17–18: к моменту вызова S8 холд уже создан, и он сам является
+        доказательством достаточности средств.
+
+        Нарушение любого инварианта → `422 VALIDATION_FAILED` → наш `VALIDATION_ERROR` (400).
+      additionalProperties: false
+      required:
+        [userId, walletId, quoteId, fromAsset, toAsset, fromAmount, feeAmount,
+         netFromAmount, toAmount, rate, inverseRate, rateSource, holdId,
+         idempotencyKey, correlationId, clientMeta]
+      properties:
+        userId:
+          $ref: '#/components/schemas/UserId'
+          description: |
+            Владелец заявки. Должен совпадать с `X-User-Id` от gateway; расхождение → `403`.
+          examples: ["usr_01J8ZQ4H9K2M3N4P5R6S7T8V9W"]
+        walletId:
+          $ref: '#/components/schemas/WalletId'
+          description: Кошелёк, с балансов которого выполняется обмен.
+          examples: ["wlt_01J8ZQ4H9K2M3N4P5R6S7T8VAB"]
+        quoteId:
+          $ref: '#/components/schemas/Uuid'
+          description: |
+            Котировка, на основании которой создаётся заявка (канон §4.3). S8 обязан
+            пометить её как использованную атомарно с созданием заявки — иначе одна
+            котировка породит две заявки. Повторное использование → `409
+            QUOTE_ALREADY_CONSUMED` → наш `QUOTE_ALREADY_USED` (409), шаг 7 цепочки §6.
+          examples: ["7c9e6679-7425-40de-944b-e07fc1f90ae7"]
+        fromAsset:
+          $ref: '#/components/schemas/AssetRef'
+          description: Актив списания.
+        toAsset:
+          $ref: '#/components/schemas/AssetRef'
+          description: |
+            Актив получения. Должен отличаться от `fromAsset` с учётом сети
+            (канон §6, шаг 4, `SAME_ASSET_PAIR`).
+        fromAmount:
+          $ref: '#/components/schemas/DecimalString'
+          description: |
+            Полная сумма списания, **включая комиссию** (канон §4.3, §5.3: режим
+            `INCLUDED_IN_SOURCE` — комиссия удерживается внутри введённой суммы,
+            а не сверху).
+          examples: ["10000.00"]
+        feeAmount:
+          $ref: '#/components/schemas/DecimalString'
+          description: |
+            Комиссия в валюте списания. Канон §5.3: `feeRaw = fromAmount × percent / 100`,
+            затем `clamp(feeRaw, minFee, maxFee)` и округление **ВВЕРХ** до
+            `decimals(fromAsset)` (§5.4: детерминированно и не в убыток системе).
+          examples: ["35.00"]
+        netFromAmount:
+          $ref: '#/components/schemas/DecimalString'
+          description: |
+            `fromAmount − feeAmount` — сумма, которая идёт в конвертацию (канон §4.3).
+            Инвариант I1 требует **точного** равенства `feeAmount + netFromAmount ==
+            fromAmount`.
+          examples: ["9965.00"]
+        toAmount:
+          $ref: '#/components/schemas/DecimalString'
+          description: |
+            Сумма получения: `netFromAmount × rate`, округление **ВНИЗ** до
+            `decimals(toAsset)` (канон §5.4: «никогда не обещаем пользователю больше,
+            чем сможем выдать»). Инвариант I2: `toAmount ≤ netFromAmount × rate`.
+          examples: ["106.010638"]
+        rate:
+          $ref: '#/components/schemas/DecimalString'
+          description: |
+            Курс: сколько единиц `toAsset` даётся за **1 единицу** `fromAsset`
+            (канон §5.2). Передаётся **без округления, как пришёл от S5** (§5.4:
+            округление курса ломает воспроизводимость расчёта).
+          examples: ["0.010638297872"]
+        inverseRate:
+          $ref: '#/components/schemas/DecimalString'
+          description: |
+            Обратный курс, `ROUND_HALF_UP` до 2 знаков. Канон §5.2: считается BFF
+            и служит **только** для отображения («1 USDT = 94.00 RUB» читается человеком
+            легче). В расчётах не участвует и не является источником истины.
+          examples: ["94.00"]
+        rateSource:
+          $ref: '#/components/schemas/RateSource'
+          description: Источник курса (канон §4.3).
+          examples: ["AGGREGATED"]
+        holdId:
+          $ref: '#/components/schemas/HoldId'
+          description: |
+            Резерв средств, созданный в S6 на шаге 18 цепочки §6. S8 обязан проверить,
+            что резерв существует, активен и принадлежит тому же `walletId` и активу.
+            Отсутствие → `409 HOLD_NOT_FOUND`, неактивен → `409 HOLD_NOT_ACTIVE`;
+            оба → наш `HOLD_FAILED` (409).
+          examples: ["hld_01J9X2C4K5QF8N3M5T6V7W8Y9Z"]
+        idempotencyKey:
+          $ref: '#/components/schemas/IdempotencyKey'
+          description: |
+            Дублирует заголовок `Idempotency-Key`. Дублирование намеренное: ключ
+            сохраняется в теле заявки и возвращается в `Order`, что делает сверку
+            через `GET /v1/orders?idempotencyKey=…` возможной. Расхождение значения
+            в заголовке и в теле → `400 VALIDATION_FAILED`.
+          examples: ["3f1a7c58-2b64-4e9a-9d31-8a5f0c7b2e14"]
+        correlationId:
+          $ref: '#/components/schemas/CorrelationId'
+          description: |
+            Дублирует заголовок `X-Correlation-Id` и сохраняется в заявке, чтобы связать
+            её с полной трассой создания даже спустя месяцы.
+          examples: ["01J9X2C4K7QF8N3M5T6V7W8Y9Z"]
+        estimatedCompletionAt:
+          $ref: '#/components/schemas/Timestamp'
+          description: |
+            Ожидаемое время завершения, рассчитанное BFF. Необязательно: если поле
+            опущено, S8 рассчитывает срок сам по своей модели.
+          examples: ["2026-08-07T10:16:02.117Z"]
+        clientMeta:
+          $ref: '#/components/schemas/ClientMeta'
+          description: |
+            Контекст клиента. Входит в сравнение тел при проверке идемпотентности.
+
+    RateSource:
+      type: string
+      enum: [AGGREGATED, BINANCE, CBR, INTERNAL]
+      description: |
+        Источник курса (канон §4.3: `"AGGREGATED" | "BINANCE" | "CBR" | "INTERNAL"`).
+        Сохраняется в заявке для воспроизводимости расчёта при разборе спора.
+      examples: ["AGGREGATED", "CBR"]
+
+    Order:
+      type: object
+      description: |
+        Заявка на обмен. Соответствует `ExchangeOrder` канона §4.5, расширенному полями,
+        которых нет в минимальной канонической записи, но которые нужны для реальной
+        эксплуатации: `netFromAmount`, `inverseRate`, `rateSource`, `updatedAt`,
+        `statusReason`, `reviewCaseId`, `version`, `walletId`.
+      additionalProperties: false
+      required:
+        [orderId, status, userId, walletId, quoteId, fromAsset, toAsset, fromAmount,
+         feeAmount, netFromAmount, toAmount, rate, inverseRate, rateSource, holdId,
+         createdAt, updatedAt, estimatedCompletionAt, idempotencyKey, correlationId,
+         statusReason, version]
+      properties:
+        orderId:
+          $ref: '#/components/schemas/OrderId'
+          description: |
+            Идентификатор заявки, присвоенный S8. **Это то, ради чего мы сюда ходим**
+            (канон §1: пользователь получает `orderId` и подтверждение приёма заявки).
+          examples: ["ord_01J9X2C4K7QF8N3M5T6V7W8Y9Z"]
+        status:
+          $ref: '#/components/schemas/OrderStatus'
+          description: |
+            Текущий статус. На пути создания заявки возможны только `PENDING`,
+            `MANUAL_REVIEW` и `REJECTED` (канон §1, §8).
+          examples: ["PENDING"]
+        userId:
+          $ref: '#/components/schemas/UserId'
+          description: Владелец заявки.
+          examples: ["usr_01J8ZQ4H9K2M3N4P5R6S7T8V9W"]
+        walletId:
+          $ref: '#/components/schemas/WalletId'
+          description: Кошелёк списания.
+          examples: ["wlt_01J8ZQ4H9K2M3N4P5R6S7T8VAB"]
+        quoteId:
+          $ref: '#/components/schemas/Uuid'
+          description: Котировка, на основании которой создана заявка.
+          examples: ["7c9e6679-7425-40de-944b-e07fc1f90ae7"]
+        fromAsset:
+          $ref: '#/components/schemas/AssetRef'
+          description: Актив списания.
+        toAsset:
+          $ref: '#/components/schemas/AssetRef'
+          description: Актив получения.
+        fromAmount:
+          $ref: '#/components/schemas/DecimalString'
+          description: Полная сумма списания, включая комиссию (канон §5.3).
+          examples: ["10000.00"]
+        feeAmount:
+          $ref: '#/components/schemas/DecimalString'
+          description: Комиссия в валюте списания, округление ВВЕРХ (канон §5.4).
+          examples: ["35.00"]
+        netFromAmount:
+          $ref: '#/components/schemas/DecimalString'
+          description: "Сумма, ушедшая в конвертацию: `fromAmount − feeAmount`."
+          examples: ["9965.00"]
+        toAmount:
+          $ref: '#/components/schemas/DecimalString'
+          description: Сумма получения, округление ВНИЗ (канон §5.4).
+          examples: ["106.010638"]
+        rate:
+          $ref: '#/components/schemas/DecimalString'
+          description: Курс, зафиксированный котировкой; без округления (канон §5.4).
+          examples: ["0.010638297872"]
+        inverseRate:
+          $ref: '#/components/schemas/DecimalString'
+          description: Обратный курс, только для отображения (канон §5.2).
+          examples: ["94.00"]
+        rateSource:
+          $ref: '#/components/schemas/RateSource'
+          description: Источник курса.
+          examples: ["AGGREGATED"]
+        holdId:
+          $ref: '#/components/schemas/HoldId'
+          description: |
+            Резерв в S6, обеспечивающий заявку. При переходе в `REJECTED` / `FAILED` /
+            `EXPIRED` резерв снимается (канон §8).
+          examples: ["hld_01J9X2C4K5QF8N3M5T6V7W8Y9Z"]
+        createdAt:
+          $ref: '#/components/schemas/Timestamp'
+          description: Момент регистрации заявки в S8.
+          examples: ["2026-08-07T10:15:32.117Z"]
+        updatedAt:
+          $ref: '#/components/schemas/Timestamp'
+          description: |
+            Момент последнего изменения. При первичном создании совпадает с `createdAt`.
+          examples: ["2026-08-07T10:15:32.117Z"]
+        estimatedCompletionAt:
+          $ref: '#/components/schemas/Timestamp'
+          description: |
+            Ожидаемое время завершения (канон §4.5). Оценка, а не обязательство:
+            исполнение вне скоупа задания (канон §1).
+          examples: ["2026-08-07T10:16:02.117Z"]
+        idempotencyKey:
+          $ref: '#/components/schemas/IdempotencyKey'
+          description: |
+            Ключ, с которым заявка была создана. Возвращается, чтобы сверка через
+            `GET /v1/orders?idempotencyKey=…` могла подтвердить соответствие.
+          examples: ["3f1a7c58-2b64-4e9a-9d31-8a5f0c7b2e14"]
+        correlationId:
+          $ref: '#/components/schemas/CorrelationId'
+          description: Трасса создания заявки.
+          examples: ["01J9X2C4K7QF8N3M5T6V7W8Y9Z"]
+        statusReason:
+          $ref: '#/components/schemas/StatusReason'
+          description: |
+            Код причины текущего статуса; `null` для обычного `PENDING`.
+          examples: [null, "SCORING_REVIEW_REQUIRED"]
+        reviewCaseId:
+          type: [string, 'null']
+          pattern: '^rev_[0-9A-HJKMNP-TV-Z]{26}$'
+          minLength: 30
+          maxLength: 30
+          description: |
+            Ссылка на кейс ручной проверки. Заполняется при `status: MANUAL_REVIEW`,
+            `null` в остальных случаях. Это **непрозрачная ссылка** на кейс в S3
+            (Scoring / AML): детали скоринга, причины и риск-факторы в заявку
+            не переносятся — они PII и остаются в системе комплаенса.
+          examples: ["rev_01J9X2C4K9QF8N3M5T6V7W8Y9Z", null]
+        version:
+          type: integer
+          minimum: 1
+          maximum: 2147483647
+          description: |
+            Версия агрегата, начинается с 1 и увеличивается на 1 при каждом изменении.
+            Три применения: оптимистическая блокировка в `PATCH`, упорядочивание событий
+            вебхука (событие с меньшим `version`, чем сохранённый, **отбрасывается**)
+            и значение `ETag`.
+          examples: [1, 2]
+
+    OrderList:
+      type: object
+      description: |
+        Страница заявок с курсорной пагинацией (канон §9). Пустой `items` — успешный
+        ответ, а не ошибка: для процедуры сверки «не найдено» это значимый результат.
+      additionalProperties: false
+      required: [items, hasMore]
+      properties:
+        items:
+          type: array
+          minItems: 0
+          maxItems: 100
+          description: Заявки, отсортированные по `createdAt` по убыванию.
+          items:
+            $ref: '#/components/schemas/Order'
+        nextCursor:
+          type: [string, 'null']
+          pattern: '^[A-Za-z0-9_-]{1,512}$'
+          minLength: 1
+          maxLength: 512
+          description: |
+            Курсор следующей страницы; `null`, если страниц больше нет. Непрозрачен:
+            разбирать его содержимое нельзя.
+          examples: ["eyJjcmVhdGVkQXQiOiIyMDI2LTA4LTA3VDEwOjE1OjMyLjExN1oifQ", null]
+        hasMore:
+          type: boolean
+          description: |
+            Есть ли следующая страница. Дублирует смысл `nextCursor != null`, но делает
+            условие явным и защищает клиента от ошибочной проверки пустой строки.
+          examples: [false, true]
+
+    OrderReviewRequest:
+      type: object
+      description: |
+        Решение комплаенса по заявке в `MANUAL_REVIEW`. Вызывается бэк-офисом,
+        **не нашим приложением** (см. описание операции `reviewOrder`).
+      additionalProperties: false
+      required: [status, version]
+      properties:
+        status:
+          type: string
+          enum: [PENDING, REJECTED]
+          description: |
+            Целевой статус. Перечень намеренно сужен до двух значений: канон §8
+            допускает из `MANUAL_REVIEW` только эти два перехода. Любой другой
+            статус отсекается схемой ещё до бизнес-логики.
+          examples: ["PENDING", "REJECTED"]
+        statusReason:
+          $ref: '#/components/schemas/StatusReason'
+          description: |
+            Код причины решения. Обязателен по бизнес-правилу при `status: REJECTED`
+            (иначе пользователь получит отказ без объяснимой причины) и может быть
+            `null` при одобрении.
+          examples: ["COMPLIANCE_DECLINED", null]
+        version:
+          type: integer
+          minimum: 1
+          maximum: 2147483647
+          description: |
+            Версия заявки, известная вызывающему. Несовпадение с текущей → `409
+            VERSION_CONFLICT`. Защита от гонки двух операторов, открывших один кейс.
+          examples: [2]
+        reviewerId:
+          type: string
+          pattern: '^opr_[0-9A-HJKMNP-TV-Z]{26}$'
+          minLength: 30
+          maxLength: 30
+          description: |
+            Псевдонимизированный идентификатор оператора комплаенса — для аудита.
+            Имя, email и должность оператора в заявку **не пишутся**: это PII, которая
+            в системе заявок не нужна.
+          examples: ["opr_01J9X2C4KAQF8N3M5T6V7W8Y9Z"]
+
+    OrderStatusChangedEvent:
+      type: object
+      description: |
+        Событие смены статуса заявки, доставляемое вебхуком. Полная семантика доставки,
+        подписи, дедупликации и упорядочивания — в описании вебхука
+        `order.status.changed`.
+      additionalProperties: false
+      required:
+        [eventId, eventType, occurredAt, sequence, orderId, userId, previousStatus,
+         currentStatus, statusReason, version, correlationId]
+      properties:
+        eventId:
+          $ref: '#/components/schemas/Uuid'
+          description: |
+            Уникальный идентификатор события — **ключ дедупликации**. Доставка
+            at-least-once, поэтому одно и то же `eventId` может прийти несколько раз.
+            Окно дедупа у приёмника — **24 ч**. Повторное `eventId` → пропустить
+            обработку и ответить `200`.
+          examples: ["b1e4c2f0-8a3d-4e21-9f76-0c5d3a8b1e42"]
+        eventType:
+          type: string
+          enum: [order.status.changed]
+          description: |
+            Тип события. Единственное значение в этом контракте; enum, а не свободная
+            строка, — чтобы приёмник мог маршрутизировать по нему и падать на неизвестном
+            типе явно, а не молча игнорировать.
+          examples: ["order.status.changed"]
+        occurredAt:
+          $ref: '#/components/schemas/Timestamp'
+          description: |
+            Момент **наступления** события в S8, не момент доставки. При повторе
+            по расписанию значение не меняется — иначе дубликат было бы не отличить
+            от нового события.
+          examples: ["2026-08-07T10:15:32.402Z"]
+        sequence:
+          type: integer
+          format: int64
+          minimum: 1
+          maximum: 9223372036854775807
+          description: |
+            Монотонно возрастающий номер события **в пределах одной заявки**
+            (не глобальный). Первое событие заявки имеет `sequence: 1`. Разрыв
+            в последовательности — признак потери: следует запросить актуальное
+            состояние через `GET /v1/orders/{orderId}`.
+          examples: [1, 2]
+        orderId:
+          $ref: '#/components/schemas/OrderId'
+          description: Заявка, к которой относится событие.
+          examples: ["ord_01J9X2C4K7QF8N3M5T6V7W8Y9Z"]
+        userId:
+          $ref: '#/components/schemas/UserId'
+          description: |
+            Владелец заявки — чтобы приёмник смог адресовать уведомление, не выполняя
+            дополнительный запрос к S8.
+          examples: ["usr_01J8ZQ4H9K2M3N4P5R6S7T8V9W"]
+        previousStatus:
+          oneOf:
+            - $ref: '#/components/schemas/OrderStatus'
+            - type: 'null'
+          description: |
+            Статус до перехода. `null` для самого первого события заявки: предыдущим
+            состоянием было внутреннее `VALIDATING` (канон §8), которое наружу
+            не отдаётся, поэтому вместо него передаётся `null`.
+          examples: [null, "MANUAL_REVIEW"]
+        currentStatus:
+          $ref: '#/components/schemas/OrderStatus'
+          description: Статус после перехода.
+          examples: ["PENDING", "REJECTED"]
+        statusReason:
+          $ref: '#/components/schemas/StatusReason'
+          description: Код причины перехода; `null`, если причины нет.
+          examples: [null, "COMPLIANCE_DECLINED"]
+        holdId:
+          oneOf:
+            - $ref: '#/components/schemas/HoldId'
+            - type: 'null'
+          description: |
+            Резерв, связанный с заявкой. `null`, если резерв уже снят при переходе
+            в терминальный статус (канон §8: `REJECTED` / `FAILED` / `EXPIRED` —
+            «hold снят»).
+          examples: ["hld_01J9X2C4K5QF8N3M5T6V7W8Y9Z", null]
+        version:
+          type: integer
+          minimum: 1
+          maximum: 2147483647
+          description: |
+            Версия агрегата **после** перехода. Ключевое поле упорядочивания:
+
+            > Событие с `version` **меньше** уже сохранённого у приёмника —
+            > **ОТБРАСЫВАЕТСЯ** (ответ `200`, обработка пропускается).
+
+            Без этого правила запоздавшее событие откатило бы состояние заявки,
+            показанное пользователю.
+          examples: [1, 2]
+        correlationId:
+          $ref: '#/components/schemas/CorrelationId'
+          description: |
+            Трасса исходной операции создания заявки. Позволяет связать асинхронное
+            событие с синхронным запросом пользователя даже спустя часы.
+          examples: ["01J9X2C4K7QF8N3M5T6V7W8Y9Z"]
+
+    WebhookAck:
+      type: object
+      description: |
+        Ответ нашего приёмника на вебхук. Тело носит диагностический характер: для S8
+        значим только HTTP-код, но `result` заметно ускоряет разбор инцидентов доставки.
+      additionalProperties: false
+      required: [result]
+      properties:
+        result:
+          type: string
+          enum: [ACCEPTED, DUPLICATE_IGNORED, STALE_VERSION_IGNORED, INVALID, UNAUTHORIZED]
+          description: |
+            Как приёмник поступил с событием. `ACCEPTED` — принято в обработку;
+            `DUPLICATE_IGNORED` — `eventId` уже виден в окне 24 ч; `STALE_VERSION_IGNORED` —
+            `version` меньше сохранённого, событие отброшено по правилу упорядочивания.
+            Первые три сопровождаются HTTP `200`.
+          examples: ["ACCEPTED", "DUPLICATE_IGNORED", "STALE_VERSION_IGNORED"]
+        eventId:
+          $ref: '#/components/schemas/Uuid'
+          description: Эхо `eventId` из события — для сопоставления в логах.
+          examples: ["b1e4c2f0-8a3d-4e21-9f76-0c5d3a8b1e42"]
+        receivedAt:
+          $ref: '#/components/schemas/Timestamp'
+          description: Момент приёма события нашим приёмником.
+          examples: ["2026-08-07T10:15:32.501Z"]
+
+    OrderServiceErrorCode:
+      type: string
+      enum:
+        - VALIDATION_FAILED
+        - DUPLICATE_IDEMPOTENCY_KEY_DIFFERENT_PAYLOAD
+        - QUOTE_NOT_FOUND
+        - QUOTE_ALREADY_CONSUMED
+        - HOLD_NOT_FOUND
+        - HOLD_NOT_ACTIVE
+        - ORDER_NOT_FOUND
+        - INVALID_STATUS_TRANSITION
+        - VERSION_CONFLICT
+        - UNAUTHORIZED
+        - FORBIDDEN
+        - RATE_LIMITED
+        - INTERNAL_ERROR
+        - SERVICE_UNAVAILABLE
+      description: |
+        Машиночитаемый код ошибки S8. **Маппинг в каталог ошибок канона §7** — нормативная
+        часть контракта: BFF обязан переводить коды по этой таблице и никак иначе.
+
+        | Код S8 | HTTP S8 | → Код §7 | HTTP наружу | Компенсация (release hold в S6) |
+        |---|---|---|---|---|
+        | `VALIDATION_FAILED` | 400 / 422 | → **`VALIDATION_ERROR`** | 400 | **да** — холд уже создан на шаге 18 |
+        | `DUPLICATE_IDEMPOTENCY_KEY_DIFFERENT_PAYLOAD` | 409 | → **`IDEMPOTENCY_CONFLICT`** | 409 | нет — заявка по этому ключу уже существует, её холд трогать нельзя |
+        | `QUOTE_NOT_FOUND` | 404 | → **`QUOTE_NOT_FOUND`** | 404 | **да** |
+        | `QUOTE_ALREADY_CONSUMED` | 409 | → **`QUOTE_ALREADY_USED`** | 409 | **да** — этот холд лишний, обмен уже был отправлен |
+        | `HOLD_NOT_FOUND` | 409 | → **`HOLD_FAILED`** | 409 | нет — холда не существует; сверить состояние в S6 |
+        | `HOLD_NOT_ACTIVE` | 409 | → **`HOLD_FAILED`** | 409 | **да**, если холд в состоянии, допускающем снятие |
+        | `ORDER_NOT_FOUND` | 404 | → **`ORDER_CREATION_FAILED`** для записи; для чтения — 404 клиенту | 500 / 404 | нет |
+        | `INVALID_STATUS_TRANSITION` | 409 | маппинга нет (эндпоинт комплаенса, вне нашего скоупа) | — | нет |
+        | `VERSION_CONFLICT` | 409 | маппинга нет (эндпоинт комплаенса) | — | нет |
+        | `UNAUTHORIZED` | 401 | → **`EXCHANGE_SERVICE_UNAVAILABLE`** | 503 | **да** — инфраструктурный сбой, пользователь ни при чём |
+        | `FORBIDDEN` | 403 | → **`EXCHANGE_SERVICE_UNAVAILABLE`** | 503 | **да** |
+        | `RATE_LIMITED` | 429 | → **`RATE_LIMITED`** | 429 | **да** |
+        | `INTERNAL_ERROR` | 500 | → **`ORDER_CREATION_FAILED`** | 500 | **да** |
+        | `SERVICE_UNAVAILABLE` | 503 | → **`EXCHANGE_SERVICE_UNAVAILABLE`** | 503 | **да** |
+        | *(нет ответа за 2 000 мс)* | — | → **`UPSTREAM_TIMEOUT`** | 504 | **да, но только после сверки** через `GET /v1/orders?idempotencyKey=…`, подтвердившей отсутствие заявки |
+
+        Три правила, которые нельзя нарушать:
+
+        1. **Компенсация обязательна** там, где отмечено «да». Холд создан на шаге 18
+           цепочки §6, до вызова S8. Незакрытый холд = замороженные деньги пользователя
+           под несуществующую заявку.
+        2. **`POST` не ретраится** (канон §11). Вместо ретрая — сверка.
+        3. **Холд освобождается только после подтверждённого отсутствия заявки.**
+           Освободить его «на всякий случай» при таймауте нельзя: если заявка на самом
+           деле создалась, она останется без обеспечения.
+      examples: ["VALIDATION_FAILED", "QUOTE_ALREADY_CONSUMED", "SERVICE_UNAVAILABLE"]
+
+    OrderServiceError:
+      type: object
+      description: |
+        Собственный конверт ошибки сервиса заявок. Отличается от нашего внешнего конверта
+        (RFC 9457 Problem Details, канон §7): перевод в `code` каталога §7 выполняет BFF
+        по таблице в описании `OrderServiceErrorCode`. Пробрасывать этот конверт
+        пользователю напрямую **запрещено**.
+      additionalProperties: false
+      required: [error, message, traceId, timestamp]
+      properties:
+        error:
+          $ref: '#/components/schemas/OrderServiceErrorCode'
+          description: Машиночитаемый код. Единственное, по чему допустимо ветвиться.
+          examples: ["QUOTE_ALREADY_CONSUMED"]
+        message:
+          type: string
+          minLength: 1
+          maxLength: 512
+          description: |
+            Человекочитаемое пояснение на английском, для логов. Пользователю не
+            показывается: он видит сообщение из каталога §7. PII содержать не должно.
+          examples: ["Quote 7c9e6679-7425-40de-944b-e07fc1f90ae7 has already been consumed by order ord_01J9X2C4K7QF8N3M5T6V7W8Y9Z"]
+        traceId:
+          type: string
+          pattern: '^[0-9a-f]{32}$'
+          minLength: 32
+          maxLength: 32
+          description: |
+            Идентификатор трассировки на стороне S8 (W3C Trace Context, `trace-id`).
+            Логируется рядом с нашим `X-Correlation-Id`.
+          examples: ["4bf92f3577b34da6a3ce929d0e0e4736"]
+        timestamp:
+          $ref: '#/components/schemas/Timestamp'
+          description: Момент возникновения ошибки в S8.
+          examples: ["2026-08-07T10:15:32.117Z"]
+        details:
+          type: object
+          description: |
+            Структурированный контекст: для `VALIDATION_FAILED` — список нарушенных полей
+            и инвариантов, для `QUOTE_ALREADY_CONSUMED` — `orderId` заявки, которая уже
+            заняла котировку, для `VERSION_CONFLICT` — текущая версия. PII содержать
+            не должен.
+          additionalProperties: true
+          examples:
+            - { "field": "netFromAmount", "invariant": "I1" }
+            - { "existingOrderId": "ord_01J9X2C4K7QF8N3M5T6V7W8Y9Z" }
+        retryable:
+          type: boolean
+          description: |
+            Подсказка сервиса, имеет ли смысл повтор. Для `POST` **не отменяет** запрет
+            автоматического ретрая из канона §11: даже при `retryable: true` повтор
+            выполняется только осознанно и с тем же `Idempotency-Key`.
+          examples: [false, true]
+
+  responses:
+
+    ValidationFailed:
+      description: |
+        Тело запроса не проходит схему или нарушены инварианты канона §5.4
+        (`I1`, `I2`, `I4`, `I5`). → **`VALIDATION_ERROR` (400)** каталога §7, шаг 1
+        цепочки §6. **Компенсация обязательна**: холд уже создан на шаге 18.
+      headers:
+        X-Correlation-Id:
+          $ref: '#/components/headers/XCorrelationId'
+        X-Request-Id:
+          $ref: '#/components/headers/XRequestId'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/OrderServiceError'
+          examples:
+            invariantViolation:
+              $ref: '#/components/examples/ErrorValidationFailed'
+
+    Unauthorized:
+      description: |
+        Service-JWT отсутствует, просрочен или не проходит проверку `aud`; либо
+        не предъявлен валидный клиентский сертификат mTLS.
+        → **`EXCHANGE_SERVICE_UNAVAILABLE` (503)** каталога §7: для пользователя это
+        неработающий сервис, а не его ошибка. **Компенсация обязательна.**
+      headers:
+        X-Correlation-Id:
+          $ref: '#/components/headers/XCorrelationId'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/OrderServiceError'
+          examples:
+            expiredServiceToken:
+              $ref: '#/components/examples/ErrorUnauthorized'
+
+    Forbidden:
+      description: |
+        У токена нет требуемого скоупа (например, BFF пытается вызвать `PATCH` без
+        `orders:review`) либо `X-User-Id` не совпадает с `userId` в теле.
+        → **`EXCHANGE_SERVICE_UNAVAILABLE` (503)** каталога §7 для пути создания заявки:
+        наружу нельзя раскрывать детали внутренней авторизации. Инцидент логируется
+        с высоким приоритетом — это либо дефект, либо попытка обхода. **Компенсация
+        обязательна.**
+      headers:
+        X-Correlation-Id:
+          $ref: '#/components/headers/XCorrelationId'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/OrderServiceError'
+          examples:
+            missingScope:
+              $ref: '#/components/examples/ErrorForbidden'
+
+    OrderNotFound:
+      description: |
+        Заявка с указанным `orderId` не найдена. Для чтения — прозрачно отдаётся `404`
+        клиенту. На пути записи такой исход означает рассогласование состояний
+        → **`ORDER_CREATION_FAILED` (500)**.
+      headers:
+        X-Correlation-Id:
+          $ref: '#/components/headers/XCorrelationId'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/OrderServiceError'
+          examples:
+            unknownOrder:
+              $ref: '#/components/examples/ErrorOrderNotFound'
+
+    Conflict:
+      description: |
+        Конфликт состояния. Один HTTP-код объединяет несколько бизнес-исходов —
+        различать их следует **только** по полю `error`:
+
+        | `error` | → Код §7 | HTTP наружу | Компенсация |
+        |---|---|---|---|
+        | `DUPLICATE_IDEMPOTENCY_KEY_DIFFERENT_PAYLOAD` | `IDEMPOTENCY_CONFLICT` | 409 | нет |
+        | `QUOTE_ALREADY_CONSUMED` | `QUOTE_ALREADY_USED` | 409 | **да** |
+        | `HOLD_NOT_FOUND` | `HOLD_FAILED` | 409 | нет |
+        | `HOLD_NOT_ACTIVE` | `HOLD_FAILED` | 409 | **да** |
+        | `INVALID_STATUS_TRANSITION` | маппинга нет (комплаенс) | — | нет |
+        | `VERSION_CONFLICT` | маппинга нет (комплаенс) | — | нет |
+      headers:
+        X-Correlation-Id:
+          $ref: '#/components/headers/XCorrelationId'
+        X-Request-Id:
+          $ref: '#/components/headers/XRequestId'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/OrderServiceError'
+          examples:
+            idempotencyConflict:
+              $ref: '#/components/examples/ErrorIdempotencyConflict'
+            quoteAlreadyConsumed:
+              $ref: '#/components/examples/ErrorQuoteAlreadyConsumed'
+            holdNotFound:
+              $ref: '#/components/examples/ErrorHoldNotFound'
+            holdNotActive:
+              $ref: '#/components/examples/ErrorHoldNotActive'
+            invalidTransition:
+              $ref: '#/components/examples/ErrorInvalidStatusTransition'
+            versionConflict:
+              $ref: '#/components/examples/ErrorVersionConflict'
+
+    UnprocessableOrder:
+      description: |
+        Запрос синтаксически корректен, но семантически невозможен: нарушены инварианты
+        канона §5.4 или котировка не найдена.
+        → **`VALIDATION_ERROR` (400)** либо **`QUOTE_NOT_FOUND` (404)** каталога §7
+        в зависимости от `error`. **Компенсация обязательна.**
+      headers:
+        X-Correlation-Id:
+          $ref: '#/components/headers/XCorrelationId'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/OrderServiceError'
+          examples:
+            quoteNotFound:
+              $ref: '#/components/examples/ErrorQuoteNotFound'
+
+    TooManyRequests:
+      description: |
+        Превышен лимит запросов к S8. → **`RATE_LIMITED` (429)** каталога §7.
+        Автоматического ретрая `POST` нет и здесь. **Компенсация обязательна.**
+      headers:
+        X-Correlation-Id:
+          $ref: '#/components/headers/XCorrelationId'
+        Retry-After:
+          $ref: '#/components/headers/RetryAfter'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/OrderServiceError'
+          examples:
+            quotaExceeded:
+              $ref: '#/components/examples/ErrorRateLimited'
+
+    InternalError:
+      description: |
+        Внутренний сбой S8. → **`ORDER_CREATION_FAILED` (500)** каталога §7 — это
+        нормативный код шага 19 цепочки §6. Retryable по каталогу, но повтор инициирует
+        **пользователь**, а не автоматика. **Компенсация обязательна: release hold в S6.**
+        Счётчик circuit breaker увеличивается (§11).
+      headers:
+        X-Correlation-Id:
+          $ref: '#/components/headers/XCorrelationId'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/OrderServiceError'
+          examples:
+            persistenceFailure:
+              $ref: '#/components/examples/ErrorInternal'
+
+    ServiceUnavailable:
+      description: |
+        S8 недоступен: плановые работы, перегрузка, открытый circuit breaker.
+        → **`EXCHANGE_SERVICE_UNAVAILABLE` (503)** каталога §7. Это исход сценария
+        `EXCHANGE_DOWN` из dev-панели прототипа (канон §10.6).
+        **Компенсация обязательна: release hold в S6.**
+      headers:
+        X-Correlation-Id:
+          $ref: '#/components/headers/XCorrelationId'
+        Retry-After:
+          $ref: '#/components/headers/RetryAfter'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/OrderServiceError'
+          examples:
+            maintenance:
+              $ref: '#/components/examples/ErrorServiceUnavailable'
+
+    GatewayTimeout:
+      description: |
+        S8 не ответил в срок (таймаут BFF — 2 000 мс, канон §11).
+        → **`UPSTREAM_TIMEOUT` (504)** каталога §7, **но только после процедуры сверки**:
+
+        1. `POST` **не** повторяется.
+        2. Выполняется `GET /v1/orders?idempotencyKey={ключ}` (ретраи разрешены).
+        3. Заявка найдена → это успех, работаем с ней; холд **не** трогаем.
+        4. Заявка не найдена → `UPSTREAM_TIMEOUT` (504) пользователю
+           **и обязательный release hold в S6**.
+        5. Сверка не ответила → `UPSTREAM_TIMEOUT` (504); сверка ставится в очередь
+           и повторяется; холд освобождается **только** после подтверждённого отсутствия
+           заявки.
+      headers:
+        X-Correlation-Id:
+          $ref: '#/components/headers/XCorrelationId'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/OrderServiceError'
+          examples:
+            timeout:
+              $ref: '#/components/examples/ErrorTimeout'
+
+  examples:
+
+    OrderCreateRequestRubUsdt:
+      summary: Обмен 10 000 RUB → USDT по фикстурам канона §10
+      description: |
+        Расчёт полностью выведен из канона, шаг за шагом по §5.3 при фикстурах §10.3–§10.4
+        (пара `RUB→USDT`: `rate = 0.010638297872`, `percent = 0.35`, `minFee = 10.00 RUB`,
+        `min = 500.00`, `max = 1 000 000.00`):
+
+        ```
+        1. fromAmount    = "10000.00"                       (в пределах min/max §10.4)
+        2. feeRaw        = 10000.00 × 0.35 / 100 = 35.00
+        3. feeAmount     = clamp(35.00, 10.00, null)
+                         = "35.00"                          ROUND_UP до decimals(RUB)=2
+        4. netFromAmount = 10000.00 − 35.00 = "9965.00"     инвариант I1 выполнен
+        5. toAmountRaw   = 9965.00 × 0.010638297872
+                         = 106.010638294...
+        6. toAmount      = "106.010638"                     ROUND_DOWN до decimals(USDT)=6
+        ```
+
+        `inverseRate = "94.00"` — ROUND_HALF_UP, 2 знака (§5.4), читается как
+        «1 USDT = 94.00 RUB» (§10.3). `fromAmount` укладывается в доступный баланс
+        `RUB = 25450.00` из §10.2 (инвариант I3, проверен в S6 на шаге 17).
+        `toAsset.network = "TRON"` соответствует фикстуре §10.2.
+      value:
+        userId: "usr_01J8ZQ4H9K2M3N4P5R6S7T8V9W"
+        walletId: "wlt_01J8ZQ4H9K2M3N4P5R6S7T8VAB"
+        quoteId: "7c9e6679-7425-40de-944b-e07fc1f90ae7"
+        fromAsset:
+          assetId: "RUB"
+          network: null
+        toAsset:
+          assetId: "USDT"
+          network: "TRON"
+        fromAmount: "10000.00"
+        feeAmount: "35.00"
+        netFromAmount: "9965.00"
+        toAmount: "106.010638"
+        rate: "0.010638297872"
+        inverseRate: "94.00"
+        rateSource: "AGGREGATED"
+        holdId: "hld_01J9X2C4K5QF8N3M5T6V7W8Y9Z"
+        idempotencyKey: "3f1a7c58-2b64-4e9a-9d31-8a5f0c7b2e14"
+        correlationId: "01J9X2C4K7QF8N3M5T6V7W8Y9Z"
+        estimatedCompletionAt: "2026-08-07T10:16:02.117Z"
+        clientMeta:
+          source: "IOS"
+          deviceId: "dev_9f2b71ac04e3"
+          locale: "en-US"
+
+    OrderPending:
+      summary: Заявка принята — целевой исход скоупа (канон §1)
+      description: |
+        `status: PENDING` — терминальное состояние для этого задания. Средства
+        зарезервированы холдом `hld_…`, `statusReason` = `null`, `version` = 1.
+      value:
+        orderId: "ord_01J9X2C4K7QF8N3M5T6V7W8Y9Z"
+        status: "PENDING"
+        userId: "usr_01J8ZQ4H9K2M3N4P5R6S7T8V9W"
+        walletId: "wlt_01J8ZQ4H9K2M3N4P5R6S7T8VAB"
+        quoteId: "7c9e6679-7425-40de-944b-e07fc1f90ae7"
+        fromAsset:
+          assetId: "RUB"
+          network: null
+        toAsset:
+          assetId: "USDT"
+          network: "TRON"
+        fromAmount: "10000.00"
+        feeAmount: "35.00"
+        netFromAmount: "9965.00"
+        toAmount: "106.010638"
+        rate: "0.010638297872"
+        inverseRate: "94.00"
+        rateSource: "AGGREGATED"
+        holdId: "hld_01J9X2C4K5QF8N3M5T6V7W8Y9Z"
+        createdAt: "2026-08-07T10:15:32.117Z"
+        updatedAt: "2026-08-07T10:15:32.117Z"
+        estimatedCompletionAt: "2026-08-07T10:16:02.117Z"
+        idempotencyKey: "3f1a7c58-2b64-4e9a-9d31-8a5f0c7b2e14"
+        correlationId: "01J9X2C4K7QF8N3M5T6V7W8Y9Z"
+        statusReason: null
+        reviewCaseId: null
+        version: 1
+
+    OrderPendingReplay:
+      summary: Идемпотентный повтор — тот же 201 и то же тело
+      description: |
+        Повтор с тем же `Idempotency-Key` и тем же телом в окне 24 ч. Ответ **побайтово
+        совпадает** с первичным (включая `createdAt` и `version`), новая заявка
+        не создаётся. Отличить повтор можно только по заголовку
+        `X-Idempotent-Replay: true`.
+      value:
+        orderId: "ord_01J9X2C4K7QF8N3M5T6V7W8Y9Z"
+        status: "PENDING"
+        userId: "usr_01J8ZQ4H9K2M3N4P5R6S7T8V9W"
+        walletId: "wlt_01J8ZQ4H9K2M3N4P5R6S7T8VAB"
+        quoteId: "7c9e6679-7425-40de-944b-e07fc1f90ae7"
+        fromAsset:
+          assetId: "RUB"
+          network: null
+        toAsset:
+          assetId: "USDT"
+          network: "TRON"
+        fromAmount: "10000.00"
+        feeAmount: "35.00"
+        netFromAmount: "9965.00"
+        toAmount: "106.010638"
+        rate: "0.010638297872"
+        inverseRate: "94.00"
+        rateSource: "AGGREGATED"
+        holdId: "hld_01J9X2C4K5QF8N3M5T6V7W8Y9Z"
+        createdAt: "2026-08-07T10:15:32.117Z"
+        updatedAt: "2026-08-07T10:15:32.117Z"
+        estimatedCompletionAt: "2026-08-07T10:16:02.117Z"
+        idempotencyKey: "3f1a7c58-2b64-4e9a-9d31-8a5f0c7b2e14"
+        correlationId: "01J9X2C4K7QF8N3M5T6V7W8Y9Z"
+        statusReason: null
+        reviewCaseId: null
+        version: 1
+
+    OrderManualReview:
+      summary: Скоринг потребовал ручной проверки (сценарий SCORING_REVIEW, §10.6)
+      description: |
+        Шаг 16 цепочки §6 вернул `REVIEW`. **S8 отвечает `201`** (ресурс создан),
+        а наш внешний API отдаёт пользователю **`202 Accepted`** с кодом
+        `SCORING_REVIEW_REQUIRED` — канон §7: «это **не ошибка**, а альтернативный
+        успешный исход». Средства зарезервированы (канон §8). `reviewCaseId` —
+        непрозрачная ссылка на кейс в S3; деталей скоринга в заявке нет.
+
+        Обратите внимание: фикстура §10.1 задаёт `riskScore = 17 (LOW → ALLOW)`,
+        поэтому в happy-path этот исход не возникает — он воспроизводится
+        переключателем `SCORING_REVIEW` из §10.6.
+      value:
+        orderId: "ord_01J9X2C4K8QF8N3M5T6V7W8Y9Z"
+        status: "MANUAL_REVIEW"
+        userId: "usr_01J8ZQ4H9K2M3N4P5R6S7T8V9W"
+        walletId: "wlt_01J8ZQ4H9K2M3N4P5R6S7T8VAB"
+        quoteId: "9d2c4a11-6f38-4b7c-8e05-2a6b9c1d3e57"
+        fromAsset:
+          assetId: "RUB"
+          network: null
+        toAsset:
+          assetId: "USDT"
+          network: "TRON"
+        fromAmount: "10000.00"
+        feeAmount: "35.00"
+        netFromAmount: "9965.00"
+        toAmount: "106.010638"
+        rate: "0.010638297872"
+        inverseRate: "94.00"
+        rateSource: "AGGREGATED"
+        holdId: "hld_01J9X2C4K6QF8N3M5T6V7W8Y9Z"
+        createdAt: "2026-08-07T10:20:11.004Z"
+        updatedAt: "2026-08-07T10:20:11.004Z"
+        estimatedCompletionAt: "2026-08-07T14:20:11.004Z"
+        idempotencyKey: "8c0d4e21-5a97-4f36-b2e8-71d4a9c60f35"
+        correlationId: "01J9X2D5M1QF8N3M5T6V7W8Y9Z"
+        statusReason: "SCORING_REVIEW_REQUIRED"
+        reviewCaseId: "rev_01J9X2C4K9QF8N3M5T6V7W8Y9Z"
+        version: 1
+
+    OrderRejected:
+      summary: Заявка отклонена комплаенсом — терминальный статус, hold снят
+      description: |
+        Переход `MANUAL_REVIEW → REJECTED` по решению комплаенса. Канон §8: в статусе
+        `REJECTED` средства «не тронуты / hold снят». `version` увеличен до 2.
+      value:
+        orderId: "ord_01J9X2C4K8QF8N3M5T6V7W8Y9Z"
+        status: "REJECTED"
+        userId: "usr_01J8ZQ4H9K2M3N4P5R6S7T8V9W"
+        walletId: "wlt_01J8ZQ4H9K2M3N4P5R6S7T8VAB"
+        quoteId: "9d2c4a11-6f38-4b7c-8e05-2a6b9c1d3e57"
+        fromAsset:
+          assetId: "RUB"
+          network: null
+        toAsset:
+          assetId: "USDT"
+          network: "TRON"
+        fromAmount: "10000.00"
+        feeAmount: "35.00"
+        netFromAmount: "9965.00"
+        toAmount: "106.010638"
+        rate: "0.010638297872"
+        inverseRate: "94.00"
+        rateSource: "AGGREGATED"
+        holdId: "hld_01J9X2C4K6QF8N3M5T6V7W8Y9Z"
+        createdAt: "2026-08-07T10:20:11.004Z"
+        updatedAt: "2026-08-07T11:02:44.310Z"
+        estimatedCompletionAt: "2026-08-07T14:20:11.004Z"
+        idempotencyKey: "8c0d4e21-5a97-4f36-b2e8-71d4a9c60f35"
+        correlationId: "01J9X2D5M1QF8N3M5T6V7W8Y9Z"
+        statusReason: "COMPLIANCE_DECLINED"
+        reviewCaseId: "rev_01J9X2C4K9QF8N3M5T6V7W8Y9Z"
+        version: 2
+
+    OrderApprovedToPending:
+      summary: Комплаенс одобрил — MANUAL_REVIEW → PENDING, hold сохранён
+      value:
+        orderId: "ord_01J9X2C4K8QF8N3M5T6V7W8Y9Z"
+        status: "PENDING"
+        userId: "usr_01J8ZQ4H9K2M3N4P5R6S7T8V9W"
+        walletId: "wlt_01J8ZQ4H9K2M3N4P5R6S7T8VAB"
+        quoteId: "9d2c4a11-6f38-4b7c-8e05-2a6b9c1d3e57"
+        fromAsset:
+          assetId: "RUB"
+          network: null
+        toAsset:
+          assetId: "USDT"
+          network: "TRON"
+        fromAmount: "10000.00"
+        feeAmount: "35.00"
+        netFromAmount: "9965.00"
+        toAmount: "106.010638"
+        rate: "0.010638297872"
+        inverseRate: "94.00"
+        rateSource: "AGGREGATED"
+        holdId: "hld_01J9X2C4K6QF8N3M5T6V7W8Y9Z"
+        createdAt: "2026-08-07T10:20:11.004Z"
+        updatedAt: "2026-08-07T11:05:07.882Z"
+        estimatedCompletionAt: "2026-08-07T11:05:37.882Z"
+        idempotencyKey: "8c0d4e21-5a97-4f36-b2e8-71d4a9c60f35"
+        correlationId: "01J9X2D5M1QF8N3M5T6V7W8Y9Z"
+        statusReason: null
+        reviewCaseId: "rev_01J9X2C4K9QF8N3M5T6V7W8Y9Z"
+        version: 2
+
+    OrderReviewApprove:
+      summary: Решение «одобрить»
+      value:
+        status: "PENDING"
+        statusReason: null
+        version: 1
+        reviewerId: "opr_01J9X2C4KAQF8N3M5T6V7W8Y9Z"
+
+    OrderReviewReject:
+      summary: Решение «отклонить» — statusReason обязателен
+      value:
+        status: "REJECTED"
+        statusReason: "COMPLIANCE_DECLINED"
+        version: 1
+        reviewerId: "opr_01J9X2C4KAQF8N3M5T6V7W8Y9Z"
+
+    OrderListReconciliationFound:
+      summary: Сверка после таймаута — заявка НАШЛАСЬ
+      description: |
+        `GET /v1/orders?idempotencyKey=3f1a7c58-…&limit=1`. Заявка есть: `POST` дошёл,
+        потерялся только ответ. Работаем с найденной заявкой как с успехом,
+        холд **не** освобождаем.
+      value:
+        items:
+          - orderId: "ord_01J9X2C4K7QF8N3M5T6V7W8Y9Z"
+            status: "PENDING"
+            userId: "usr_01J8ZQ4H9K2M3N4P5R6S7T8V9W"
+            walletId: "wlt_01J8ZQ4H9K2M3N4P5R6S7T8VAB"
+            quoteId: "7c9e6679-7425-40de-944b-e07fc1f90ae7"
+            fromAsset:
+              assetId: "RUB"
+              network: null
+            toAsset:
+              assetId: "USDT"
+              network: "TRON"
+            fromAmount: "10000.00"
+            feeAmount: "35.00"
+            netFromAmount: "9965.00"
+            toAmount: "106.010638"
+            rate: "0.010638297872"
+            inverseRate: "94.00"
+            rateSource: "AGGREGATED"
+            holdId: "hld_01J9X2C4K5QF8N3M5T6V7W8Y9Z"
+            createdAt: "2026-08-07T10:15:32.117Z"
+            updatedAt: "2026-08-07T10:15:32.117Z"
+            estimatedCompletionAt: "2026-08-07T10:16:02.117Z"
+            idempotencyKey: "3f1a7c58-2b64-4e9a-9d31-8a5f0c7b2e14"
+            correlationId: "01J9X2C4K7QF8N3M5T6V7W8Y9Z"
+            statusReason: null
+            reviewCaseId: null
+            version: 1
+        nextCursor: null
+        hasMore: false
+
+    OrderListReconciliationEmpty:
+      summary: Сверка после таймаута — заявки НЕТ
+      description: |
+        Пустой `items` при живом сервисе — надёжный признак, что `POST` не был обработан:
+        запись ключа идемпотентности и запись заявки выполняются в одной транзакции.
+        Действие: `UPSTREAM_TIMEOUT` (504) пользователю **и обязательный release hold
+        в S6**.
+      value:
+        items: []
+        nextCursor: null
+        hasMore: false
+
+    EventOrderPending:
+      summary: Первое событие заявки — previousStatus = null
+      description: |
+        `previousStatus: null`, потому что предыдущим состоянием было внутреннее
+        `VALIDATING` (канон §8), которое наружу не отдаётся. `sequence: 1`, `version: 1`.
+      value:
+        eventId: "b1e4c2f0-8a3d-4e21-9f76-0c5d3a8b1e42"
+        eventType: "order.status.changed"
+        occurredAt: "2026-08-07T10:15:32.402Z"
+        sequence: 1
+        orderId: "ord_01J9X2C4K7QF8N3M5T6V7W8Y9Z"
+        userId: "usr_01J8ZQ4H9K2M3N4P5R6S7T8V9W"
+        previousStatus: null
+        currentStatus: "PENDING"
+        statusReason: null
+        holdId: "hld_01J9X2C4K5QF8N3M5T6V7W8Y9Z"
+        version: 1
+        correlationId: "01J9X2C4K7QF8N3M5T6V7W8Y9Z"
+
+    EventOrderManualReview:
+      summary: Заявка ушла на ручную проверку
+      value:
+        eventId: "c2f5d3a1-9b4e-4f32-8a07-1d6e4b9c2f53"
+        eventType: "order.status.changed"
+        occurredAt: "2026-08-07T10:20:11.298Z"
+        sequence: 1
+        orderId: "ord_01J9X2C4K8QF8N3M5T6V7W8Y9Z"
+        userId: "usr_01J8ZQ4H9K2M3N4P5R6S7T8V9W"
+        previousStatus: null
+        currentStatus: "MANUAL_REVIEW"
+        statusReason: "SCORING_REVIEW_REQUIRED"
+        holdId: "hld_01J9X2C4K6QF8N3M5T6V7W8Y9Z"
+        version: 1
+        correlationId: "01J9X2D5M1QF8N3M5T6V7W8Y9Z"
+
+    EventOrderRejected:
+      summary: Комплаенс отклонил — sequence 2, version 2, hold снят
+      description: |
+        `holdId: null` — резерв снят при переходе в терминальный статус (канон §8).
+        Если это событие придёт **раньше** события с `version: 1`, приёмник обязан
+        сохранить `version: 2`, а запоздавшее событие с `version: 1` — **отбросить**.
+      value:
+        eventId: "d3a6e4b2-0c5f-4a43-9b18-2e7f5c0d3a64"
+        eventType: "order.status.changed"
+        occurredAt: "2026-08-07T11:02:44.601Z"
+        sequence: 2
+        orderId: "ord_01J9X2C4K8QF8N3M5T6V7W8Y9Z"
+        userId: "usr_01J8ZQ4H9K2M3N4P5R6S7T8V9W"
+        previousStatus: "MANUAL_REVIEW"
+        currentStatus: "REJECTED"
+        statusReason: "COMPLIANCE_DECLINED"
+        holdId: null
+        version: 2
+        correlationId: "01J9X2D5M1QF8N3M5T6V7W8Y9Z"
+
+    WebhookAckAccepted:
+      summary: Событие принято в обработку
+      value:
+        result: "ACCEPTED"
+        eventId: "b1e4c2f0-8a3d-4e21-9f76-0c5d3a8b1e42"
+        receivedAt: "2026-08-07T10:15:32.501Z"
+
+    WebhookAckDuplicate:
+      summary: Дубликат по eventId — 200, повтор не нужен
+      description: |
+        At-least-once доставка: дубликаты штатны. Отвечаем `200`, чтобы S8 не запускал
+        расписание повторов.
+      value:
+        result: "DUPLICATE_IGNORED"
+        eventId: "b1e4c2f0-8a3d-4e21-9f76-0c5d3a8b1e42"
+        receivedAt: "2026-08-07T10:16:05.118Z"
+
+    WebhookAckStale:
+      summary: Событие с устаревшим version — отброшено, но ответ 200
+      description: |
+        Пришло событие с `version: 1`, когда у приёмника уже сохранён `version: 2`.
+        По правилу упорядочивания событие **отбрасывается**. Ответ `200`: доставка
+        состоялась, повторять её не нужно — проблема не в транспорте.
+      value:
+        result: "STALE_VERSION_IGNORED"
+        eventId: "b1e4c2f0-8a3d-4e21-9f76-0c5d3a8b1e42"
+        receivedAt: "2026-08-07T11:03:02.740Z"
+
+    ErrorValidationFailed:
+      summary: Нарушен инвариант I1 → VALIDATION_ERROR (400) + компенсация
+      description: |
+        `feeAmount + netFromAmount ≠ fromAmount`. Канон §5.4 требует **точного**
+        равенства. S8 не доверяет расчёту вызывающей стороны и перепроверяет инварианты
+        сам.
+      value:
+        error: "VALIDATION_FAILED"
+        message: "Invariant I1 violated: feeAmount + netFromAmount must equal fromAmount"
+        traceId: "4bf92f3577b34da6a3ce929d0e0e4736"
+        timestamp: "2026-08-07T10:15:32.117Z"
+        details:
+          invariant: "I1"
+          fromAmount: "10000.00"
+          feeAmount: "35.00"
+          netFromAmount: "9964.00"
+        retryable: false
+
+    ErrorIdempotencyConflict:
+      summary: Тот же ключ, другое тело → IDEMPOTENCY_CONFLICT (409), компенсации НЕТ
+      description: |
+        Заявка по этому ключу уже существует и обеспечена своим холдом. Освобождать
+        холд нельзя — он принадлежит существующей заявке.
+      value:
+        error: "DUPLICATE_IDEMPOTENCY_KEY_DIFFERENT_PAYLOAD"
+        message: "Idempotency key was already used with a different request payload"
+        traceId: "a1b2c3d4e5f60718293a4b5c6d7e8f90"
+        timestamp: "2026-08-07T10:15:33.220Z"
+        details:
+          existingOrderId: "ord_01J9X2C4K7QF8N3M5T6V7W8Y9Z"
+          firstSeenAt: "2026-08-07T10:15:32.117Z"
+          changedFields: ["fromAmount", "toAmount"]
+        retryable: false
+
+    ErrorQuoteAlreadyConsumed:
+      summary: Котировка уже использована → QUOTE_ALREADY_USED (409) + компенсация
+      description: |
+        Шаг 7 цепочки §6. Этот холд лишний — обмен по котировке уже отправлен,
+        холд освобождается.
+      value:
+        error: "QUOTE_ALREADY_CONSUMED"
+        message: "Quote has already been consumed by another order"
+        traceId: "b2c3d4e5f60718293a4b5c6d7e8f9012"
+        timestamp: "2026-08-07T10:15:33.410Z"
+        details:
+          quoteId: "7c9e6679-7425-40de-944b-e07fc1f90ae7"
+          existingOrderId: "ord_01J9X2C4K7QF8N3M5T6V7W8Y9Z"
+        retryable: false
+
+    ErrorQuoteNotFound:
+      summary: Котировка не найдена → QUOTE_NOT_FOUND (404) + компенсация
+      description: |
+        Шаг 6 цепочки §6. TTL котировки — 15 с (канон §2, §11); за пределами окна
+        хранения она удаляется.
+      value:
+        error: "QUOTE_NOT_FOUND"
+        message: "Quote does not exist or has been evicted"
+        traceId: "c3d4e5f60718293a4b5c6d7e8f901234"
+        timestamp: "2026-08-07T10:15:50.002Z"
+        details:
+          quoteId: "7c9e6679-7425-40de-944b-e07fc1f90ae7"
+        retryable: true
+
+    ErrorHoldNotFound:
+      summary: Холд не существует → HOLD_FAILED (409), компенсации НЕТ
+      description: |
+        Освобождать нечего. Требуется сверка состояния в S6: расхождение между шагом 18
+        и шагом 19 — серьёзный инцидент целостности.
+      value:
+        error: "HOLD_NOT_FOUND"
+        message: "Referenced hold does not exist in the accounting service"
+        traceId: "d4e5f60718293a4b5c6d7e8f90123456"
+        timestamp: "2026-08-07T10:15:33.615Z"
+        details:
+          holdId: "hld_01J9X2C4K5QF8N3M5T6V7W8Y9Z"
+        retryable: true
+
+    ErrorHoldNotActive:
+      summary: Холд неактивен → HOLD_FAILED (409) + компенсация
+      description: |
+        Холд существует, но истёк или уже снят. Если состояние допускает снятие —
+        освобождаем.
+      value:
+        error: "HOLD_NOT_ACTIVE"
+        message: "Hold exists but is not in ACTIVE state"
+        traceId: "e5f60718293a4b5c6d7e8f9012345678"
+        timestamp: "2026-08-07T10:15:33.702Z"
+        details:
+          holdId: "hld_01J9X2C4K5QF8N3M5T6V7W8Y9Z"
+          holdState: "EXPIRED"
+        retryable: true
+
+    ErrorInvalidStatusTransition:
+      summary: Недопустимый переход → маппинга в §7 нет (эндпоинт комплаенса)
+      description: |
+        Канон §8 не содержит ребра `PENDING → MANUAL_REVIEW`. Ошибка возникает только
+        на `PATCH`, который наше приложение не вызывает.
+      value:
+        error: "INVALID_STATUS_TRANSITION"
+        message: "Transition PENDING -> MANUAL_REVIEW is not allowed"
+        traceId: "f60718293a4b5c6d7e8f901234567890"
+        timestamp: "2026-08-07T11:02:44.100Z"
+        details:
+          from: "PENDING"
+          to: "MANUAL_REVIEW"
+          allowed: ["EXECUTING", "REJECTED", "EXPIRED"]
+        retryable: false
+
+    ErrorVersionConflict:
+      summary: Оптимистическая блокировка сработала → маппинга в §7 нет
+      value:
+        error: "VERSION_CONFLICT"
+        message: "Order was modified by another actor"
+        traceId: "0718293a4b5c6d7e8f90123456789012"
+        timestamp: "2026-08-07T11:02:44.180Z"
+        details:
+          expectedVersion: 1
+          currentVersion: 2
+        retryable: true
+
+    ErrorOrderNotFound:
+      summary: Заявка не найдена
+      value:
+        error: "ORDER_NOT_FOUND"
+        message: "Order not found"
+        traceId: "18293a4b5c6d7e8f9012345678901234"
+        timestamp: "2026-08-07T10:15:40.000Z"
+        details:
+          orderId: "ord_01J9X2C4KZQF8N3M5T6V7W8Y9Z"
+        retryable: false
+
+    ErrorUnauthorized:
+      summary: Просрочен service-JWT → EXCHANGE_SERVICE_UNAVAILABLE (503) + компенсация
+      value:
+        error: "UNAUTHORIZED"
+        message: "Service token expired"
+        traceId: "293a4b5c6d7e8f901234567890123456"
+        timestamp: "2026-08-07T10:15:32.117Z"
+        details:
+          reason: "exp_in_past"
+        retryable: false
+
+    ErrorForbidden:
+      summary: Нет скоупа orders:review → EXCHANGE_SERVICE_UNAVAILABLE (503)
+      description: |
+        Попытка BFF вызвать `PATCH`. Инцидент высокого приоритета: это либо дефект,
+        либо обход шага 16 цепочки §6.
+      value:
+        error: "FORBIDDEN"
+        message: "Scope 'orders:review' is required for this operation"
+        traceId: "3a4b5c6d7e8f90123456789012345678"
+        timestamp: "2026-08-07T11:02:44.050Z"
+        details:
+          requiredScope: "orders:review"
+        retryable: false
+
+    ErrorRateLimited:
+      summary: Превышен лимит → RATE_LIMITED (429) + компенсация
+      value:
+        error: "RATE_LIMITED"
+        message: "Rate limit exceeded for client 'svc:exchange-bff'"
+        traceId: "4b5c6d7e8f9012345678901234567890"
+        timestamp: "2026-08-07T10:15:32.117Z"
+        details:
+          limit: 2000
+          windowSeconds: 60
+        retryable: true
+
+    ErrorInternal:
+      summary: Сбой записи → ORDER_CREATION_FAILED (500) + обязательный release hold
+      description: |
+        Нормативный код шага 19 цепочки §6. Компенсация обязательна: холд создан
+        на шаге 18 и остался бы висеть на балансе пользователя.
+      value:
+        error: "INTERNAL_ERROR"
+        message: "Failed to persist order"
+        traceId: "5c6d7e8f901234567890123456789012"
+        timestamp: "2026-08-07T10:15:32.117Z"
+        details: {}
+        retryable: true
+
+    ErrorServiceUnavailable:
+      summary: Сервис недоступен → EXCHANGE_SERVICE_UNAVAILABLE (503) + release hold
+      description: |
+        Исход сценария `EXCHANGE_DOWN` из dev-панели прототипа (канон §10.6).
+      value:
+        error: "SERVICE_UNAVAILABLE"
+        message: "Order service is temporarily unavailable"
+        traceId: "6d7e8f9012345678901234567890abcd"
+        timestamp: "2026-08-07T10:15:32.117Z"
+        details:
+          reason: "maintenance"
+        retryable: true
+
+    ErrorTimeout:
+      summary: Таймаут 2000 мс → UPSTREAM_TIMEOUT (504) ТОЛЬКО после сверки
+      description: |
+        Конверт приходит от шлюза, если тот успел ответить; чаще соединение просто
+        обрывается по таймауту BFF. В обоих случаях `POST` **не повторяется** —
+        выполняется `GET /v1/orders?idempotencyKey=…`, и только подтверждённое отсутствие
+        заявки даёт `UPSTREAM_TIMEOUT` (504) плюс release hold в S6.
+      value:
+        error: "SERVICE_UNAVAILABLE"
+        message: "Upstream did not respond within the deadline"
+        traceId: "7e8f901234567890123456789012ab34"
+        timestamp: "2026-08-07T10:15:34.117Z"
+        details:
+          deadlineMs: 2000
+        retryable: true

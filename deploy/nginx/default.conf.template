@@ -1,0 +1,176 @@
+# ═══════════════════════════════════════════════════════════════════════════
+# Шаблон конфигурации nginx для Railway.
+#
+# Единственная подстановка — ${PORT}. Её делает /docker-entrypoint.d/40-port.sh
+# командой `envsubst '${PORT}'` с ЯВНЫМ списком переменных: без явного списка
+# envsubst съел бы и $uri, и $request_filename, и всё остальное, что здесь
+# написано через доллар.
+#
+# Раскладка файловой системы повторяет раскладку URL — это осознанно:
+# никаких alias/rewrite, try_files и index работают «как в учебнике».
+#
+#   /srv/www/            → прототип (Vite SPA)          отдаётся по  /
+#   /srv/www/docs/       → вики (MkDocs Material)       отдаётся по  /docs/
+#   /srv/www/docs/swagger/ → Swagger UI                 отдаётся по  /docs/swagger/
+# ═══════════════════════════════════════════════════════════════════════════
+
+# Кеш-политика, вычисляемая по Content-Type ответа.
+#
+# Почему так, а не «одна директива на весь сервер»:
+#   * HTML — точка входа. Он содержит ссылки на хешированные бандлы, поэтому
+#     обязан перепроверяться каждый раз, иначе после деплоя браузер будет
+#     тянуть новый index.html только после истечения TTL, а до тех пор
+#     запрашивать удалённые из образа ассеты → белый экран.
+#     no-cache ≠ no-store: файл кешируется, но перед использованием
+#     валидируется по ETag, то есть обычно это дешёвый 304.
+#   * JSON/XML — поисковый индекс MkDocs и sitemap, меняются каждой сборкой.
+#   * YAML — OpenAPI-спецификации, тоже меняются от сборки к сборке.
+#   * Всё прочее без хеша в имени (favicon.svg, logo.svg, extra.css,
+#     mermaid.min.js) — час. Достаточно, чтобы не долбить сервер, и достаточно
+#     мало, чтобы правка дошла до пользователя в тот же день.
+# Хешированные ассеты обрабатываются отдельными location'ами ниже.
+map $sent_http_content_type $bidzaar_cache_control {
+    default                  "public, max-age=3600";
+    "~*^text/html"           "no-cache";
+    "~*^application/json"    "no-cache";
+    "~*^application/xml"     "no-cache";
+    "~*^text/xml"            "no-cache";
+    "~*^text/yaml"           "no-cache";
+}
+
+server {
+    # Railway отдаёт порт переменной окружения и меняет его между деплоями.
+    # Строку с IPv6 подставляет entrypoint — и только если в контейнере есть
+    # стек IPv6. Безусловный `listen [::]:…` в окружении без AF_INET6 роняет
+    # nginx на старте («Address family not supported by protocol»).
+    listen ${PORT} default_server;
+${LISTEN_IPV6}
+    server_name _;
+
+    root  /srv/www;
+    index index.html;
+
+    # Весь контент — русскоязычный.
+    charset utf-8;
+    charset_types
+        text/css
+        text/plain
+        text/yaml
+        text/xml
+        application/javascript
+        application/json
+        application/xml
+        image/svg+xml;
+
+    # nginx не знает про YAML, а Swagger UI раздаёт спецификации именно так.
+    # Без этого браузер получил бы application/octet-stream и предложил
+    # «скачать файл» вместо показа.
+    types {
+        text/yaml  yaml yml;
+        text/plain feature;
+    }
+
+    server_tokens off;
+
+    # Railway терминирует TLS у себя и проксирует на $PORT по HTTP.
+    # absolute_redirect off заставляет nginx отдавать в Location относительный
+    # путь — иначе в редиректе утёк бы внутренний http://<container>:8080.
+    absolute_redirect off;
+    port_in_redirect  off;
+
+    client_max_body_size 1m;
+
+    # ── Сжатие ───────────────────────────────────────────────────────────────
+    # text/html жмётся всегда и в список не входит по определению.
+    gzip              on;
+    gzip_vary         on;
+    gzip_comp_level   6;
+    gzip_min_length   1024;
+    gzip_proxied      any;
+    gzip_types
+        text/plain
+        text/css
+        text/xml
+        text/yaml
+        application/javascript
+        application/json
+        application/xml
+        application/rss+xml
+        application/manifest+json
+        image/svg+xml;
+
+    # ── Заголовки по умолчанию ───────────────────────────────────────────────
+    # ВНИМАНИЕ: add_header не складывается — набор в location ПОЛНОСТЬЮ
+    # замещает набор с уровня server. Поэтому в каждом location, который
+    # переопределяет Cache-Control, заголовки безопасности повторены.
+    add_header Cache-Control          $bidzaar_cache_control always;
+    add_header X-Content-Type-Options nosniff                always;
+    add_header Referrer-Policy        strict-origin-when-cross-origin always;
+
+    # ── Health-check ─────────────────────────────────────────────────────────
+    # Ни одного обращения к диску: ответ формируется в памяти.
+    # Railway дёргает его после деплоя (healthcheckPath в railway.json).
+    location = /healthz {
+        access_log off;
+        default_type text/plain;
+        add_header Cache-Control "no-store" always;
+        return 200 "ok\n";
+    }
+
+    # ── Хешированные ассеты прототипа ────────────────────────────────────────
+    # Vite кладёт в /assets/ только файлы вида index-DzAr8mrO.js: имя меняется
+    # при любом изменении содержимого, значит перевалидация бессмысленна.
+    # immutable избавляет от условных запросов даже при F5.
+    # ^~ — префикс с приоритетом над regex ниже, чтобы не гонять регулярки
+    # по самым частым запросам.
+    location ^~ /assets/ {
+        access_log off;
+        add_header Cache-Control          "public, max-age=31536000, immutable" always;
+        add_header X-Content-Type-Options nosniff always;
+        add_header Referrer-Policy        strict-origin-when-cross-origin always;
+        try_files $uri =404;
+    }
+
+    # ── Хешированные ассеты MkDocs Material ──────────────────────────────────
+    # Material именует свои бандлы main.484c7ddc.min.css / bundle.79ae519e.min.js.
+    # Нехешированные соседи в том же каталоге (extra.css, mermaid.min.js,
+    # favicon.svg, logo.svg) сюда НЕ попадают и живут по общей политике —
+    # иначе правка extra.css застряла бы у пользователей на год.
+    # Обычный regex (не ^~), поэтому он выигрывает у префикса /docs/ ниже.
+    location ~ "^/docs/assets/.+\.[0-9a-f]{8}\.min\.(css|js)$" {
+        access_log off;
+        add_header Cache-Control          "public, max-age=31536000, immutable" always;
+        add_header X-Content-Type-Options nosniff always;
+        add_header Referrer-Policy        strict-origin-when-cross-origin always;
+        try_files $uri =404;
+    }
+
+    # ── Вики + Swagger UI: обычная статика, БЕЗ SPA-fallback ─────────────────
+    # Несуществующая страница под /docs/ обязана давать 404, а не index.html
+    # прототипа: иначе битая ссылка в документации выглядела бы как рабочая.
+    location /docs/ {
+        # Каталог без завершающего слэша → внешний 301 на слэш.
+        # Это не косметика: MkDocs строит все ссылки относительными
+        # (href=../sdd/, href=assets/…). Если отдать /docs/swagger как
+        # /docs/swagger/index.html без смены адреса в браузере, относительный
+        # ./vendor/swagger-ui.css уедет в /docs/vendor/… и Swagger не загрузится.
+        # try_files $uri/ сделал бы именно внутренний редирект, поэтому
+        # перехватываем случай заранее.
+        if (-d $request_filename) {
+            rewrite ^(.*[^/])$ $1/ permanent;
+        }
+        try_files $uri $uri/ =404;
+    }
+
+    # /docs → /docs/  (иначе location / ниже увёл бы запрос в SPA-fallback)
+    location = /docs {
+        return 301 /docs/;
+    }
+
+    # ── Прототип: SPA-fallback ───────────────────────────────────────────────
+    # Неизвестный путь под / отдаёт index.html, чтобы клиентский роутинг
+    # переживал перезагрузку страницы и прямые ссылки.
+    location / {
+        try_files $uri $uri/ /index.html;
+    }
+}

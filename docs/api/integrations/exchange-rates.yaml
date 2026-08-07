@@ -1,0 +1,2141 @@
+openapi: 3.1.0
+
+info:
+  title: Exchange Rate Service (S5) — Inbound Contract Stub
+  version: "1.0.0"
+  summary: Котировки валютных пар, TTL, источник цены, признак stale и здоровье источников.
+  description: |
+    # Назначение
+
+    Это **стаб внешнего сервиса S5 «Exchange Rate Service»**. Контракт описывает
+    **входящую к нам информацию**: что именно наше приложение (**Exchange BFF**) получает
+    от поставщика котировок. Сам сервис мы **не реализуем** — он принадлежит смежной
+    команде. Файл фиксирует форму данных, семантику устаревания, коды ошибок и правила
+    деградации, на которые опирается BFF.
+
+    Источник истины по доменным именам, деньгам, направлению курса, порядку валидации,
+    каталогу ошибок и фикстурам — `docs/00-canonical-model.md` (далее «канон»).
+    Расхождение с каноном = дефект контракта.
+
+    # Что мы получаем
+
+    * **Котировки** (`GET /v1/rates`, `GET /v1/rates/{pairId}`) — `bid`, `ask`, `mid`,
+      применяемый `rate`, обратный курс для отображения, спред, точность, источник,
+      время котировки, TTL, признаки `stale` / `degraded` и уровень доверия.
+    * **Здоровье источников цены** (`GET /v1/sources`) — статус, момент последнего
+      успешного опроса, доля ошибок, задержка p95. Используется дежурной сменой и
+      для решения «доверять ли текущей котировке».
+    * **Поток тиков** по WebSocket — описан ниже в разделе «WebSocket-канал тиков»,
+      потому что OpenAPI не выражает потоковые каналы.
+
+    Сервис **только читающий**. Все HTTP-эндпоинты — идемпотентные `GET`, ретраи
+    разрешены, но ограничены жёстким бюджетом времени (см. ниже).
+
+    # Направление курса (канон §5.2) — читать обязательно
+
+    `rate` = сколько единиц **`toAsset`** даётся за **1 единицу `fromAsset`**.
+
+    Пример из канона: пара `RUB→USDT`, `rate = "0.010638297872"`, что читается человеком
+    как «1 USDT = 94.00 RUB». Поле `inverseRate` (`"94.00"`) существует **только для
+    отображения** и округляется `ROUND_HALF_UP` до 2 знаков (канон §5.4).
+    В расчётах `inverseRate` **запрещено** использовать: `toAmountRaw = netFromAmount × rate`.
+
+    Пары **односторонние**: `RUB→USDT` и `USDT→RUB` котируются независимо и не связаны
+    соотношением `1/rate` — заложенный спред это демонстрирует (канон §10.3).
+
+    # Критичность (канон §3)
+
+    Класс критичности — **Blocking**. Без котировки заявка не создаётся: пользователю
+    возвращается `RATE_SERVICE_UNAVAILABLE` (503). Смягчение — только короткое окно
+    отдачи устаревших данных, описанное ниже.
+
+    # Таймауты и ретраи (канон §11)
+
+    | Параметр | Значение |
+    |---|---|
+    | Таймаут одного вызова | **800 мс** — пользователь ждёт котировку синхронно |
+    | Ретраи | **2 попытки**, экспоненциальный backoff + jitter (разрешено: только `GET`) |
+    | Circuit breaker | порог 50 % ошибок на окне 20 запросов, open 30 с |
+    | Бюджет `POST /v1/exchange-quotes` | p95 ≤ 300 мс — котировка пересчитывается на каждый ввод |
+    | Дебаунс ввода на клиенте | 300 мс, чтобы не выжигать бюджет запросов |
+
+    Таймаут S5 самый жёсткий среди всех интеграций именно потому, что он лежит на
+    синхронном пути ввода суммы. Суммарное время всех попыток не должно превышать
+    бюджет `POST /v1/exchange-quotes`; при исчерпании — `UPSTREAM_TIMEOUT` (504).
+
+    # Кеширование, stale и деградация (канон §11 «Кеширование»)
+
+    Строка канона: **курсы — TTL 1 с; отдаём с `degraded: true` до 10 с, дальше `503`**.
+    Разворачивается в трёхзонную модель по возрасту котировки `staleAgeMs`:
+
+    | Возраст котировки | `stale` | `degraded` | Поведение BFF |
+    |---|---|---|---|
+    | `0 … 1 000 мс` | `false` | `false` | Свежая котировка, используется как есть |
+    | `1 000 … 10 000 мс` | `true` | `true` | Используется, но котировка помечается `degraded: true` |
+    |  |  |  | (канон §4.3) и в UI показывается индикатор устаревания |
+    | `> 10 000 мс` | `true` | `true` | **Не используется.** Наружу `RATE_SERVICE_UNAVAILABLE` (503) |
+
+    Клиент может сузить допуск параметром `maxStalenessMs`: сервис не вернёт котировку
+    старше указанного возраста и отдаст вместо неё ошибку `RATE_STALE`.
+    Верхняя граница параметра — `10000`, потому что дальше решение всё равно
+    предопределено каноном.
+
+    Ключ кеша — `pairId`. Кеш **не персональный** и не содержит PII, поэтому разделяется
+    между всеми пользователями.
+
+    # Дрейф курса (канон §11)
+
+    Порог дрейфа — **0.20 %**. При подтверждении заявки BFF повторно запрашивает курс
+    (шаг 10 цепочки валидации) и сравнивает его с `rate`, зафиксированным в котировке:
+
+    ```
+    drift = |rateNow − rateQuoted| / rateQuoted × 100
+    drift > 0.20 %  →  RATE_CHANGED (409, retryable, баннер «Rate changed. Calculation updated.»)
+    ```
+
+    Порог выбран как компромисс: меньше — пользователя дёргает рыночный шум,
+    больше — систему несёт валютный риск.
+
+    # Поведение при недоступности
+
+    1. **Таймаут / сетевой отказ / 5xx** → берём последнюю котировку из кеша.
+       Если её возраст ≤ 10 с, отдаём с `degraded: true`; иначе — отказ.
+    2. **Кеш пуст или котировка старше 10 с** → `RATE_SERVICE_UNAVAILABLE` (503).
+    3. **`PAIR_NOT_QUOTED`** → `PAIR_NOT_SUPPORTED` (422), не retryable: это доменный
+       факт, а не сбой.
+    4. **Circuit breaker open** → исходящих вызовов нет, сразу шаг 1.
+    5. **Отказ WebSocket-потока** → переход на polling REST с интервалом 1 с; котировки
+       помечаются `degraded: true` до восстановления потока.
+
+    Сценарный переключатель прототипа `RATES_DOWN` (канон §10.6) воспроизводит именно
+    исход 2, `RATE_DRIFT` — исход из раздела «Дрейф курса».
+
+    # Где используется в цепочке валидации (канон §6)
+
+    | Шаг | Проверка | Что берём из S5 |
+    |---|---|---|
+    | **6** | Котировка существует → `QUOTE_NOT_FOUND` (404) | `GET /v1/rates/{pairId}` при построении котировки |
+    | **10** | Курс не уехал за порог 0.20 % → `RATE_CHANGED` (409) | повторный `GET /v1/rates/{pairId}` при подтверждении |
+
+    # Деньги, курсы и проценты
+
+    Все курсы, суммы и процентные величины передаются **строками** с десятичной записью
+    (канон §5.1). Двоичные `float`/`double` запрещены на всём пути. Регулярное выражение
+    валидации: `^(0|[1-9]\d{0,18})(\.\d{1,18})?$`. Курс **не округляется** при передаче
+    и хранении (канон §5.4) — округление курса ломает воспроизводимость расчёта.
+    Не-денежные величины (`spreadBps`, `precision`, `ttlMs`, `sourceLatencyMs`,
+    `staleAgeMs`) — целые числа, потому что деньгами не являются.
+
+    # Время
+
+    Все временные метки — ISO-8601 UTC с миллисекундами и суффиксом `Z`
+    (например `2026-08-07T10:15:32.117Z`), канон §9. Длительности — целые миллисекунды.
+
+    # PII
+
+    Сервис **не обрабатывает персональные данные**: котировки одинаковы для всех
+    пользователей, `userId` в запросах не передаётся, персонализации нет. Тела ответов
+    можно логировать целиком и кешировать в разделяемом кеше.
+
+    Единственное ограничение приватности — **корреляция**: `X-Correlation-Id` связывает
+    запрос курса с конкретной пользовательской сессией. Поэтому связка
+    «correlationId + pairId + сумма» не должна утекать в сторонние системы аналитики,
+    а объём запросов по пользователю не должен использоваться для профилирования.
+
+    # Безопасность транспорта
+
+    Service-to-service: **mTLS** на транспорте плюс **Bearer JWT** сервисного аккаунта
+    (см. `components.securitySchemes`). WebSocket-канал использует тот же токен
+    в заголовке `Authorization` на этапе handshake.
+
+    # WebSocket-канал тиков
+
+    OpenAPI не описывает потоковые каналы, поэтому контракт потока зафиксирован здесь
+    текстом и продублирован в `x-websocket-channel` на корне документа. Он **нормативен
+    наравне** с REST-частью.
+
+    ## Подключение
+
+    * URL: `wss://rates.internal.wallet/v1/stream`
+    * Подпротокол: `wallet.rates.v1` (заголовок `Sec-WebSocket-Protocol`)
+    * Транспорт: TLS 1.3 + **mTLS**, клиентский сертификат обязателен
+    * Аутентификация: заголовок `Authorization: Bearer <service-JWT>` **при handshake**.
+      Токен в query-строке запрещён (утекает в логи прокси). Токен проверяется один раз;
+      при его истечении соединение **не** разрывается — переавторизация выполняется
+      кадром `{"op":"auth","token":"..."}`, который обязателен не реже чем раз в 240 с.
+    * Отказ аутентификации → соединение закрывается кодом **4001** ещё до отправки
+      первого кадра данных.
+
+    ## Подписка
+
+    Клиент отправляет:
+
+    ```json
+    {"op":"subscribe","channel":"ticks","pairs":["RUB-USDT","USDT-RUB"],"reqId":"01J9X2C4K7QF8N3M5T6V7W8Y9Z"}
+    ```
+
+    Сервер подтверждает:
+
+    ```json
+    {"op":"subscribed","channel":"ticks","pairs":["RUB-USDT","USDT-RUB"],"reqId":"01J9X2C4K7QF8N3M5T6V7W8Y9Z","ts":"2026-08-07T10:15:32.117Z"}
+    ```
+
+    Частичный успех (часть пар не котируется):
+
+    ```json
+    {"op":"subscribed","channel":"ticks","pairs":["RUB-USDT"],"rejected":[{"pair":"EUR-USDT","reason":"PAIR_NOT_QUOTED"}],"reqId":"01J9X2C4K7QF8N3M5T6V7W8Y9Z","ts":"2026-08-07T10:15:32.117Z"}
+    ```
+
+    Отписка: `{"op":"unsubscribe","channel":"ticks","pairs":["USDT-RUB"],"reqId":"..."}`
+    → ответ `{"op":"unsubscribed", ...}`.
+
+    Ошибка подписки: `{"op":"error","reqId":"...","error":"SUBSCRIPTION_LIMIT_EXCEEDED","message":"...","ts":"..."}`.
+
+    Поле `reqId` обязательно и эхом возвращается в ответе — это единственный способ
+    сопоставить ответ с запросом в дуплексном канале.
+
+    ## Формат тика
+
+    ```json
+    {"channel":"ticks","pairId":"RUB-USDT","bid":"0.010638297872","ask":"0.010683760684","mid":"0.010661029278","rate":"0.010638297872","seq":12345,"ts":"2026-08-07T10:15:32.117Z"}
+    ```
+
+    * Все ценовые поля — **строки** (канон §5.1), даже в потоке.
+    * `rate` — применяемая сторона; направление то же, что в REST (канон §5.2).
+    * `ts` — момент котировки на стороне источника, ISO-8601 UTC с миллисекундами.
+    * `seq` — см. следующий раздел.
+    * Тик **не содержит** `stale` / `degraded`: по определению поток отдаёт свежие
+      данные, а признак устаревания вычисляет клиент как `now − ts`.
+
+    ## Heartbeat
+
+    * Клиент отправляет `{"op":"ping","ts":"2026-08-07T10:15:32.117Z"}` **каждые 15 с**.
+    * Сервер отвечает `{"op":"pong","ts":"2026-08-07T10:15:32.121Z"}`.
+    * Если сервер не получил ни одного кадра от клиента **30 с** — соединение
+      закрывается кодом `1001`.
+    * Если клиент не получил `pong` или тик **30 с** — он обязан считать соединение
+      мёртвым и переподключиться, не дожидаясь TCP-таймаута.
+    * Прикладной ping/pong используется вместо контрольных кадров WebSocket намеренно:
+      промежуточные L7-прокси часто отвечают на контрольные кадры сами и маскируют
+      обрыв.
+
+    ## Последовательность `seq` и ресинхронизация
+
+    * `seq` — монотонно возрастающий счётчик **на каждую пару** (не на соединение),
+      целое ≥ 1, без пропусков в нормальном режиме.
+    * Клиент хранит `lastSeq[pairId]`. Разрыв (`seq > lastSeq + 1`) означает потерю
+      тиков, откат (`seq ≤ lastSeq`) — дубликат или переподключение источника.
+    * При **разрыве**: тик применяется, но пара помечается локально «рассинхронизирована»
+      и клиент немедленно выполняет ресинхронизацию через REST —
+      `GET /v1/rates/{pairId}` — и продолжает от полученного значения.
+      Ресинхронизация обязана уважать общий таймаут 800 мс и не блокировать обработку
+      остальных пар.
+    * При **откате**: тик игнорируется как дубликат (защита от повторной доставки).
+    * После реконнекта `seq` начинается заново; клиент сбрасывает `lastSeq` и делает
+      первичную синхронизацию через `GET /v1/rates?pairs=...`.
+
+    ## Backpressure и conflation
+
+    * Канал **conflated**: если клиент читает медленнее, чем публикуется поток, сервер
+      **не буферизует историю** — он хранит только **последний** тик по каждой паре и
+      отдаёт именно его, когда сокет снова готов к записи. Промежуточные тики теряются
+      осознанно: для расчёта котировки важна текущая цена, а не история.
+    * Из-за conflation `seq` может увеличиваться скачком — это **не ошибка** и не повод
+      для ресинхронизации, если возраст полученного тика в пределах допуска.
+      Различить conflation и реальную потерю позволяет поле `conflated: true`,
+      добавляемое сервером в тик, отданный после отставания.
+    * Порог отставания: если очередь записи превышает **1 МБ** или отставание держится
+      более **5 с**, соединение закрывается кодом `1013` (Try Again Later).
+    * Максимальная частота публикации на пару — **10 тиков/с**; более частые обновления
+      источника схлопываются сервером.
+
+    ## Reconnect
+
+    * Экспоненциальный backoff с полным jitter: `delay = random(0, min(30s, 500ms × 2^n))`,
+      где `n` — номер неудачной попытки, начиная с 0. Верхняя граница 30 с.
+    * После **успешного** соединения, прожившего дольше 60 с, счётчик `n` сбрасывается.
+    * Реконнект **не выполняется** при кодах закрытия `4001` (auth) и `4003` (forbidden) —
+      это конфигурационные ошибки, повтор их не исправит; событие эскалируется дежурному.
+    * При коде `4029` (rate limit) первая пауза берётся не меньше значения,
+      присланного в поле `retryAfterMs` кадра ошибки.
+    * Пока поток не восстановлен, BFF работает на REST-polling с интервалом 1 с
+      и помечает котировки `degraded: true`.
+
+    ## Лимиты
+
+    | Лимит | Значение |
+    |---|---|
+    | Пар на одно соединение | **50** |
+    | Соединений на сервисный аккаунт | **20** |
+    | Управляющих кадров (`subscribe`/`unsubscribe`/`auth`) | **10/с**, burst 30 |
+    | Размер входящего кадра | **16 КиБ** |
+    | Время жизни соединения без переавторизации | **240 с** |
+
+    Превышение лимита пар → кадр `{"op":"error","error":"SUBSCRIPTION_LIMIT_EXCEEDED"}`
+    без разрыва соединения. Превышение частоты управляющих кадров → закрытие `4029`.
+
+    ## Коды закрытия
+
+    | Код | Значение | Реконнект |
+    |---|---|---|
+    | `1000` | Нормальное закрытие по инициативе клиента | не требуется |
+    | `1001` | Going Away — heartbeat не получен 30 с либо сервер уходит на деплой | да, с backoff |
+    | `1011` | Внутренняя ошибка сервера | да, с backoff; учитывается circuit breaker |
+    | `1013` | Try Again Later — клиент не успевает читать (backpressure) | да, с увеличенным backoff |
+    | `4001` | Ошибка аутентификации: токен отсутствует, истёк или подпись неверна | **нет** |
+    | `4003` | Аутентификация прошла, но доступ к каналу запрещён | **нет** |
+    | `4029` | Rate limit по управляющим кадрам или по числу соединений | да, не раньше `retryAfterMs` |
+
+  contact:
+    name: Wallet Platform / Market Data Team
+    email: market-data@wallet.internal
+  license:
+    name: Proprietary — internal use only
+    identifier: LicenseRef-Wallet-Internal
+
+x-websocket-channel:
+  url: wss://rates.internal.wallet/v1/stream
+  subprotocol: wallet.rates.v1
+  description: |
+    Машиночитаемая выжимка WebSocket-контракта. Полное нормативное описание —
+    в разделе «WebSocket-канал тиков» внутри `info.description`.
+  authentication:
+    scheme: bearer
+    location: "Authorization header at handshake"
+    reauthFrame: '{"op":"auth","token":"<service-JWT>"}'
+    reauthIntervalSeconds: 240
+    note: |
+      Передача токена в query-строке запрещена. Транспорт — TLS 1.3 с обязательным mTLS.
+  operations:
+    subscribe:
+      request: '{"op":"subscribe","channel":"ticks","pairs":["RUB-USDT"],"reqId":"01J9X2C4K7QF8N3M5T6V7W8Y9Z"}'
+      ack: '{"op":"subscribed","channel":"ticks","pairs":["RUB-USDT"],"reqId":"01J9X2C4K7QF8N3M5T6V7W8Y9Z","ts":"2026-08-07T10:15:32.117Z"}'
+    unsubscribe:
+      request: '{"op":"unsubscribe","channel":"ticks","pairs":["RUB-USDT"],"reqId":"01J9X2C4K7QF8N3M5T6V7W8Y9Z"}'
+      ack: '{"op":"unsubscribed","channel":"ticks","pairs":["RUB-USDT"],"reqId":"01J9X2C4K7QF8N3M5T6V7W8Y9Z","ts":"2026-08-07T10:15:32.117Z"}'
+    tick:
+      message: '{"channel":"ticks","pairId":"RUB-USDT","bid":"0.010638297872","ask":"0.010683760684","mid":"0.010661029278","rate":"0.010638297872","seq":12345,"ts":"2026-08-07T10:15:32.117Z"}'
+      note: Все ценовые поля — строки (канон §5.1). Направление курса — по канону §5.2.
+    heartbeat:
+      clientPing: '{"op":"ping","ts":"2026-08-07T10:15:32.117Z"}'
+      serverPong: '{"op":"pong","ts":"2026-08-07T10:15:32.121Z"}'
+      intervalSeconds: 15
+      timeoutSeconds: 30
+    error:
+      message: '{"op":"error","reqId":"01J9X2C4K7QF8N3M5T6V7W8Y9Z","error":"SUBSCRIPTION_LIMIT_EXCEEDED","message":"Maximum 50 pairs per connection","retryAfterMs":1000,"ts":"2026-08-07T10:15:32.117Z"}'
+  sequencing:
+    field: seq
+    scope: per-pair
+    monotonic: true
+    onGap: |
+      Применить тик, пометить пару рассинхронизированной, немедленно выполнить
+      ресинхронизацию через REST GET /v1/rates/{pairId}, продолжить от полученного значения.
+    onRegression: Игнорировать тик как дубликат.
+    onReconnect: Сбросить lastSeq и выполнить первичную синхронизацию через GET /v1/rates?pairs=...
+  backpressure:
+    strategy: conflation
+    description: |
+      История не буферизуется: хранится только последний тик по каждой паре.
+      Тик, отданный после отставания, помечается conflated: true. Скачок seq
+      при conflation не является потерей данных.
+    maxQueueBytes: 1048576
+    maxLagSeconds: 5
+    maxTicksPerSecondPerPair: 10
+    onOverflow: Закрытие соединения кодом 1013.
+  reconnect:
+    strategy: exponential-backoff-full-jitter
+    formula: "delay = random(0, min(30000ms, 500ms * 2^n))"
+    maxDelayMs: 30000
+    resetAfterStableSeconds: 60
+    noReconnectOnCloseCodes: [4001, 4003]
+    fallback: "REST-polling каждую 1 с, котировки помечаются degraded: true."
+  limits:
+    maxPairsPerConnection: 50
+    maxConnectionsPerServiceAccount: 20
+    maxControlFramesPerSecond: 10
+    maxControlFrameBurst: 30
+    maxIncomingFrameBytes: 16384
+  closeCodes:
+    "1000": Нормальное закрытие по инициативе клиента; реконнект не требуется.
+    "1001": Going Away — heartbeat не получен 30 с либо сервер уходит на деплой; реконнект с backoff.
+    "1011": Внутренняя ошибка сервера; реконнект с backoff, учитывается circuit breaker.
+    "1013": Try Again Later — клиент не успевает читать; реконнект с увеличенным backoff.
+    "4001": Ошибка аутентификации; реконнект запрещён, эскалация дежурному.
+    "4003": Доступ к каналу запрещён; реконнект запрещён.
+    "4029": Rate limit; реконнект не раньше retryAfterMs.
+
+servers:
+  - url: https://rates.internal.wallet
+    description: |
+      Production. Внутренний контур, доступ только из service mesh, обязателен mTLS.
+      Версия API входит в путь (`/v1/...`), поэтому базовый URL версии не содержит.
+      WebSocket-эндпоинт того же контура — `wss://rates.internal.wallet/v1/stream`.
+  - url: https://rates.staging.internal.wallet
+    description: Staging. Котировки от тестовых источников, спреды шире продовых.
+  - url: https://rates.mock.internal.wallet
+    description: |
+      Mock. Детерминированные курсы из канона §10.3 — те же, что использует прототип.
+      Сценарии `RATE_DRIFT` и `RATES_DOWN` (канон §10.6) воспроизводятся заголовком
+      `X-Mock-Scenario`.
+
+security:
+  - bearerAuth: []
+
+tags:
+  - name: Rates
+    description: |
+      Котировки направленных пар. Направление курса — по канону §5.2: `rate` = сколько
+      единиц `toAsset` за 1 единицу `fromAsset`. TTL котировки 1 с, допустимая
+      деградация — до 10 с с признаком `degraded: true`, дальше `503`.
+  - name: Sources
+    description: |
+      Здоровье поставщиков цены (`AGGREGATED`, `BINANCE`, `CBR`, `INTERNAL`).
+      Используется дежурной сменой и алертингом; на пути создания заявки не блокирует.
+  - name: Streaming
+    description: |
+      **WebSocket-канал тиков** `wss://rates.internal.wallet/v1/stream`. OpenAPI не
+      описывает потоковые каналы, поэтому нормативный контракт канала вынесен в раздел
+      «WebSocket-канал тиков» внутри `info.description` и продублирован в
+      `x-websocket-channel` на корне документа.
+
+      Коротко: Bearer-JWT при handshake (в query-строке запрещён); подписка
+      `{"op":"subscribe","channel":"ticks","pairs":[...],"reqId":"..."}` с ответом
+      `{"op":"subscribed",...}`; тик
+      `{"channel":"ticks","pairId":"RUB-USDT","bid":"...","ask":"...","mid":"...","rate":"...","seq":12345,"ts":"..."}`;
+      прикладной heartbeat `{"op":"ping"}` каждые 15 с при таймауте 30 с;
+      `seq` монотонный **на пару**, разрыв → ресинхронизация через
+      `GET /v1/rates/{pairId}`; conflation вместо буферизации (отдаётся только последний
+      тик, скачок `seq` — норма); reconnect с экспоненциальным backoff и полным jitter
+      (`random(0, min(30s, 500ms × 2^n))`); максимум 50 пар на соединение и 20 соединений
+      на сервисный аккаунт; коды закрытия `4001` (auth, без реконнекта), `4029`
+      (rate limit), `1011` (internal), `1013` (backpressure).
+
+paths:
+
+  /v1/rates:
+    get:
+      operationId: getRatesBatch
+      summary: Batch-запрос котировок по нескольким парам
+      description: |
+        Возвращает котировки сразу по нескольким парам за один сетевой раунд-трип.
+        Это основной способ обращения BFF: экран обмена показывает и прямое, и обратное
+        направление, а таймаут 800 мс не оставляет места на последовательные вызовы.
+
+        **Частичный успех — нормальный исход.** Если часть пар не удалось котировать,
+        сервис возвращает `200` с `partial: true` и перечисляет недостающие в
+        `missingPairs`. Ошибку `404` batch-эндпоинт не отдаёт: отсутствие одной пары
+        не должно обнулять полезный результат по остальным. Решение по каждой
+        отсутствующей паре BFF принимает сам — как правило `PAIR_NOT_SUPPORTED` (422)
+        для запрошенного пользователем направления.
+
+        **Устаревание.** Флаг `anyStale` позволяет одним сравнением понять, попала ли
+        хоть одна котировка в зону деградации. Параметр `maxStalenessMs` сужает
+        допустимый возраст; котировки старше него в ответ не попадают и переходят
+        в `missingPairs`.
+      tags: [Rates, Streaming]
+      parameters:
+        - $ref: '#/components/parameters/CorrelationId'
+        - $ref: '#/components/parameters/RequestId'
+        - $ref: '#/components/parameters/PairsQuery'
+        - $ref: '#/components/parameters/MaxStalenessMsQuery'
+        - $ref: '#/components/parameters/AllowStaleQuery'
+      responses:
+        '200':
+          description: |
+            Котировки получены. Возможен частичный результат — см. `partial`
+            и `missingPairs`.
+          headers:
+            X-Correlation-Id:
+              $ref: '#/components/headers/XCorrelationId'
+            X-Request-Id:
+              $ref: '#/components/headers/XRequestId'
+            Cache-Control:
+              $ref: '#/components/headers/CacheControl'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RatesBatchResponse'
+              examples:
+                allEightPairs:
+                  $ref: '#/components/examples/RatesAllPairs'
+                partialWithMissing:
+                  $ref: '#/components/examples/RatesPartial'
+                degradedStale:
+                  $ref: '#/components/examples/RatesDegraded'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '422':
+          $ref: '#/components/responses/UnprocessableEntity'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+        '504':
+          $ref: '#/components/responses/GatewayTimeout'
+
+  /v1/rates/{pairId}:
+    get:
+      operationId: getRate
+      summary: Котировка одной пары
+      description: |
+        Возвращает котировку одной направленной пары. Используется в двух местах:
+
+        * **шаг 6** цепочки валидации — построение котировки; отсутствие цены даёт
+          наш `QUOTE_NOT_FOUND` (404, retryable, баннер `Rate expired. Refreshing…`);
+        * **шаг 10** — повторный запрос при подтверждении заявки для проверки дрейфа;
+          при `drift > 0.20 %` наружу уходит `RATE_CHANGED` (409, retryable).
+
+        Также этот эндпоинт — точка **ресинхронизации WebSocket-потока** при обнаружении
+        разрыва в `seq` (см. раздел «WebSocket-канал тиков»).
+
+        Различие исходов:
+
+        * `404` `PAIR_NOT_QUOTED` — пара в принципе не котируется → `PAIR_NOT_SUPPORTED` (422);
+        * `404` `QUOTE_NOT_FOUND` — пара котируется, но цены сейчас нет → `QUOTE_NOT_FOUND` (404);
+        * `503` `RATE_STALE` — единственная имеющаяся цена старше 10 с →
+          `RATE_SERVICE_UNAVAILABLE` (503).
+      tags: [Rates, Streaming]
+      parameters:
+        - $ref: '#/components/parameters/CorrelationId'
+        - $ref: '#/components/parameters/RequestId'
+        - $ref: '#/components/parameters/PairIdPath'
+        - $ref: '#/components/parameters/MaxStalenessMsQuery'
+        - $ref: '#/components/parameters/AllowStaleQuery'
+      responses:
+        '200':
+          description: Котировка получена. Проверьте `stale` / `degraded` / `staleAgeMs`.
+          headers:
+            X-Correlation-Id:
+              $ref: '#/components/headers/XCorrelationId'
+            X-Request-Id:
+              $ref: '#/components/headers/XRequestId'
+            Cache-Control:
+              $ref: '#/components/headers/CacheControl'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RateQuote'
+              examples:
+                rubToUsdt:
+                  $ref: '#/components/examples/RateRubUsdt'
+                usdtToRub:
+                  $ref: '#/components/examples/RateUsdtRub'
+                btcToUsdt:
+                  $ref: '#/components/examples/RateBtcUsdt'
+                staleDegraded:
+                  $ref: '#/components/examples/RateStaleDegraded'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/UnprocessableEntity'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+        '504':
+          $ref: '#/components/responses/GatewayTimeout'
+
+  /v1/sources:
+    get:
+      operationId: listRateSources
+      summary: Статус и здоровье источников цены
+      description: |
+        Возвращает состояние всех поставщиков котировок. Это диагностический ресурс:
+        он **не участвует** в цепочке валидации и не блокирует создание заявки.
+
+        Используется для трёх задач:
+
+        1. алертинг дежурной смены при переходе источника в `DEGRADED` / `DOWN`;
+        2. объяснение пользователю, почему котировка помечена `degraded` — в UI
+           показывается нейтральный индикатор, детали источников наружу не отдаются;
+        3. решение об отключении пары на стороне S4 (`disabledReason: RATE_SOURCE_DOWN`).
+
+        Ответ не содержит PII и кешируется на 10 с.
+      tags: [Sources]
+      parameters:
+        - $ref: '#/components/parameters/CorrelationId'
+        - $ref: '#/components/parameters/RequestId'
+        - $ref: '#/components/parameters/SourceStatusQuery'
+      responses:
+        '200':
+          description: Состояние источников получено.
+          headers:
+            X-Correlation-Id:
+              $ref: '#/components/headers/XCorrelationId'
+            X-Request-Id:
+              $ref: '#/components/headers/XRequestId'
+            Cache-Control:
+              $ref: '#/components/headers/CacheControl'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RateSourcesResponse'
+              examples:
+                allHealthy:
+                  $ref: '#/components/examples/SourcesHealthy'
+                oneDown:
+                  $ref: '#/components/examples/SourcesOneDown'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+        '504':
+          $ref: '#/components/responses/GatewayTimeout'
+
+components:
+
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: |
+        **Service-to-service JWT.** BFF предъявляет короткоживущий токен сервисного
+        аккаунта (`sub = svc:exchange-bff`, TTL ≤ 300 с, подпись `RS256`, обязательные
+        claims `iss`, `aud = exchange-rates`, `exp`, `jti`) в заголовке
+        `Authorization: Bearer <token>`.
+
+        Токен **дополняет**, а не заменяет транспортную аутентификацию: соединение
+        обязано быть установлено по **mTLS**, клиентский сертификат выдаётся внутренним
+        CA service mesh, CN сертификата обязан совпадать с `sub` токена.
+
+        **WebSocket** использует ту же схему: заголовок `Authorization` передаётся при
+        handshake, передача токена в query-строке запрещена (утекает в логи прокси).
+        Переавторизация долгоживущего соединения выполняется кадром
+        `{"op":"auth","token":"..."}` не реже чем раз в 240 с.
+
+        Пользовательский JWT в S5 **не передаётся**: котировки не персонализированы,
+        `userId` сервису не нужен.
+
+  parameters:
+
+    CorrelationId:
+      name: X-Correlation-Id
+      in: header
+      required: false
+      description: |
+        Сквозной идентификатор бизнес-операции (канон §9). Возвращается сервисом эхом
+        в ответе и во всех ошибках; при отсутствии сервис генерирует собственное
+        значение. Формат — ULID (26 символов Crockford Base32) либо UUIDv4.
+      schema:
+        type: string
+        minLength: 26
+        maxLength: 36
+        pattern: '^([0-9A-HJKMNP-TV-Z]{26}|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$'
+        examples:
+          - "01J9X2C4K7QF8N3M5T6V7W8Y9Z"
+
+    RequestId:
+      name: X-Request-Id
+      in: header
+      required: false
+      description: |
+        Идентификатор конкретной HTTP-попытки. Меняется на каждом ретрае, что позволяет
+        отличить повтор от нового запроса при разборе инцидентов.
+      schema:
+        type: string
+        format: uuid
+        minLength: 36
+        maxLength: 36
+        pattern: '^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$'
+        examples:
+          - "3f2504e0-4f89-41d3-9a0c-0305e82c3301"
+
+    PairIdPath:
+      name: pairId
+      in: path
+      required: true
+      description: |
+        Идентификатор направленной пары в формате `FROM[@NETWORK]-TO[@NETWORK]`.
+        Для котировок сеть обычно опускается (`RUB-USDT`), потому что цена не зависит
+        от блокчейн-сети: `USDT@TRON` и `USDT@ETHEREUM` котируются одинаково.
+        Квалифицированная форма (`USDT@TRON-RUB`) принимается и трактуется так же.
+      schema:
+        $ref: '#/components/schemas/PairId'
+
+    PairsQuery:
+      name: pairs
+      in: query
+      required: true
+      description: |
+        Список пар через запятую (CSV), например `RUB-USDT,USDT-RUB`.
+        Порядок в ответе не гарантирован — сопоставляйте по `pairId`.
+        Дубликаты схлопываются. Максимум 50 пар за запрос: это тот же предел,
+        что и для одного WebSocket-соединения.
+
+        CSV, а не повторяющийся параметр, выбран сознательно: он даёт короткий и
+        стабильный URL, пригодный для ключа HTTP-кеша.
+      schema:
+        type: string
+        minLength: 5
+        maxLength: 2048
+        pattern: '^[A-Z0-9]{2,12}(@(TRON|ETHEREUM|BITCOIN))?-[A-Z0-9]{2,12}(@(TRON|ETHEREUM|BITCOIN))?(,[A-Z0-9]{2,12}(@(TRON|ETHEREUM|BITCOIN))?-[A-Z0-9]{2,12}(@(TRON|ETHEREUM|BITCOIN))?){0,49}$'
+        examples:
+          - "RUB-USDT,USDT-RUB"
+          - "RUB-USDT,USDT-RUB,RUB-BTC,USDT-BTC,USDT-ETH,BTC-USDT,ETH-USDT,RUB-EUR"
+
+    MaxStalenessMsQuery:
+      name: maxStalenessMs
+      in: query
+      required: false
+      description: |
+        Максимальный допустимый возраст котировки в миллисекундах. Котировки старше
+        не возвращаются: в batch-запросе они попадают в `missingPairs`, в запросе
+        одной пары приводят к `RATE_STALE` (503).
+
+        Границы соответствуют канону §11: TTL котировки **1 000 мс**, предел
+        деградации — **10 000 мс**, дальше решение предопределено (`503`), поэтому
+        большее значение бессмысленно. По умолчанию — `10000`.
+      schema:
+        type: integer
+        minimum: 0
+        maximum: 10000
+        default: 10000
+        examples:
+          - 1000
+          - 10000
+
+    AllowStaleQuery:
+      name: allowStale
+      in: query
+      required: false
+      description: |
+        Разрешить возврат устаревшей котировки (возраст > TTL 1 000 мс, но ≤ 10 000 мс)
+        с признаками `stale: true` и `degraded: true`. При `false` сервис отдаёт только
+        свежие котировки. По умолчанию `true` — это соответствует стратегии канона §11
+        «отдаём с `degraded: true` до 10 с».
+      schema:
+        type: boolean
+        default: true
+        examples:
+          - true
+
+    SourceStatusQuery:
+      name: status
+      in: query
+      required: false
+      description: |
+        Фильтр по статусу источника. Удобен для алертинга: запрос со `status=DOWN`
+        возвращает только проблемные источники.
+      schema:
+        $ref: '#/components/schemas/SourceStatus'
+
+  headers:
+
+    XCorrelationId:
+      description: Сквозной идентификатор бизнес-операции, эхом возвращается сервисом.
+      required: true
+      schema:
+        type: string
+        minLength: 26
+        maxLength: 36
+        examples:
+          - "01J9X2C4K7QF8N3M5T6V7W8Y9Z"
+
+    XRequestId:
+      description: Идентификатор конкретной HTTP-попытки, эхом возвращается сервисом.
+      required: false
+      schema:
+        type: string
+        format: uuid
+        minLength: 36
+        maxLength: 36
+        examples:
+          - "3f2504e0-4f89-41d3-9a0c-0305e82c3301"
+
+    CacheControl:
+      description: |
+        Директива кеширования. TTL котировки — 1 секунда (канон §11);
+        `stale-while-revalidate=9` покрывает окно допустимой деградации до 10 с.
+      required: false
+      schema:
+        type: string
+        maxLength: 200
+        examples:
+          - "public, max-age=1, stale-while-revalidate=9"
+
+    RetryAfter:
+      description: |
+        Через сколько секунд разрешено повторить запрос. Возвращается при `429` и `503`.
+        BFF использует значение как нижнюю границу backoff.
+      required: false
+      schema:
+        type: integer
+        minimum: 0
+        maximum: 3600
+        examples:
+          - 1
+
+  schemas:
+
+    DecimalString:
+      type: string
+      description: |
+        Курс, цена или денежная величина в виде **строки** с десятичной записью
+        (канон §5.1). Двоичные `float`/`double` запрещены на всём пути: API, BFF,
+        состояние фронтенда, отображение. Значение неотрицательное. Целая часть —
+        до 19 цифр, дробная — до 18 знаков. Курс передаётся **без округления**
+        (канон §5.4).
+      minLength: 1
+      maxLength: 40
+      pattern: '^(0|[1-9]\d{0,18})(\.\d{1,18})?$'
+      examples:
+        - "0.010638297872"
+        - "93.60"
+        - "66200.00"
+
+    PercentString:
+      type: string
+      description: |
+        Процентная величина в виде строки. Значение выражено **в процентах**,
+        а не в долях: `"0.20"` = 0.20 %, `"1.50"` = 1.5 %.
+      minLength: 1
+      maxLength: 40
+      pattern: '^(0|[1-9]\d{0,18})(\.\d{1,18})?$'
+      examples:
+        - "0.20"
+        - "0.00"
+
+    Timestamp:
+      type: string
+      format: date-time
+      description: |
+        Момент времени в ISO-8601, зона UTC, обязательные миллисекунды и суффикс `Z`
+        (канон §9). Смещения вида `+03:00` не допускаются.
+      minLength: 24
+      maxLength: 24
+      pattern: '^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$'
+      examples:
+        - "2026-08-07T10:15:32.117Z"
+
+    AssetId:
+      type: string
+      description: |
+        Код учётной единицы баланса (канон §4.1). Только заглавные латинские буквы
+        и цифры.
+      minLength: 2
+      maxLength: 12
+      pattern: '^[A-Z0-9]{2,12}$'
+      examples:
+        - "RUB"
+        - "USDT"
+
+    Network:
+      type: [string, 'null']
+      description: |
+        Блокчейн-сеть крипто-актива (канон §2). Для котировок обычно `null`: цена
+        `USDT` не зависит от того, в сети `TRON` или `ETHEREUM` он учитывается.
+        Заполняется, только если источник котирует сеть отдельно.
+      enum: ["TRON", "ETHEREUM", "BITCOIN", null]
+      examples:
+        - null
+        - "TRON"
+
+    AssetRef:
+      type: object
+      description: "Ссылка на актив: код плюс (необязательная для котировок) сеть."
+      additionalProperties: false
+      required: [assetId, network]
+      properties:
+        assetId:
+          $ref: '#/components/schemas/AssetId'
+        network:
+          $ref: '#/components/schemas/Network'
+      examples:
+        - assetId: "RUB"
+          network: null
+
+    PairId:
+      type: string
+      description: |
+        Идентификатор направленной пары: `FROM[@NETWORK]-TO[@NETWORK]`.
+        Пары односторонние: `RUB-USDT` и `USDT-RUB` котируются независимо и **не**
+        связаны соотношением `1/rate` — заложенный спред это демонстрирует
+        (канон §10.3).
+      minLength: 5
+      maxLength: 67
+      pattern: '^[A-Z0-9]{2,12}(@(TRON|ETHEREUM|BITCOIN))?-[A-Z0-9]{2,12}(@(TRON|ETHEREUM|BITCOIN))?$'
+      examples:
+        - "RUB-USDT"
+        - "BTC-USDT"
+
+    RateSource:
+      type: string
+      description: |
+        Поставщик цены (канон §4.3, поле `rateSource`).
+
+        * `AGGREGATED` — сводная цена по нескольким источникам, режим по умолчанию;
+        * `BINANCE` — биржевой стакан, используется для крипто-крипто;
+        * `CBR` — официальный курс регулятора, используется для фиатных пар;
+        * `INTERNAL` — внутренняя книга котировок, fallback при отказе внешних.
+      enum: ["AGGREGATED", "BINANCE", "CBR", "INTERNAL"]
+      examples:
+        - "AGGREGATED"
+
+    Confidence:
+      type: string
+      description: |
+        Уровень доверия к котировке. Определяется числом согласных источников,
+        шириной спреда и возрастом данных.
+
+        * `HIGH` — не меньше двух согласных источников, спред в норме, возраст ≤ TTL;
+        * `MEDIUM` — один источник либо расширенный спред либо котировка `stale`;
+        * `LOW` — только `INTERNAL` fallback или сильное расхождение источников.
+
+        BFF не отказывает по `LOW` автоматически, но помечает котировку `degraded`.
+      enum: ["HIGH", "MEDIUM", "LOW"]
+      examples:
+        - "HIGH"
+
+    SourceStatus:
+      type: string
+      description: |
+        Состояние поставщика цены. `DEGRADED` — отвечает, но с повышенной долей ошибок
+        или задержкой; `DOWN` — не отвечает или отвергнут по качеству данных.
+      enum: ["UP", "DEGRADED", "DOWN"]
+      examples:
+        - "UP"
+
+    RateQuote:
+      type: object
+      description: |
+        Котировка одной направленной пары.
+
+        **Соотношение цен.** `bid` ≤ `mid` ≤ `ask`, все три выражены в единицах
+        `toAsset` за 1 единицу `fromAsset`. Применяемый `rate` равен **`bid`** —
+        клиент продаёт `fromAsset`, поэтому получает цену покупателя. Именно поэтому
+        `RUB→USDT` и `USDT→RUB` в фикстурах канона §10.3 не являются взаимно обратными:
+        каждая пара котируется своей стороной стакана.
+
+        **Устаревание.** Зоны по канону §11: `staleAgeMs ≤ 1000` — свежая;
+        `1000 < staleAgeMs ≤ 10000` — `stale: true`, `degraded: true`, использовать
+        можно; `staleAgeMs > 10000` — использовать нельзя, наружу
+        `RATE_SERVICE_UNAVAILABLE` (503).
+      additionalProperties: false
+      required:
+        - pairId
+        - fromAsset
+        - toAsset
+        - bid
+        - ask
+        - mid
+        - rate
+        - inverseRate
+        - spreadBps
+        - precision
+        - source
+        - sourceLatencyMs
+        - quotedAt
+        - receivedAt
+        - ttlMs
+        - expiresAt
+        - stale
+        - staleAgeMs
+        - confidence
+        - degraded
+      properties:
+        pairId:
+          $ref: '#/components/schemas/PairId'
+        fromAsset:
+          allOf:
+            - $ref: '#/components/schemas/AssetRef'
+          description: Актив списания — знаменатель курса («за 1 единицу чего»).
+        toAsset:
+          allOf:
+            - $ref: '#/components/schemas/AssetRef'
+          description: Актив получения — числитель курса («сколько единиц чего»).
+        bid:
+          allOf:
+            - $ref: '#/components/schemas/DecimalString'
+          description: |
+            Цена покупателя: сколько единиц `toAsset` дают за 1 единицу `fromAsset`
+            те, кто готов купить `fromAsset` прямо сейчас. Это сторона, по которой
+            исполняется клиент, поэтому `rate = bid`.
+        ask:
+          allOf:
+            - $ref: '#/components/schemas/DecimalString'
+          description: |
+            Цена продавца: сколько единиц `toAsset` просят за 1 единицу `fromAsset`.
+            Всегда `ask ≥ bid`. В расчёте котировки напрямую не участвует —
+            используется для вычисления спреда и контроля качества данных.
+        mid:
+          allOf:
+            - $ref: '#/components/schemas/DecimalString'
+          description: |
+            Середина спреда `(bid + ask) / 2`. Справочная величина: используется для
+            аналитики, сравнения источников и расчёта `spreadBps`.
+            **В расчёте суммы получения не применяется.**
+        rate:
+          allOf:
+            - $ref: '#/components/schemas/DecimalString'
+          description: |
+            **Применяемый курс.** Направление по канону §5.2: сколько единиц `toAsset`
+            даётся за **1 единицу `fromAsset`**. Пример канона: `RUB→USDT`,
+            `rate = "0.010638297872"` ⇔ «1 USDT = 94.00 RUB».
+
+            Используется в шаге 5 расчёта (канон §5.3): `toAmountRaw = netFromAmount × rate`,
+            после чего `toAmount` округляется **вниз** до `decimals(toAsset)`.
+            Сам `rate` **не округляется** ни при передаче, ни при хранении (канон §5.4) —
+            округление курса ломает воспроизводимость расчёта.
+        inverseRate:
+          allOf:
+            - $ref: '#/components/schemas/DecimalString'
+          description: |
+            Обратный курс — **только для отображения** (канон §5.2, §5.4).
+            Округление `ROUND_HALF_UP` до **2 знаков**. Строка «1 USDT = 94.00 RUB»
+            читается человеком легче, чем «1 RUB = 0.010638297872 USDT».
+
+            **В расчётах использовать запрещено.**
+
+            Замечание к канону: правило «2 знака» корректно, когда обратный курс
+            выражен в фиате (`"94.00"`, `"6250000.00"`). Для направлений, где обратный
+            курс меньше `0.01` (например `BTC→USDT`: `1/66200 ≈ 0.0000151`), округление
+            до 2 знаков даёт вырожденное `"0.00"`. В таких случаях UI показывает прямой
+            курс и `inverseRate` не отображает; поле всё равно заполняется по букве
+            канона, чтобы контракт оставался предсказуемым.
+        spreadBps:
+          type: integer
+          description: |
+            Ширина спреда в базисных пунктах: `(ask − bid) / mid × 10000`, округлённая
+            до целого. Не денежная величина, поэтому целое число, а не строка.
+            Рост спреда — ранний признак ухудшения ликвидности; при значении выше
+            порога источника `confidence` понижается до `MEDIUM`.
+          minimum: 0
+          maximum: 100000
+          examples:
+            - 43
+            - 78
+        precision:
+          type: integer
+          description: |
+            Число значащих знаков после запятой в поле `rate`. Позволяет клиенту
+            корректно форматировать курс, не «додумывая» точность и не обрезая её.
+            Не путать с `decimals` актива: `precision` относится к курсу, `decimals` —
+            к суммам.
+          minimum: 0
+          maximum: 18
+          examples:
+            - 12
+            - 2
+        source:
+          $ref: '#/components/schemas/RateSource'
+        sourceLatencyMs:
+          type: integer
+          description: |
+            Задержка получения цены от источника до S5, в миллисекундах. Входит
+            в общий бюджет 800 мс; аномальный рост — сигнал деградации источника.
+          minimum: 0
+          maximum: 60000
+          examples:
+            - 42
+        quotedAt:
+          allOf:
+            - $ref: '#/components/schemas/Timestamp'
+          description: |
+            Момент формирования цены **на стороне источника**. Именно от него
+            отсчитывается возраст котировки `staleAgeMs`.
+        receivedAt:
+          allOf:
+            - $ref: '#/components/schemas/Timestamp'
+          description: |
+            Момент получения цены сервисом S5. Разница `receivedAt − quotedAt`
+            равна `sourceLatencyMs`.
+        ttlMs:
+          type: integer
+          description: |
+            Время жизни котировки в миллисекундах. Каноническое значение — **1000**
+            (канон §11, TTL курсов 1 с). Не путать с Rate Lock TTL котировки
+            пользователя, который равен **15 секундам** (канон §2) — это разные
+            сущности: здесь живёт рыночная цена, там — зафиксированный для клиента
+            расчёт.
+          minimum: 100
+          maximum: 60000
+          examples:
+            - 1000
+        expiresAt:
+          allOf:
+            - $ref: '#/components/schemas/Timestamp'
+          description: '`quotedAt + ttlMs`. После этого момента котировка считается `stale`.'
+        stale:
+          type: boolean
+          description: |
+            Котировка старше своего TTL (`now > expiresAt`). `true` не означает, что
+            котировку нельзя использовать: до возраста 10 с она допустима, но
+            помечается `degraded`.
+          examples:
+            - false
+        staleAgeMs:
+          type: integer
+          description: |
+            Возраст котировки в миллисекундах: `now − quotedAt`. Ключевая величина
+            для трёхзонного решения канона §11 (≤ 1000 — свежая; ≤ 10000 — деградация;
+            > 10000 — отказ `503`).
+          minimum: 0
+          maximum: 86400000
+          examples:
+            - 120
+            - 4300
+        confidence:
+          $ref: '#/components/schemas/Confidence'
+        degraded:
+          type: boolean
+          description: |
+            Признак того, что котировка получена не по нормальному пути: из кеша,
+            от fallback-источника `INTERNAL`, при разорванном WebSocket-потоке или
+            при `confidence: LOW`. Пробрасывается в поле `degraded` нашей котировки
+            (канон §4.3) и показывается пользователю индикатором.
+          examples:
+            - false
+
+    RatesBatchResponse:
+      type: object
+      description: |
+        Ответ batch-запроса котировок. Частичный результат — валидный исход:
+        отсутствие одной пары не обнуляет полезные данные по остальным.
+      additionalProperties: false
+      required: [rates, requestedAt, partial, missingPairs, anyStale]
+      properties:
+        rates:
+          type: array
+          description: |
+            Полученные котировки. Порядок не соответствует порядку в query-параметре
+            `pairs` — сопоставляйте по `pairId`.
+          minItems: 0
+          maxItems: 50
+          items:
+            $ref: '#/components/schemas/RateQuote'
+        requestedAt:
+          allOf:
+            - $ref: '#/components/schemas/Timestamp'
+          description: |
+            Момент обработки запроса сервисом. Относительно него вычислены `staleAgeMs`
+            всех котировок в ответе — так все элементы batch сравнимы между собой.
+        partial:
+          type: boolean
+          description: |
+            `true`, если хотя бы одна запрошенная пара не попала в `rates`.
+            Эквивалентно `missingPairs.length > 0`; продублировано отдельным флагом,
+            чтобы клиент мог ветвиться одним сравнением.
+          examples:
+            - false
+        missingPairs:
+          type: array
+          description: |
+            Пары, по которым котировка не получена: пара не котируется, цена
+            отсутствует либо её возраст превысил `maxStalenessMs`. По каждой такой
+            паре BFF принимает решение самостоятельно — как правило
+            `PAIR_NOT_SUPPORTED` (422) для направления, выбранного пользователем.
+          minItems: 0
+          maxItems: 50
+          items:
+            $ref: '#/components/schemas/PairId'
+        anyStale:
+          type: boolean
+          description: |
+            `true`, если хотя бы одна котировка в `rates` имеет `stale: true`.
+            Позволяет одним сравнением решить, помечать ли всю котировку пользователя
+            `degraded: true` (канон §4.3).
+          examples:
+            - false
+
+    RateSourceHealth:
+      type: object
+      description: |
+        Состояние одного поставщика цены. Диагностические данные: наружу пользователю
+        не отдаются, используются алертингом и дежурной сменой.
+      additionalProperties: false
+      required: [source, status, lastSuccessAt, errorRatePercent, latencyP95Ms]
+      properties:
+        source:
+          $ref: '#/components/schemas/RateSource'
+        status:
+          $ref: '#/components/schemas/SourceStatus'
+        lastSuccessAt:
+          allOf:
+            - $ref: '#/components/schemas/Timestamp'
+          description: |
+            Момент последнего успешного получения цены от источника. Разрыв больше
+            10 с означает, что все котировки от него уже вышли за предел деградации.
+        errorRatePercent:
+          allOf:
+            - $ref: '#/components/schemas/PercentString'
+          description: |
+            Доля ошибочных опросов источника за скользящее окно 1 минута, **в процентах**,
+            строкой. Значение `"50.00"` совпадает с порогом circuit breaker канона §11.
+        latencyP95Ms:
+          type: integer
+          description: |
+            95-й перцентиль задержки ответа источника за окно 1 минута, в миллисекундах.
+            Ориентир: значение выше 800 мс делает источник непригодным для синхронного
+            пути построения котировки (таймаут S5).
+          minimum: 0
+          maximum: 60000
+          examples:
+            - 37
+
+    RateSourcesResponse:
+      type: object
+      description: Обёртка ответа о состоянии источников цены.
+      additionalProperties: false
+      required: [sources, evaluatedAt, primarySource]
+      properties:
+        sources:
+          type: array
+          description: Состояние всех известных поставщиков цены.
+          minItems: 1
+          maxItems: 32
+          items:
+            $ref: '#/components/schemas/RateSourceHealth'
+        evaluatedAt:
+          allOf:
+            - $ref: '#/components/schemas/Timestamp'
+          description: Момент, на который построен снимок состояния.
+        primarySource:
+          allOf:
+            - $ref: '#/components/schemas/RateSource'
+          description: |
+            Источник, который сейчас используется как основной. Смена основного
+            источника на `INTERNAL` означает, что все внешние поставщики недоступны
+            и котировки идут с `confidence: LOW` и `degraded: true`.
+
+    RatesServiceErrorCode:
+      type: string
+      description: |
+        Код ошибки **сервиса S5**. Это не наш код: BFF обязан отобразить его в код
+        каталога канона §7 перед отдачей наружу. Таблица маппинга:
+
+        | Код S5 | HTTP S5 | → наш код (канон §7) | HTTP наружу | Retryable |
+        |---|---|---|---|---|
+        | `VALIDATION_FAILED` | 400 | → `VALIDATION_ERROR` | 400 | нет |
+        | `UNAUTHENTICATED` | 401 | → `RATE_SERVICE_UNAVAILABLE` | 503 | да |
+        | `FORBIDDEN` | 403 | → `RATE_SERVICE_UNAVAILABLE` | 503 | да |
+        | `PAIR_NOT_QUOTED` | 404 | → `PAIR_NOT_SUPPORTED` | 422 | нет |
+        | `QUOTE_NOT_FOUND` | 404 | → `QUOTE_NOT_FOUND` | 404 | да |
+        | `RATE_DRIFT_EXCEEDED` | 409 | → `RATE_CHANGED` | 409 | да |
+        | `SOURCE_DISAGREEMENT` | 422 | → `RATE_SERVICE_UNAVAILABLE` | 503 | да |
+        | `RATE_LIMITED` | 429 | → `RATE_LIMITED` | 429 | да |
+        | `INTERNAL_ERROR` | 500 | → `RATE_SERVICE_UNAVAILABLE` | 503 | да |
+        | `RATE_STALE` | 503 | → `RATE_SERVICE_UNAVAILABLE` | 503 | да |
+        | `SERVICE_UNAVAILABLE` | 503 | → `RATE_SERVICE_UNAVAILABLE` | 503 | да |
+        | `UPSTREAM_TIMEOUT` | 504 | → `UPSTREAM_TIMEOUT` | 504 | да |
+        | *(таймаут клиента 800 мс / нет ответа)* | — | → `UPSTREAM_TIMEOUT` | 504 | да |
+
+        Отдельные пояснения:
+
+        * **`RATE_STALE`** возвращается, когда единственная доступная цена старше
+          **10 с** — предела деградации из канона §11. До 10 с сервис отдаёт `200`
+          с `stale: true` и `degraded: true`, а не ошибку.
+        * **`RATE_DRIFT_EXCEEDED`** — курс уехал больше чем на **0.20 %** (порог
+          канона §11) относительно значения, переданного клиентом в
+          `If-Rate-Matches`. Это шаг 10 цепочки валидации; наружу идёт
+          `RATE_CHANGED` (409) с баннером `Rate changed. Calculation updated.`
+        * **`PAIR_NOT_QUOTED` против `QUOTE_NOT_FOUND`**: первое — пара в принципе не
+          котируется (постоянный факт конфигурации), второе — пара котируется, но
+          цены сейчас нет (временное состояние). Отсюда разные наши коды и разная
+          retryability.
+
+        Ни при каких обстоятельствах код S5 не должен утечь во внешний ответ BFF:
+        фронтенд ветвится только по кодам канона §7.
+      enum:
+        - "VALIDATION_FAILED"
+        - "UNAUTHENTICATED"
+        - "FORBIDDEN"
+        - "PAIR_NOT_QUOTED"
+        - "QUOTE_NOT_FOUND"
+        - "RATE_DRIFT_EXCEEDED"
+        - "SOURCE_DISAGREEMENT"
+        - "RATE_LIMITED"
+        - "INTERNAL_ERROR"
+        - "RATE_STALE"
+        - "SERVICE_UNAVAILABLE"
+        - "UPSTREAM_TIMEOUT"
+      examples:
+        - "RATE_STALE"
+        - "PAIR_NOT_QUOTED"
+
+    RatesServiceError:
+      type: object
+      description: |
+        Собственный конверт ошибки сервиса S5. Отличается от нашего RFC 9457
+        Problem Details (канон §7) — BFF обязан выполнить преобразование, а не
+        пробрасывать этот объект наружу.
+      additionalProperties: false
+      required: [error, message, traceId, timestamp]
+      properties:
+        error:
+          $ref: '#/components/schemas/RatesServiceErrorCode'
+        message:
+          type: string
+          description: |
+            Человекочитаемое техническое описание на английском. Предназначено для
+            инженеров и логов, **не** для показа пользователю: наружу идёт текст из
+            каталога канона §7.
+          minLength: 1
+          maxLength: 512
+          examples:
+            - "No quote for pair EUR-USDT from any configured source"
+        traceId:
+          type: string
+          description: |
+            Идентификатор трассировки на стороне S5. Логируется BFF рядом со своим
+            `correlationId`, чтобы связать инцидент между сервисами.
+          minLength: 8
+          maxLength: 64
+          pattern: '^[0-9a-zA-Z_-]{8,64}$'
+          examples:
+            - "7c2e1a90b4d35f68"
+        timestamp:
+          allOf:
+            - $ref: '#/components/schemas/Timestamp'
+          description: Момент формирования ошибки на стороне S5.
+        details:
+          type: [object, 'null']
+          description: |
+            Структурированный контекст ошибки: идентификатор пары, возраст котировки,
+            величина дрейфа, состояние источников. Ключи и значения — строки, чтобы
+            курсы не потеряли точность (канон §5.1). Может быть `null`.
+          additionalProperties:
+            type: string
+            maxLength: 256
+          examples:
+            - pairId: "RUB-USDT"
+              staleAgeMs: "14200"
+              maxAllowedMs: "10000"
+            - pairId: "RUB-USDT"
+              quotedRate: "0.010638297872"
+              currentRate: "0.010612000000"
+              driftPercent: "0.2470"
+              thresholdPercent: "0.20"
+
+  responses:
+
+    BadRequest:
+      description: |
+        Некорректный запрос: не разобран CSV в `pairs`, значение `maxStalenessMs`
+        вне диапазона `0…10000`, неверный формат `pairId`.
+        Маппинг: `VALIDATION_FAILED` → наш `VALIDATION_ERROR` (400), не retryable.
+        Это дефект BFF, а не пользователя.
+      headers:
+        X-Correlation-Id:
+          $ref: '#/components/headers/XCorrelationId'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/RatesServiceError'
+          examples:
+            validationFailed:
+              $ref: '#/components/examples/ErrorValidationFailed'
+
+    Unauthorized:
+      description: |
+        Сервисный JWT отсутствует, просрочен или подпись неверна.
+        Маппинг: `UNAUTHENTICATED` → наш `RATE_SERVICE_UNAVAILABLE` (503) — для
+        пользователя это отказ инфраструктуры. Аналог в WebSocket — код закрытия
+        `4001`, после которого реконнект запрещён. Событие эскалируется дежурному.
+      headers:
+        X-Correlation-Id:
+          $ref: '#/components/headers/XCorrelationId'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/RatesServiceError'
+          examples:
+            unauthenticated:
+              $ref: '#/components/examples/ErrorUnauthenticated'
+
+    Forbidden:
+      description: |
+        Сервисный аккаунт аутентифицирован, но не имеет доступа к запрошенной паре
+        или ресурсу. Маппинг: `FORBIDDEN` → наш `RATE_SERVICE_UNAVAILABLE` (503).
+        Аналог в WebSocket — код закрытия `4003`, реконнект запрещён.
+      headers:
+        X-Correlation-Id:
+          $ref: '#/components/headers/XCorrelationId'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/RatesServiceError'
+          examples:
+            forbidden:
+              $ref: '#/components/examples/ErrorForbidden'
+
+    NotFound:
+      description: |
+        Котировка недоступна. Два разных кода с разными последствиями:
+
+        * `PAIR_NOT_QUOTED` → наш `PAIR_NOT_SUPPORTED` (422), **не** retryable —
+          пара в принципе не котируется (например `EUR-USDT`, канон §10.4);
+        * `QUOTE_NOT_FOUND` → наш `QUOTE_NOT_FOUND` (404), **retryable** —
+          пара котируется, но цены сейчас нет; баннер `Rate expired. Refreshing…`,
+          шаг 6 цепочки валидации.
+      headers:
+        X-Correlation-Id:
+          $ref: '#/components/headers/XCorrelationId'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/RatesServiceError'
+          examples:
+            pairNotQuoted:
+              $ref: '#/components/examples/ErrorPairNotQuoted'
+            quoteNotFound:
+              $ref: '#/components/examples/ErrorQuoteNotFound'
+
+    Conflict:
+      description: |
+        Курс изменился сильнее допустимого порога **0.20 %** (канон §11) относительно
+        значения, переданного клиентом в заголовке `If-Rate-Matches`.
+        Маппинг: `RATE_DRIFT_EXCEEDED` → наш `RATE_CHANGED` (409), retryable,
+        баннер `Rate changed. Calculation updated.`
+
+        Это шаг 10 цепочки валидации (канон §6). BFF обязан пересчитать котировку
+        по новому курсу и предложить пользователю подтвердить заново — молча
+        исполнять по изменившемуся курсу запрещено.
+        Сценарий прототипа — `RATE_DRIFT` (канон §10.6).
+      headers:
+        X-Correlation-Id:
+          $ref: '#/components/headers/XCorrelationId'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/RatesServiceError'
+          examples:
+            rateDriftExceeded:
+              $ref: '#/components/examples/ErrorRateDriftExceeded'
+
+    UnprocessableEntity:
+      description: |
+        Данные получены, но непригодны: источники расходятся сильнее допустимого,
+        цена не прошла контроль качества.
+        Маппинг: `SOURCE_DISAGREEMENT` → наш `RATE_SERVICE_UNAVAILABLE` (503), retryable.
+        Наружу отдаётся как отказ сервиса, а не как ошибка пользователя: пользователь
+        не может ничего исправить своими действиями.
+      headers:
+        X-Correlation-Id:
+          $ref: '#/components/headers/XCorrelationId'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/RatesServiceError'
+          examples:
+            sourceDisagreement:
+              $ref: '#/components/examples/ErrorSourceDisagreement'
+
+    TooManyRequests:
+      description: |
+        Превышен лимит частоты запросов сервисного аккаунта.
+        Маппинг: `RATE_LIMITED` → наш `RATE_LIMITED` (429), retryable.
+        BFF обязан уважать `Retry-After` и не засчитывать ответ circuit breaker'у.
+        Аналог в WebSocket — код закрытия `4029`.
+
+        Частая причина — недостаточный дебаунс ввода на клиенте: канон §11 требует
+        300 мс.
+      headers:
+        X-Correlation-Id:
+          $ref: '#/components/headers/XCorrelationId'
+        Retry-After:
+          $ref: '#/components/headers/RetryAfter'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/RatesServiceError'
+          examples:
+            rateLimited:
+              $ref: '#/components/examples/ErrorRateLimited'
+
+    InternalServerError:
+      description: |
+        Внутренний сбой S5.
+        Маппинг: `INTERNAL_ERROR` → наш `RATE_SERVICE_UNAVAILABLE` (503), retryable.
+        Порядок действий BFF: взять последнюю котировку из кеша; если её возраст
+        ≤ 10 с — использовать с `degraded: true`, иначе отказать.
+        Ответ учитывается circuit breaker. Аналог в WebSocket — код закрытия `1011`.
+      headers:
+        X-Correlation-Id:
+          $ref: '#/components/headers/XCorrelationId'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/RatesServiceError'
+          examples:
+            internalError:
+              $ref: '#/components/examples/ErrorInternal'
+
+    ServiceUnavailable:
+      description: |
+        Котировки недоступны. Два кода:
+
+        * `RATE_STALE` — единственная имеющаяся цена старше предела деградации
+          **10 с** (канон §11);
+        * `SERVICE_UNAVAILABLE` — сервис в целом недоступен (деплой, перегрузка,
+          отказ всех источников).
+
+        Оба → наш `RATE_SERVICE_UNAVAILABLE` (503), retryable, баннер
+        `Rates are temporarily unavailable`. Заявка не создаётся.
+        Сценарий прототипа — `RATES_DOWN` (канон §10.6).
+      headers:
+        X-Correlation-Id:
+          $ref: '#/components/headers/XCorrelationId'
+        Retry-After:
+          $ref: '#/components/headers/RetryAfter'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/RatesServiceError'
+          examples:
+            rateStale:
+              $ref: '#/components/examples/ErrorRateStale'
+            serviceUnavailable:
+              $ref: '#/components/examples/ErrorServiceUnavailable'
+
+    GatewayTimeout:
+      description: |
+        S5 не ответил в отведённые **800 мс** (канон §11) либо сам не дождался
+        источника цены.
+        Маппинг: `UPSTREAM_TIMEOUT` → наш `UPSTREAM_TIMEOUT` (504), retryable.
+        Ретрай разрешён (все операции — идемпотентные `GET`, максимум 2 попытки,
+        экспоненциальный backoff + jitter), но суммарное время попыток обязано
+        уложиться в бюджет `POST /v1/exchange-quotes` (p95 ≤ 300 мс) — на практике
+        это означает не более одной дополнительной попытки на синхронном пути.
+      headers:
+        X-Correlation-Id:
+          $ref: '#/components/headers/XCorrelationId'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/RatesServiceError'
+          examples:
+            upstreamTimeout:
+              $ref: '#/components/examples/ErrorUpstreamTimeout'
+
+  examples:
+
+    RateRubUsdt:
+      summary: RUB→USDT — дефолтная пара экрана (канон §10.3)
+      description: |
+        `rate = "0.010638297872"` ⇔ «1 USDT = 94.00 RUB». Применяемый курс равен
+        `bid`; `ask = 1/93.60` отражает противоположную сторону стакана, из-за чего
+        обратная пара `USDT→RUB` котируется как `93.60`, а не как `94.00`
+        (заложенный спред, канон §10.3).
+      value:
+        pairId: "RUB-USDT"
+        fromAsset: { assetId: "RUB", network: null }
+        toAsset: { assetId: "USDT", network: null }
+        bid: "0.010638297872"
+        ask: "0.010683760684"
+        mid: "0.010661029278"
+        rate: "0.010638297872"
+        inverseRate: "94.00"
+        spreadBps: 43
+        precision: 12
+        source: "AGGREGATED"
+        sourceLatencyMs: 42
+        quotedAt: "2026-08-07T10:15:32.000Z"
+        receivedAt: "2026-08-07T10:15:32.042Z"
+        ttlMs: 1000
+        expiresAt: "2026-08-07T10:15:33.000Z"
+        stale: false
+        staleAgeMs: 117
+        confidence: "HIGH"
+        degraded: false
+
+    RateUsdtRub:
+      summary: USDT→RUB — обратное направление котируется независимо
+      description: |
+        `rate = "93.60"` (канон §10.3). Пара **не** является обратной к `RUB→USDT`:
+        `1/0.010638297872 = 94.00 ≠ 93.60`. Разница — тот самый спред, который
+        показывает, что котировки приходят из реального источника с bid/ask,
+        а не вычисляются делением.
+
+        `inverseRate = "0.01"` — вырожденный случай правила «ROUND_HALF_UP, 2 знака»
+        (канон §5.4): для этого направления UI показывает прямой курс, а `inverseRate`
+        не отображает.
+      value:
+        pairId: "USDT-RUB"
+        fromAsset: { assetId: "USDT", network: null }
+        toAsset: { assetId: "RUB", network: null }
+        bid: "93.60"
+        ask: "94.00"
+        mid: "93.80"
+        rate: "93.60"
+        inverseRate: "0.01"
+        spreadBps: 43
+        precision: 2
+        source: "AGGREGATED"
+        sourceLatencyMs: 39
+        quotedAt: "2026-08-07T10:15:32.000Z"
+        receivedAt: "2026-08-07T10:15:32.039Z"
+        ttlMs: 1000
+        expiresAt: "2026-08-07T10:15:33.000Z"
+        stale: false
+        staleAgeMs: 117
+        confidence: "HIGH"
+        degraded: false
+
+    RateBtcUsdt:
+      summary: BTC→USDT — крипто-крипто, источник BINANCE
+      description: |
+        `rate = "66200.00"` (канон §10.3). Обратное направление `USDT→BTC`
+        котируется как `0.0000150`, то есть 1 BTC ≈ 66 667 USDT — снова заложенный спред.
+        `inverseRate = "0.00"` — вырожденный результат правила 2 знаков, в UI не
+        отображается.
+      value:
+        pairId: "BTC-USDT"
+        fromAsset: { assetId: "BTC", network: null }
+        toAsset: { assetId: "USDT", network: null }
+        bid: "66200.00"
+        ask: "66666.666666"
+        mid: "66433.333333"
+        rate: "66200.00"
+        inverseRate: "0.00"
+        spreadBps: 70
+        precision: 2
+        source: "BINANCE"
+        sourceLatencyMs: 61
+        quotedAt: "2026-08-07T10:15:32.000Z"
+        receivedAt: "2026-08-07T10:15:32.061Z"
+        ttlMs: 1000
+        expiresAt: "2026-08-07T10:15:33.000Z"
+        stale: false
+        staleAgeMs: 130
+        confidence: "HIGH"
+        degraded: false
+
+    RateStaleDegraded:
+      summary: Котировка в зоне деградации (возраст 4.3 с)
+      description: |
+        Возраст `4300 мс` попадает в интервал `1 000 … 10 000 мс` канона §11:
+        котировка помечена `stale: true` и `degraded: true`, но использовать её
+        **можно**. Наша котировка (канон §4.3) наследует `degraded: true`,
+        в UI показывается индикатор устаревания. Источник переключён на
+        fallback `INTERNAL`, поэтому `confidence` понижен до `MEDIUM`.
+      value:
+        pairId: "RUB-USDT"
+        fromAsset: { assetId: "RUB", network: null }
+        toAsset: { assetId: "USDT", network: null }
+        bid: "0.010638297872"
+        ask: "0.010683760684"
+        mid: "0.010661029278"
+        rate: "0.010638297872"
+        inverseRate: "94.00"
+        spreadBps: 43
+        precision: 12
+        source: "INTERNAL"
+        sourceLatencyMs: 8
+        quotedAt: "2026-08-07T10:15:28.000Z"
+        receivedAt: "2026-08-07T10:15:28.008Z"
+        ttlMs: 1000
+        expiresAt: "2026-08-07T10:15:29.000Z"
+        stale: true
+        staleAgeMs: 4300
+        confidence: "MEDIUM"
+        degraded: true
+
+    RatesAllPairs:
+      summary: Batch — все восемь пар из фикстур канона §10.3
+      description: |
+        Полный набор курсов прототипа. Обратите внимание на намеренный спред между
+        прямым и обратным направлением: `RUB→USDT` даёт 94.00 RUB за USDT,
+        а `USDT→RUB` — 93.60 RUB за USDT.
+      value:
+        rates:
+          - pairId: "RUB-USDT"
+            fromAsset: { assetId: "RUB", network: null }
+            toAsset: { assetId: "USDT", network: null }
+            bid: "0.010638297872"
+            ask: "0.010683760684"
+            mid: "0.010661029278"
+            rate: "0.010638297872"
+            inverseRate: "94.00"
+            spreadBps: 43
+            precision: 12
+            source: "AGGREGATED"
+            sourceLatencyMs: 42
+            quotedAt: "2026-08-07T10:15:32.000Z"
+            receivedAt: "2026-08-07T10:15:32.042Z"
+            ttlMs: 1000
+            expiresAt: "2026-08-07T10:15:33.000Z"
+            stale: false
+            staleAgeMs: 117
+            confidence: "HIGH"
+            degraded: false
+          - pairId: "USDT-RUB"
+            fromAsset: { assetId: "USDT", network: null }
+            toAsset: { assetId: "RUB", network: null }
+            bid: "93.60"
+            ask: "94.00"
+            mid: "93.80"
+            rate: "93.60"
+            inverseRate: "0.01"
+            spreadBps: 43
+            precision: 2
+            source: "AGGREGATED"
+            sourceLatencyMs: 39
+            quotedAt: "2026-08-07T10:15:32.000Z"
+            receivedAt: "2026-08-07T10:15:32.039Z"
+            ttlMs: 1000
+            expiresAt: "2026-08-07T10:15:33.000Z"
+            stale: false
+            staleAgeMs: 117
+            confidence: "HIGH"
+            degraded: false
+          - pairId: "RUB-BTC"
+            fromAsset: { assetId: "RUB", network: null }
+            toAsset: { assetId: "BTC", network: null }
+            bid: "0.00000016"
+            ask: "0.000000160640"
+            mid: "0.000000160320"
+            rate: "0.00000016"
+            inverseRate: "6250000.00"
+            spreadBps: 40
+            precision: 8
+            source: "AGGREGATED"
+            sourceLatencyMs: 55
+            quotedAt: "2026-08-07T10:15:32.000Z"
+            receivedAt: "2026-08-07T10:15:32.055Z"
+            ttlMs: 1000
+            expiresAt: "2026-08-07T10:15:33.000Z"
+            stale: false
+            staleAgeMs: 121
+            confidence: "HIGH"
+            degraded: false
+          - pairId: "USDT-BTC"
+            fromAsset: { assetId: "USDT", network: null }
+            toAsset: { assetId: "BTC", network: null }
+            bid: "0.0000150"
+            ask: "0.000015105740"
+            mid: "0.000015052870"
+            rate: "0.0000150"
+            inverseRate: "66666.67"
+            spreadBps: 70
+            precision: 7
+            source: "BINANCE"
+            sourceLatencyMs: 58
+            quotedAt: "2026-08-07T10:15:32.000Z"
+            receivedAt: "2026-08-07T10:15:32.058Z"
+            ttlMs: 1000
+            expiresAt: "2026-08-07T10:15:33.000Z"
+            stale: false
+            staleAgeMs: 124
+            confidence: "HIGH"
+            degraded: false
+          - pairId: "USDT-ETH"
+            fromAsset: { assetId: "USDT", network: null }
+            toAsset: { assetId: "ETH", network: null }
+            bid: "0.000410"
+            ask: "0.000413223140"
+            mid: "0.000411611570"
+            rate: "0.000410"
+            inverseRate: "2439.02"
+            spreadBps: 78
+            precision: 6
+            source: "BINANCE"
+            sourceLatencyMs: 57
+            quotedAt: "2026-08-07T10:15:32.000Z"
+            receivedAt: "2026-08-07T10:15:32.057Z"
+            ttlMs: 1000
+            expiresAt: "2026-08-07T10:15:33.000Z"
+            stale: false
+            staleAgeMs: 125
+            confidence: "HIGH"
+            degraded: false
+          - pairId: "BTC-USDT"
+            fromAsset: { assetId: "BTC", network: null }
+            toAsset: { assetId: "USDT", network: null }
+            bid: "66200.00"
+            ask: "66666.666666"
+            mid: "66433.333333"
+            rate: "66200.00"
+            inverseRate: "0.00"
+            spreadBps: 70
+            precision: 2
+            source: "BINANCE"
+            sourceLatencyMs: 61
+            quotedAt: "2026-08-07T10:15:32.000Z"
+            receivedAt: "2026-08-07T10:15:32.061Z"
+            ttlMs: 1000
+            expiresAt: "2026-08-07T10:15:33.000Z"
+            stale: false
+            staleAgeMs: 130
+            confidence: "HIGH"
+            degraded: false
+          - pairId: "ETH-USDT"
+            fromAsset: { assetId: "ETH", network: null }
+            toAsset: { assetId: "USDT", network: null }
+            bid: "2420.00"
+            ask: "2439.024390"
+            mid: "2429.512195"
+            rate: "2420.00"
+            inverseRate: "0.00"
+            spreadBps: 78
+            precision: 2
+            source: "BINANCE"
+            sourceLatencyMs: 60
+            quotedAt: "2026-08-07T10:15:32.000Z"
+            receivedAt: "2026-08-07T10:15:32.060Z"
+            ttlMs: 1000
+            expiresAt: "2026-08-07T10:15:33.000Z"
+            stale: false
+            staleAgeMs: 131
+            confidence: "HIGH"
+            degraded: false
+          - pairId: "RUB-EUR"
+            fromAsset: { assetId: "RUB", network: null }
+            toAsset: { assetId: "EUR", network: null }
+            bid: "0.0098"
+            ask: "0.009839"
+            mid: "0.0098195"
+            rate: "0.0098"
+            inverseRate: "102.04"
+            spreadBps: 40
+            precision: 4
+            source: "CBR"
+            sourceLatencyMs: 88
+            quotedAt: "2026-08-07T10:15:31.000Z"
+            receivedAt: "2026-08-07T10:15:31.088Z"
+            ttlMs: 1000
+            expiresAt: "2026-08-07T10:15:32.000Z"
+            stale: false
+            staleAgeMs: 900
+            confidence: "MEDIUM"
+            degraded: false
+        requestedAt: "2026-08-07T10:15:32.117Z"
+        partial: false
+        missingPairs: []
+        anyStale: false
+
+    RatesPartial:
+      summary: Batch — частичный результат, пара EUR→USDT не котируется
+      description: |
+        Запрошены `RUB-USDT,EUR-USDT`. Вторая пара не котируется вовсе (канон §10.4:
+        направление `EUR→*` намеренно не поддерживается), поэтому попадает
+        в `missingPairs`, а ответ помечен `partial: true`.
+
+        Batch-эндпоинт **не** возвращает `404`: результат по первой паре полезен.
+        По отсутствующей паре BFF отдаёт наружу `PAIR_NOT_SUPPORTED` (422),
+        не retryable.
+      value:
+        rates:
+          - pairId: "RUB-USDT"
+            fromAsset: { assetId: "RUB", network: null }
+            toAsset: { assetId: "USDT", network: null }
+            bid: "0.010638297872"
+            ask: "0.010683760684"
+            mid: "0.010661029278"
+            rate: "0.010638297872"
+            inverseRate: "94.00"
+            spreadBps: 43
+            precision: 12
+            source: "AGGREGATED"
+            sourceLatencyMs: 42
+            quotedAt: "2026-08-07T10:15:32.000Z"
+            receivedAt: "2026-08-07T10:15:32.042Z"
+            ttlMs: 1000
+            expiresAt: "2026-08-07T10:15:33.000Z"
+            stale: false
+            staleAgeMs: 117
+            confidence: "HIGH"
+            degraded: false
+        requestedAt: "2026-08-07T10:15:32.117Z"
+        partial: true
+        missingPairs:
+          - "EUR-USDT"
+        anyStale: false
+
+    RatesDegraded:
+      summary: Batch — все котировки устарели, работа в режиме деградации
+      description: |
+        Внешние источники недоступны, отдаются кешированные цены возрастом ~6 с.
+        Это в пределах 10 с (канон §11), поэтому котировки пригодны, но `anyStale: true`
+        и каждая помечена `degraded: true`. Наша котировка наследует
+        `degraded: true` (канон §4.3). При дальнейшем росте возраста сверх 10 с
+        сервис перейдёт на `RATE_STALE` (503) → `RATE_SERVICE_UNAVAILABLE`.
+      value:
+        rates:
+          - pairId: "RUB-USDT"
+            fromAsset: { assetId: "RUB", network: null }
+            toAsset: { assetId: "USDT", network: null }
+            bid: "0.010638297872"
+            ask: "0.010683760684"
+            mid: "0.010661029278"
+            rate: "0.010638297872"
+            inverseRate: "94.00"
+            spreadBps: 43
+            precision: 12
+            source: "INTERNAL"
+            sourceLatencyMs: 6
+            quotedAt: "2026-08-07T10:15:26.000Z"
+            receivedAt: "2026-08-07T10:15:26.006Z"
+            ttlMs: 1000
+            expiresAt: "2026-08-07T10:15:27.000Z"
+            stale: true
+            staleAgeMs: 6117
+            confidence: "LOW"
+            degraded: true
+        requestedAt: "2026-08-07T10:15:32.117Z"
+        partial: false
+        missingPairs: []
+        anyStale: true
+
+    SourcesHealthy:
+      summary: Все источники в норме
+      description: |
+        Основной источник — `AGGREGATED`. Доли ошибок далеко от порога circuit breaker
+        (50 % на окне 20 запросов, канон §11), задержки укладываются в таймаут 800 мс.
+      value:
+        sources:
+          - source: "AGGREGATED"
+            status: "UP"
+            lastSuccessAt: "2026-08-07T10:15:32.100Z"
+            errorRatePercent: "0.12"
+            latencyP95Ms: 37
+          - source: "BINANCE"
+            status: "UP"
+            lastSuccessAt: "2026-08-07T10:15:32.090Z"
+            errorRatePercent: "0.40"
+            latencyP95Ms: 64
+          - source: "CBR"
+            status: "UP"
+            lastSuccessAt: "2026-08-07T10:15:31.500Z"
+            errorRatePercent: "0"
+            latencyP95Ms: 112
+          - source: "INTERNAL"
+            status: "UP"
+            lastSuccessAt: "2026-08-07T10:15:32.110Z"
+            errorRatePercent: "0"
+            latencyP95Ms: 6
+        evaluatedAt: "2026-08-07T10:15:32.117Z"
+        primarySource: "AGGREGATED"
+
+    SourcesOneDown:
+      summary: Внешние источники деградировали, работает fallback INTERNAL
+      description: |
+        `BINANCE` не отвечает, `AGGREGATED` деградировал (доля ошибок 62 % — выше порога
+        circuit breaker 50 %), основным стал `INTERNAL`. Следствие: котировки идут
+        с `confidence: LOW` и `degraded: true`, а S4 может выключить затронутые пары
+        с `disabledReason: RATE_SOURCE_DOWN`.
+      value:
+        sources:
+          - source: "AGGREGATED"
+            status: "DEGRADED"
+            lastSuccessAt: "2026-08-07T10:15:28.400Z"
+            errorRatePercent: "62.50"
+            latencyP95Ms: 780
+          - source: "BINANCE"
+            status: "DOWN"
+            lastSuccessAt: "2026-08-07T10:14:03.220Z"
+            errorRatePercent: "100.00"
+            latencyP95Ms: 60000
+          - source: "CBR"
+            status: "UP"
+            lastSuccessAt: "2026-08-07T10:15:31.500Z"
+            errorRatePercent: "0"
+            latencyP95Ms: 118
+          - source: "INTERNAL"
+            status: "UP"
+            lastSuccessAt: "2026-08-07T10:15:32.110Z"
+            errorRatePercent: "0"
+            latencyP95Ms: 6
+        evaluatedAt: "2026-08-07T10:15:32.117Z"
+        primarySource: "INTERNAL"
+
+    ErrorValidationFailed:
+      summary: 400 — некорректный параметр запроса
+      description: "Маппинг: `VALIDATION_FAILED` → наш `VALIDATION_ERROR` (400), не retryable."
+      value:
+        error: "VALIDATION_FAILED"
+        message: "Query parameter 'maxStalenessMs' must be between 0 and 10000"
+        traceId: "1a2b3c4d5e6f7081"
+        timestamp: "2026-08-07T10:15:32.117Z"
+        details:
+          parameter: "maxStalenessMs"
+          received: "60000"
+          maximum: "10000"
+
+    ErrorUnauthenticated:
+      summary: 401 — сервисный токен невалиден
+      description: |
+        Маппинг: `UNAUTHENTICATED` → наш `RATE_SERVICE_UNAVAILABLE` (503).
+        Аналог в WebSocket — код закрытия `4001`, реконнект запрещён.
+      value:
+        error: "UNAUTHENTICATED"
+        message: "Service JWT signature verification failed"
+        traceId: "2b3c4d5e6f708192"
+        timestamp: "2026-08-07T10:15:32.117Z"
+        details: null
+
+    ErrorForbidden:
+      summary: 403 — доступ к паре или ресурсу запрещён
+      description: |
+        Маппинг: `FORBIDDEN` → наш `RATE_SERVICE_UNAVAILABLE` (503).
+        Аналог в WebSocket — код закрытия `4003`, реконнект запрещён.
+      value:
+        error: "FORBIDDEN"
+        message: "Service account svc:exchange-bff is not entitled to pair BTC-ETH"
+        traceId: "3c4d5e6f708192a3"
+        timestamp: "2026-08-07T10:15:32.117Z"
+        details:
+          pairId: "BTC-ETH"
+
+    ErrorPairNotQuoted:
+      summary: 404 — пара в принципе не котируется
+      description: |
+        Маппинг: `PAIR_NOT_QUOTED` → наш `PAIR_NOT_SUPPORTED` (422), **не** retryable.
+        Канон §10.4: направление `EUR→*` намеренно не поддерживается.
+        Сообщение пользователю — `This pair is not available right now`,
+        крепится к селектору активов.
+      value:
+        error: "PAIR_NOT_QUOTED"
+        message: "Pair EUR-USDT is not quoted by any configured source"
+        traceId: "4d5e6f708192a3b4"
+        timestamp: "2026-08-07T10:15:32.117Z"
+        details:
+          pairId: "EUR-USDT"
+
+    ErrorQuoteNotFound:
+      summary: 404 — пара котируется, но цены сейчас нет
+      description: |
+        Маппинг: `QUOTE_NOT_FOUND` → наш `QUOTE_NOT_FOUND` (404), **retryable**.
+        Шаг 6 цепочки валидации, баннер `Rate expired. Refreshing…`.
+        Отличие от `PAIR_NOT_QUOTED`: здесь состояние временное, ретрай осмыслен.
+      value:
+        error: "QUOTE_NOT_FOUND"
+        message: "No fresh quote for pair RUB-USDT; last known price was evicted"
+        traceId: "5e6f708192a3b4c5"
+        timestamp: "2026-08-07T10:15:32.117Z"
+        details:
+          pairId: "RUB-USDT"
+
+    ErrorRateDriftExceeded:
+      summary: 409 — курс уехал больше чем на 0.20 %
+      description: |
+        Маппинг: `RATE_DRIFT_EXCEEDED` → наш `RATE_CHANGED` (409), retryable.
+        Шаг 10 цепочки валидации, порог дрейфа 0.20 % из канона §11.
+        Баннер `Rate changed. Calculation updated.` BFF пересчитывает котировку
+        и требует повторного подтверждения. Сценарий прототипа — `RATE_DRIFT`.
+      value:
+        error: "RATE_DRIFT_EXCEEDED"
+        message: "Rate moved 0.2470% since quote, threshold is 0.20%"
+        traceId: "6f708192a3b4c5d6"
+        timestamp: "2026-08-07T10:15:32.117Z"
+        details:
+          pairId: "RUB-USDT"
+          quotedRate: "0.010638297872"
+          currentRate: "0.010612000000"
+          driftPercent: "0.2470"
+          thresholdPercent: "0.20"
+
+    ErrorSourceDisagreement:
+      summary: 422 — источники расходятся сильнее допустимого
+      description: |
+        Маппинг: `SOURCE_DISAGREEMENT` → наш `RATE_SERVICE_UNAVAILABLE` (503), retryable.
+        Отдаём как отказ сервиса: пользователь не может исправить это своими действиями.
+      value:
+        error: "SOURCE_DISAGREEMENT"
+        message: "Sources disagree by 3.10%, quality gate threshold is 1.00%"
+        traceId: "708192a3b4c5d6e7"
+        timestamp: "2026-08-07T10:15:32.117Z"
+        details:
+          pairId: "BTC-USDT"
+          divergencePercent: "3.10"
+          thresholdPercent: "1.00"
+
+    ErrorRateLimited:
+      summary: 429 — превышена частота запросов
+      description: |
+        Маппинг: `RATE_LIMITED` → наш `RATE_LIMITED` (429), retryable.
+        Аналог в WebSocket — код закрытия `4029`. Частая причина — недостаточный
+        дебаунс ввода на клиенте (канон §11 требует 300 мс).
+      value:
+        error: "RATE_LIMITED"
+        message: "Rate limit of 2000 rps exceeded for service account svc:exchange-bff"
+        traceId: "8192a3b4c5d6e7f8"
+        timestamp: "2026-08-07T10:15:32.117Z"
+        details:
+          limit: "2000"
+          window: "1s"
+          retryAfterSeconds: "1"
+
+    ErrorInternal:
+      summary: 500 — внутренний сбой S5
+      description: |
+        Маппинг: `INTERNAL_ERROR` → наш `RATE_SERVICE_UNAVAILABLE` (503), retryable.
+        BFF пытается использовать кешированную котировку возрастом ≤ 10 с
+        с `degraded: true`; иначе отказывает.
+      value:
+        error: "INTERNAL_ERROR"
+        message: "Unhandled exception in quote aggregation pipeline"
+        traceId: "92a3b4c5d6e7f809"
+        timestamp: "2026-08-07T10:15:32.117Z"
+        details: null
+
+    ErrorRateStale:
+      summary: 503 — единственная цена старше предела деградации 10 с
+      description: |
+        Маппинг: `RATE_STALE` → наш `RATE_SERVICE_UNAVAILABLE` (503), retryable.
+        Канон §11: курсы отдаются с `degraded: true` до 10 с, дальше `503`.
+        Баннер `Rates are temporarily unavailable`, заявка не создаётся.
+        Сценарий прототипа — `RATES_DOWN` (канон §10.6).
+      value:
+        error: "RATE_STALE"
+        message: "Latest quote for RUB-USDT is 14200 ms old, exceeds 10000 ms degradation limit"
+        traceId: "a3b4c5d6e7f80912"
+        timestamp: "2026-08-07T10:15:32.117Z"
+        details:
+          pairId: "RUB-USDT"
+          staleAgeMs: "14200"
+          maxAllowedMs: "10000"
+          lastQuotedAt: "2026-08-07T10:15:17.917Z"
+
+    ErrorServiceUnavailable:
+      summary: 503 — сервис котировок недоступен
+      description: |
+        Маппинг: `SERVICE_UNAVAILABLE` → наш `RATE_SERVICE_UNAVAILABLE` (503), retryable.
+        Все внешние источники недоступны, fallback `INTERNAL` тоже пуст.
+      value:
+        error: "SERVICE_UNAVAILABLE"
+        message: "All price sources are down; internal book is empty"
+        traceId: "b4c5d6e7f8091223"
+        timestamp: "2026-08-07T10:15:32.117Z"
+        details:
+          retryAfterSeconds: "1"
+          primarySource: "INTERNAL"
+
+    ErrorUpstreamTimeout:
+      summary: 504 — превышен таймаут 800 мс
+      description: |
+        Маппинг: `UPSTREAM_TIMEOUT` → наш `UPSTREAM_TIMEOUT` (504), retryable.
+        Ретрай безопасен (идемпотентный `GET`), но суммарное время попыток обязано
+        уложиться в бюджет `POST /v1/exchange-quotes` (p95 ≤ 300 мс).
+      value:
+        error: "UPSTREAM_TIMEOUT"
+        message: "Price source did not respond within 800 ms"
+        traceId: "c5d6e7f809122334"
+        timestamp: "2026-08-07T10:15:32.117Z"
+        details:
+          timeoutMs: "800"
+          source: "BINANCE"

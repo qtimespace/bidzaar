@@ -1,0 +1,2203 @@
+openapi: 3.1.0
+
+info:
+  title: KYC Service API (S2, WebID) — Integration Stub
+  version: "1.0.0"
+  summary: Контракт входящих данных от KYC-провайдера (WebID) в Exchange BFF
+  description: |
+    # KYC Service (S2, WebID) — стаб внешнего контракта
+
+    Документ описывает **входящую к нам** информацию: что Exchange BFF **получает** от
+    KYC-сервиса. Это НЕ спецификация на реализацию провайдера. Цель — зафиксировать
+    форму данных, семантику уровней верификации, контракт webhook и маппинг ошибок
+    в канонический каталог (`docs/00-canonical-model.md` §7).
+
+    ## ASSUMPTION-01 — идентификация вендора
+
+    Заказчик в исходных материалах написал «**welID**». Точного продукта с таким
+    названием на рынке KYC-провайдеров идентифицировать не удалось. **Наиболее
+    вероятно** имелся в виду **WebID Solutions GmbH** (немецкий провайдер удалённой
+    идентификации: VideoIdent, AutoIdent, eID) — совпадение по звучанию и по профилю
+    задачи (верификация физических лиц для финансовых сервисов).
+
+    **Это предположение, а не установленный факт.** Контракт спроектирован по типовой
+    модели такого провайдера:
+
+    * асинхронная **сессия верификации** (создаётся, пользователь проходит по redirect,
+      результат приходит позже);
+    * **webhook** об изменении статуса;
+    * дискретные **уровни** верификации с сроком действия.
+
+    Если вендор окажется другим, **форма контракта сохраняется** (сессия + webhook +
+    уровни — это индустриальный стандарт: Sumsub, Onfido, IDnow, Veriff устроены так же),
+    меняется только **маппинг имён полей и кодов** в адаптере S2 внутри Exchange BFF.
+    Именно поэтому доменная модель `KycStatus` намеренно не копирует вендорские имена,
+    а описана в терминах нашего домена.
+
+    Требуется подтверждение заказчика. До подтверждения слой адаптера должен быть
+    изолирован и покрыт контрактными тестами по этому файлу.
+
+    ## Назначение
+
+    KYC Service — источник правды об уровне верификации личности: текущий уровень,
+    статус процесса, срок действия, разрешённые операции, результаты санкционного
+    и PEP-скрининга, причины отказов.
+
+    ## Место в цепочке валидации (канон §6)
+
+    Используется на **шаге 14** — «KYC-уровень достаточен и не истёк». Провал даёт
+    `KYC_REQUIRED`, `KYC_LEVEL_INSUFFICIENT`, `KYC_PENDING` или `KYC_EXPIRED` (все 403).
+    Шаг 14 идёт ПОСЛЕ проверки статуса пользователя (шаг 13) и ДО лимитов (шаг 15),
+    скоринга (шаг 16) и баланса (шаг 17) — принцип Compliance First (канон §6).
+
+    Синхронно на пути создания заявки BFF читает **только**
+    `GET /v1/kyc/users/{userId}/status`. Остальные эндпоинты используются вне
+    критического пути: создание сессии — при переходе пользователя на верификацию,
+    статус сессии — на экране прохождения, метаданные документов — в комплаенс-контуре.
+
+    ## Критичность (канон §3)
+
+    **Blocking.** Отказ KYC Service означает, что заявка **не создаётся**:
+    `EXCHANGE_SERVICE_UNAVAILABLE` (503) или `UPSTREAM_TIMEOUT` (504).
+
+    ## Таймауты и ретраи (канон §11)
+
+    * Таймаут вызова: **1 000 мс** (общий бюджет S1/S2/S3/S4, вызовы параллельны).
+    * Ретраи: только идемпотентные `GET` — 2 попытки, экспоненциальный backoff + jitter.
+      `POST /v1/kyc/sessions` ретраится **только** при наличии `Idempotency-Key`.
+    * Circuit breaker: 50 % ошибок на окне 20 запросов, open 30 с.
+
+    ## Кеширование — 30 секунд, БЕЗ stale
+
+    Канон §11, таблица кеширования: KYC-статус — TTL **30 с**, стратегия при
+    недоступности источника — «**не** отдаём устаревший — блокируем».
+
+    Это жёсткое правило. **Отдавать stale KYC ЗАПРЕЩЕНО.** Обоснование: KYC-статус может
+    быть отозван в любой момент (санкционное попадание, истечение документа, решение
+    комплаенса). Работа по протухшей копии означает проведение операции для пользователя,
+    которому это уже запрещено — регуляторный риск, несопоставимый с неудобством отказа.
+
+    Практическое следствие: при недоступности S2 операция **блокируется**, даже если
+    30 секунд назад статус был `APPROVED`.
+
+    ## Поведение при недоступности
+
+    | Ситуация | Что делает BFF | Код наружу |
+    |----------|----------------|------------|
+    | Кеш свежий (< 30 с) | использует кеш | — |
+    | Кеш протух, S2 недоступен | **блокирует**, stale не используется | `EXCHANGE_SERVICE_UNAVAILABLE` (503) |
+    | Таймаут 1 000 мс | 2 ретрая, затем блокировка | `UPSTREAM_TIMEOUT` (504) |
+    | Circuit breaker open | немедленная блокировка | `EXCHANGE_SERVICE_UNAVAILABLE` (503) |
+
+    ## Ограничения по PII и биометрии
+
+    * **Содержимое документов** (сканы, фотографии страниц), **видеозаписи сессий**,
+      **биометрические шаблоны** и **liveness-артефакты НИКОГДА не передаются в
+      Exchange BFF** и не логируются. Эти данные остаются в контуре провайдера.
+    * Эндпоинт `/documents` возвращает **только метаданные**: тип документа, страна
+      выдачи, срок действия, факт верификации. Ни номера документа, ни изображений.
+    * `rejectionReasons[].reason` может содержать чувствительные формулировки —
+      наружу пользователю транслируется только обобщённое сообщение канона §7.
+    * `sanctions.listNames` и `pep.category` — комплаенс-чувствительны, на фронтенд
+      не проксируются.
+    * `nextActionUrl` содержит одноразовый токен — не логируется целиком.
+
+    ## Безопасность транспорта
+
+    Service-to-service: **mTLS** + `Bearer` JWT. Webhook-вызовы от провайдера
+    подписываются HMAC-SHA256, см. секцию `webhooks`.
+
+servers:
+  - url: https://kyc.internal.wallet/v1
+    description: Production — внутренний фасад над KYC-провайдером, доступ только по mTLS
+  - url: https://kyc.staging.internal.wallet/v1
+    description: Staging — sandbox провайдера, синтетические личности
+  - url: https://kyc.mock.internal.wallet/v1
+    description: Mock — детерминированные фикстуры канона §10.1 (уровень 2 VERIFIED)
+
+tags:
+  - name: KYC Status
+    description: Текущий уровень и статус верификации — единственное, что BFF читает синхронно на шаге 14
+  - name: KYC Sessions
+    description: Асинхронные сессии верификации (VideoIdent / AutoIdent / eID), создание и опрос статуса
+  - name: KYC Documents
+    description: Метаданные документов без содержимого — сканы и биометрия в BFF не передаются
+  - name: Webhooks
+    description: Асинхронные уведомления провайдера об изменении статуса верификации
+
+security:
+  - bearerAuth: []
+
+paths:
+
+  /v1/kyc/users/{userId}/status:
+    get:
+      tags: [KYC Status]
+      operationId: getKycStatus
+      summary: Get current KYC level and status for a user
+      description: |
+        Возвращает текущий уровень и статус верификации — **это единственный вызов S2
+        на критическом пути создания заявки** (шаг 14 канона §6).
+
+        Кешируется на 30 с. **Stale-ответ запрещён**: при недоступности источника и
+        протухшем кеше операция блокируется (канон §11).
+
+        Идемпотентно, допускает 2 ретрая в пределах бюджета 1 000 мс.
+      parameters:
+        - $ref: '#/components/parameters/UserIdPath'
+        - $ref: '#/components/parameters/CorrelationIdHeader'
+        - $ref: '#/components/parameters/RequestIdHeader'
+      responses:
+        '200':
+          description: Статус верификации получен
+          headers:
+            X-Correlation-Id:
+              $ref: '#/components/headers/CorrelationIdResponse'
+            X-Request-Id:
+              $ref: '#/components/headers/RequestIdResponse'
+            Cache-Control:
+              $ref: '#/components/headers/CacheControlResponse'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/KycStatus'
+              examples:
+                approvedVerified:
+                  $ref: '#/components/examples/KycStatusApproved'
+                pendingReview:
+                  $ref: '#/components/examples/KycStatusPendingReview'
+                notStarted:
+                  $ref: '#/components/examples/KycStatusNotStarted'
+                expired:
+                  $ref: '#/components/examples/KycStatusExpired'
+                rejected:
+                  $ref: '#/components/examples/KycStatusRejected'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+        '504':
+          $ref: '#/components/responses/GatewayTimeout'
+
+  /v1/kyc/sessions:
+    post:
+      tags: [KYC Sessions]
+      operationId: createKycSession
+      summary: Create a verification session
+      description: |
+        Создаёт **ресурс сессии верификации**. Это создание ресурса, а не RPC-вызов
+        действия: результат — адресуемая сущность `KycSession` с собственным
+        `sessionId`, доступная по `GET /v1/kyc/sessions/{sessionId}`.
+
+        Вызов **вне критического пути** создания заявки: используется, когда пользователь
+        переходит к прохождению верификации по баннеру `Verify your identity to exchange`.
+
+        **Идемпотентность:** заголовок `Idempotency-Key` (UUIDv4) обязателен. Окно
+        хранения — 24 ч (канон §9). Повтор с тем же телом возвращает тот же `201`-ответ
+        с тем же `sessionId`. Повтор с другим телом → `409` `IDEMPOTENCY_CONFLICT`.
+        Без идемпотентности повторный клик создавал бы лишние сессии и быстро исчерпывал
+        `attemptsLimit`.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKeyHeader'
+        - $ref: '#/components/parameters/CorrelationIdHeader'
+        - $ref: '#/components/parameters/RequestIdHeader'
+      requestBody:
+        required: true
+        description: Параметры создаваемой сессии верификации
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/KycSessionCreateRequest'
+            examples:
+              videoIdent:
+                $ref: '#/components/examples/KycSessionCreateVideoIdent'
+      responses:
+        '201':
+          description: Сессия создана
+          headers:
+            X-Correlation-Id:
+              $ref: '#/components/headers/CorrelationIdResponse'
+            X-Request-Id:
+              $ref: '#/components/headers/RequestIdResponse'
+            Location:
+              $ref: '#/components/headers/LocationResponse'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/KycSession'
+              examples:
+                created:
+                  $ref: '#/components/examples/KycSessionCreated'
+        '200':
+          description: |
+            Идемпотентный повтор: сессия с этим `Idempotency-Key` уже была создана,
+            возвращается ранее созданный ресурс без побочных эффектов.
+          headers:
+            X-Correlation-Id:
+              $ref: '#/components/headers/CorrelationIdResponse'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/KycSession'
+              examples:
+                replayed:
+                  $ref: '#/components/examples/KycSessionCreated'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/UnprocessableEntity'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+        '504':
+          $ref: '#/components/responses/GatewayTimeout'
+
+  /v1/kyc/sessions/{sessionId}:
+    get:
+      tags: [KYC Sessions]
+      operationId: getKycSession
+      summary: Get verification session state
+      description: |
+        Возвращает текущее состояние сессии верификации. Используется экраном прохождения
+        верификации как fallback к webhook: если callback задержался или потерян, клиент
+        опрашивает ресурс.
+
+        Опрос — не замена webhook. Рекомендуемый интервал опроса — не чаще 1 раза в 5 с,
+        общая продолжительность — до `expiresAt`.
+      parameters:
+        - $ref: '#/components/parameters/SessionIdPath'
+        - $ref: '#/components/parameters/CorrelationIdHeader'
+        - $ref: '#/components/parameters/RequestIdHeader'
+      responses:
+        '200':
+          description: Состояние сессии получено
+          headers:
+            X-Correlation-Id:
+              $ref: '#/components/headers/CorrelationIdResponse'
+            X-Request-Id:
+              $ref: '#/components/headers/RequestIdResponse'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/KycSession'
+              examples:
+                inProgress:
+                  $ref: '#/components/examples/KycSessionInProgress'
+                created:
+                  $ref: '#/components/examples/KycSessionCreated'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+        '504':
+          $ref: '#/components/responses/GatewayTimeout'
+
+  /v1/kyc/users/{userId}/documents:
+    get:
+      tags: [KYC Documents]
+      operationId: listKycDocuments
+      summary: List verified document metadata (no content)
+      description: |
+        Возвращает **только метаданные** документов, использованных при верификации.
+
+        **Содержимое документов, сканы, фотографии, видеозаписи сессий и биометрические
+        шаблоны НИКОГДА не передаются в Exchange BFF и не логируются.** Они остаются
+        в контуре KYC-провайдера. Этот эндпоинт физически не может их вернуть — схема
+        `KycDocumentMeta` закрыта (`additionalProperties: false`) и не содержит полей
+        для бинарных данных или номеров документов.
+
+        Вызов **вне критического пути** создания заявки. Используется комплаенс-контуром
+        и для предупреждения пользователя о скором истечении документа.
+      parameters:
+        - $ref: '#/components/parameters/UserIdPath'
+        - $ref: '#/components/parameters/CorrelationIdHeader'
+        - $ref: '#/components/parameters/RequestIdHeader'
+      responses:
+        '200':
+          description: Метаданные документов получены
+          headers:
+            X-Correlation-Id:
+              $ref: '#/components/headers/CorrelationIdResponse'
+            X-Request-Id:
+              $ref: '#/components/headers/RequestIdResponse'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/KycDocumentMetaList'
+              examples:
+                passportVerified:
+                  $ref: '#/components/examples/KycDocumentsVerified'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+        '504':
+          $ref: '#/components/responses/GatewayTimeout'
+
+webhooks:
+
+  kyc.status.changed:
+    post:
+      tags: [Webhooks]
+      operationId: onKycStatusChanged
+      summary: KYC status changed callback (provider to Exchange BFF)
+      description: |
+        Провайдер вызывает **наш** эндпоинт, когда уровень или статус верификации
+        пользователя изменился. Направление вызова: провайдер → Exchange BFF.
+
+        Событие приводит к **инвалидации кеша KYC-статуса** (TTL 30 с) — это основной
+        механизм, благодаря которому отзыв верификации становится виден быстрее, чем
+        за 30 секунд.
+
+        ## Подпись
+
+        Заголовок `X-WebID-Signature` имеет форму:
+
+        ```
+        X-WebID-Signature: t=<unix_seconds>,v1=<hex>
+        ```
+
+        где `v1 = HMAC-SHA256(secret, t + "." + rawBody)` в нижнем регистре hex.
+        Проверяется по **сырому телу** до JSON-парсинга — любая нормализация ломает
+        подпись. Сравнение — constant-time.
+
+        **Окно валидности — 300 с.** Если `|now − t| > 300`, запрос отклоняется
+        как потенциальный replay, даже при верной подписи.
+
+        ## Идемпотентность
+
+        Дедупликация по `eventId` (UUIDv4), **окно 24 ч**. Повторная доставка того же
+        `eventId` обрабатывается как no-op и получает `200` — провайдеры гарантируют
+        at-least-once, а не exactly-once.
+
+        ## Порядок доставки
+
+        Поле `sequence` — **монотонно возрастающий счётчик в пределах одного `userId`**.
+        Событие с `sequence`, меньшим или равным уже обработанному для этого пользователя,
+        **отбрасывается** как out-of-order. Без этого правила поздно доставленный старый
+        callback мог бы понизить уровень верификации обратно.
+
+        ## Ответ и ретраи
+
+        Отвечать `200` **в течение 5 с**. Обработка — асинхронная: принять, записать,
+        подтвердить; тяжёлую логику выполнять после ответа.
+
+        При любом ответе, отличном от `2xx`, или при таймауте провайдер ретраит с
+        экспоненциальным backoff: **1 мин → 5 мин → 30 мин → 2 ч → 6 ч**, после чего
+        событие уходит в dead-letter на стороне провайдера.
+
+        ## Ограничения
+
+        Payload не содержит PII, содержимого документов и биометрии.
+      parameters:
+        - $ref: '#/components/parameters/WebIdSignatureHeader'
+        - $ref: '#/components/parameters/CorrelationIdHeader'
+        - $ref: '#/components/parameters/RequestIdHeader'
+      requestBody:
+        required: true
+        description: Событие изменения статуса верификации
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/KycStatusChangedEvent'
+            examples:
+              approved:
+                $ref: '#/components/examples/WebhookKycApproved'
+              rejected:
+                $ref: '#/components/examples/WebhookKycRejected'
+      responses:
+        '200':
+          description: |
+            Событие принято (или распознано как дубликат по `eventId` и проигнорировано).
+            Должно быть отдано в течение 5 с.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WebhookAck'
+              examples:
+                accepted:
+                  $ref: '#/components/examples/WebhookAckAccepted'
+                duplicate:
+                  $ref: '#/components/examples/WebhookAckDuplicate'
+        '400':
+          description: |
+            Невалидный payload. Провайдер **не** ретраит — форма события не исправится
+            повтором. Событие уходит в наш dead-letter для ручного разбора.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/KycServiceError'
+              examples:
+                invalidPayload:
+                  $ref: '#/components/examples/ErrorWebhookInvalidPayload'
+        '401':
+          description: |
+            Подпись `X-WebID-Signature` невалидна или timestamp вне окна 300 с.
+            Ретрай бессмысленен — при просроченном окне повтор тем более не пройдёт.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/KycServiceError'
+              examples:
+                badSignature:
+                  $ref: '#/components/examples/ErrorWebhookBadSignature'
+
+components:
+
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: |
+        Service-to-service аутентификация для исходящих вызовов Exchange BFF → S2.
+
+        **Транспорт:** обязательный **mTLS**, клиентский сертификат Exchange BFF выпущен
+        внутренним CA, CN проверяется по allow-list.
+
+        **Токен:** короткоживущий JWT (TTL 300 с). Claims: `iss`, `aud=kyc-service`,
+        `sub=exchange-bff`, `exp`, `jti`, `scope` (`kyc:status:read`, `kyc:sessions:write`,
+        `kyc:documents:meta:read`). Scope `kyc:documents:content:read` **не выдаётся
+        Exchange BFF никогда** — доступ к содержимому документов исключён на уровне прав.
+
+        **Входящие webhook-вызовы аутентифицируются иначе** — не этим механизмом, а
+        HMAC-подписью `X-WebID-Signature` (см. секцию `webhooks`) поверх mTLS с
+        pinning сертификата провайдера.
+
+  parameters:
+
+    UserIdPath:
+      name: userId
+      in: path
+      required: true
+      description: Идентификатор пользователя, `usr_` + ULID (Crockford Base32, 26 символов)
+      schema:
+        type: string
+        pattern: '^usr_[0-9A-HJKMNP-TV-Z]{26}$'
+        minLength: 30
+        maxLength: 30
+        description: Идентификатор пользователя
+        examples:
+          - usr_01J8ZQ4H9K2M3N4P5R6S7T8V9W
+
+    SessionIdPath:
+      name: sessionId
+      in: path
+      required: true
+      description: Идентификатор сессии верификации, `kys_` + ULID (Crockford Base32)
+      schema:
+        type: string
+        pattern: '^kys_[0-9A-HJKMNP-TV-Z]{26}$'
+        minLength: 30
+        maxLength: 30
+        description: Идентификатор сессии верификации
+        examples:
+          - kys_01J9X3B5N6P8Q0R2T4V6X8Z1C3
+
+    IdempotencyKeyHeader:
+      name: Idempotency-Key
+      in: header
+      required: true
+      description: |
+        Ключ идемпотентности (UUIDv4). Окно хранения — 24 ч (канон §9). Повтор с тем же
+        телом возвращает тот же ресурс; повтор с другим телом → `409` `IDEMPOTENCY_CONFLICT`.
+      schema:
+        type: string
+        format: uuid
+        minLength: 36
+        maxLength: 36
+        description: UUIDv4-ключ идемпотентности
+        examples:
+          - 7c1d9b34-8f52-4a6e-b0c7-2e15d3f49a88
+
+    CorrelationIdHeader:
+      name: X-Correlation-Id
+      in: header
+      required: true
+      description: |
+        Сквозной идентификатор бизнес-операции (ULID, 26 символов Crockford Base32),
+        передаётся без изменений во все downstream-вызовы (канон §9).
+      schema:
+        type: string
+        pattern: '^[0-9A-HJKMNP-TV-Z]{26}$'
+        minLength: 26
+        maxLength: 26
+        description: Сквозной ULID корреляции операции
+        examples:
+          - 01J9X2C4K7QF8N3M5T6V7W8Y9Z
+
+    RequestIdHeader:
+      name: X-Request-Id
+      in: header
+      required: false
+      description: |
+        Идентификатор конкретного HTTP-вызова (UUIDv4), уникален для каждой попытки,
+        включая ретраи. Позволяет отличить повтор от нового вызова в логах.
+      schema:
+        type: string
+        format: uuid
+        minLength: 36
+        maxLength: 36
+        description: Уникальный идентификатор HTTP-вызова
+        examples:
+          - 3f2a9c18-5b6d-4e21-9a77-0c4f8e2b1d33
+
+    WebIdSignatureHeader:
+      name: X-WebID-Signature
+      in: header
+      required: true
+      description: |
+        Подпись webhook-события: `t=<unix_seconds>,v1=<hex HMAC-SHA256(secret, t + "." + rawBody)>`.
+        Проверяется по сырому телу до JSON-парсинга, constant-time сравнение,
+        окно валидности timestamp — 300 с.
+      schema:
+        type: string
+        pattern: '^t=\d{10},v1=[0-9a-f]{64}$'
+        minLength: 80
+        maxLength: 80
+        description: HMAC-SHA256 подпись события с временной меткой
+        examples:
+          - t=1786205732,v1=9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08
+
+  headers:
+
+    CorrelationIdResponse:
+      description: Эхо сквозного идентификатора операции, полученного в запросе
+      required: true
+      schema:
+        type: string
+        pattern: '^[0-9A-HJKMNP-TV-Z]{26}$'
+        minLength: 26
+        maxLength: 26
+        description: Сквозной ULID корреляции операции
+        examples:
+          - 01J9X2C4K7QF8N3M5T6V7W8Y9Z
+
+    RequestIdResponse:
+      description: Эхо идентификатора HTTP-вызова; при отсутствии генерируется сервисом
+      required: false
+      schema:
+        type: string
+        format: uuid
+        minLength: 36
+        maxLength: 36
+        description: Уникальный идентификатор HTTP-вызова
+        examples:
+          - 3f2a9c18-5b6d-4e21-9a77-0c4f8e2b1d33
+
+    CacheControlResponse:
+      description: |
+        Директива кеширования. KYC-статус кешируется на 30 с (канон §11).
+        Stale-ответ при недоступности источника **запрещён** — поэтому директивы
+        `stale-while-revalidate` и `stale-if-error` здесь не используются никогда.
+      required: false
+      schema:
+        type: string
+        maxLength: 128
+        description: Директива кеширования HTTP
+        examples:
+          - private, max-age=30, must-revalidate
+
+    LocationResponse:
+      description: URI созданного ресурса сессии верификации
+      required: false
+      schema:
+        type: string
+        format: uri-reference
+        maxLength: 512
+        description: Относительный URI ресурса `KycSession`
+        examples:
+          - /v1/kyc/sessions/kys_01J9X3B5N6P8Q0R2T4V6X8Z1C3
+
+    RetryAfterHeader:
+      description: Через сколько секунд допустима повторная попытка
+      required: false
+      schema:
+        type: integer
+        minimum: 0
+        maximum: 3600
+        description: Пауза перед повтором в секундах
+        examples:
+          - 30
+
+  schemas:
+
+    KycLevel:
+      type: string
+      title: KycLevel
+      enum: [NONE, BASIC, VERIFIED, ENHANCED]
+      description: |
+        Уровень верификации личности:
+        `NONE` (0) — верификация не проходилась, обмен недоступен → `KYC_REQUIRED` (403);
+        `BASIC` (1) — базовая проверка данных, для обмена недостаточна → `KYC_LEVEL_INSUFFICIENT` (403);
+        `VERIFIED` (2) — полная идентификация документа и лица, **достаточна для обмена**;
+        `ENHANCED` (3) — усиленная проверка (источник средств), требуется для PEP и
+        крупных сумм.
+        Минимальный уровень для операции обмена — `VERIFIED`, см. поле
+        `jurisdiction.requiredLevelForExchange`.
+      examples:
+        - VERIFIED
+
+    KycProcessStatus:
+      type: string
+      title: KycProcessStatus
+      enum: [NOT_STARTED, IN_PROGRESS, PENDING_REVIEW, APPROVED, REJECTED, EXPIRED]
+      description: |
+        Статус процесса верификации и его маппинг в каталог ошибок канона §7:
+        `NOT_STARTED` — не начата → `KYC_REQUIRED` (403);
+        `IN_PROGRESS` — пользователь проходит сессию → `KYC_PENDING` (403, retryable);
+        `PENDING_REVIEW` — на ручной проверке комплаенса → `KYC_PENDING` (403, retryable);
+        `APPROVED` — одобрена, проверка шага 14 канона §6 пройдена;
+        `REJECTED` — отказано → `KYC_REQUIRED` (403), причины в `rejectionReasons`;
+        `EXPIRED` — срок действия истёк → `KYC_EXPIRED` (403).
+      examples:
+        - APPROVED
+
+    KycRejectionReason:
+      type: object
+      title: KycRejectionReason
+      description: |
+        Причина отказа в верификации. Может содержать чувствительные формулировки —
+        наружу пользователю транслируется только обобщённое сообщение канона §7,
+        а не текст поля `reason`.
+      additionalProperties: false
+      required: [code, reason, occurredAt, retryable]
+      properties:
+        code:
+          type: string
+          enum:
+            - DOCUMENT_EXPIRED
+            - DOCUMENT_UNREADABLE
+            - FACE_MISMATCH
+            - LIVENESS_FAILED
+            - DATA_MISMATCH
+            - BLACKLISTED
+            - UNSUPPORTED_DOCUMENT
+            - UNDERAGE
+            - JURISDICTION_NOT_SUPPORTED
+          description: |
+            Машинный код причины отказа:
+            `DOCUMENT_EXPIRED` — срок действия документа истёк (retryable: нужен новый документ);
+            `DOCUMENT_UNREADABLE` — качество снимка недостаточно (retryable);
+            `FACE_MISMATCH` — лицо не совпало с фото документа (retryable);
+            `LIVENESS_FAILED` — проверка «живости» не пройдена (retryable);
+            `DATA_MISMATCH` — данные документа расходятся с профилем из S1 (retryable);
+            `BLACKLISTED` — попадание в чёрный список (**не** retryable, терминально);
+            `UNSUPPORTED_DOCUMENT` — тип документа не поддерживается (retryable с другим документом);
+            `UNDERAGE` — возраст ниже допустимого (**не** retryable);
+            `JURISDICTION_NOT_SUPPORTED` — юрисдикция недоступна для обслуживания (**не** retryable).
+          examples:
+            - DOCUMENT_EXPIRED
+        reason:
+          type: string
+          minLength: 1
+          maxLength: 512
+          description: |
+            Человекочитаемое пояснение на английском для инженеров и комплаенса.
+            **Пользователю не показывается.**
+          examples:
+            - Presented passport expired on 2026-03-14
+        occurredAt:
+          type: string
+          format: date-time
+          description: Момент фиксации причины отказа, ISO-8601 UTC с миллисекундами и `Z`
+          examples:
+            - 2026-07-19T11:03:42.660Z
+        retryable:
+          type: boolean
+          description: |
+            Может ли пользователь повторить верификацию и получить иной результат.
+            `false` для `BLACKLISTED`, `UNDERAGE`, `JURISDICTION_NOT_SUPPORTED`.
+          examples:
+            - true
+
+    KycJurisdiction:
+      type: object
+      title: KycJurisdiction
+      description: |
+        Юрисдикционная политика, применимая к пользователю. Определяется страной
+        резидентства из S1 (`residencyCountry`) и правилами провайдера.
+      additionalProperties: false
+      required: [country, allowed, requiredLevelForExchange]
+      properties:
+        country:
+          type: string
+          pattern: '^[A-Z]{2}$'
+          minLength: 2
+          maxLength: 2
+          description: Страна применимой юрисдикции, ISO 3166-1 alpha-2
+          examples:
+            - AE
+        allowed:
+          type: boolean
+          description: |
+            Разрешено ли обслуживание в этой юрисдикции. `false` → операция блокируется
+            с `KYC_REQUIRED` (403); повышение уровня не поможет.
+          examples:
+            - true
+        restrictedOperations:
+          type: array
+          minItems: 0
+          maxItems: 10
+          uniqueItems: true
+          description: |
+            Операции, запрещённые в данной юрисдикции даже при достаточном уровне KYC.
+            Наличие `EXCHANGE` в списке блокирует создание заявки.
+          items:
+            type: string
+            enum: [EXCHANGE, DEPOSIT, WITHDRAWAL, TRANSFER, CARD_ISSUE]
+            description: Код операции, запрещённой в юрисдикции
+            examples:
+              - CARD_ISSUE
+          examples:
+            - []
+        requiredLevelForExchange:
+          $ref: '#/components/schemas/KycLevel'
+
+    KycSanctionsCheck:
+      type: object
+      title: KycSanctionsCheck
+      description: |
+        Результат санкционного скрининга. **Комплаенс-чувствительно**: поле `listNames`
+        на фронтенд не проксируется и в пользовательские сообщения не попадает.
+      additionalProperties: false
+      required: [checked, hit]
+      properties:
+        checked:
+          type: boolean
+          description: |
+            Был ли скрининг выполнен. `false` при `status = NOT_STARTED`. Если `false`
+            и требуется решение — операция блокируется (нельзя допускать необследованного).
+          examples:
+            - true
+        hit:
+          type: boolean
+          description: |
+            Совпадение по санкционным спискам. `true` → операция блокируется независимо
+            от уровня KYC; наружу — обобщённое `Account is restricted` (`USER_BLOCKED`).
+          examples:
+            - false
+        listNames:
+          type: array
+          minItems: 0
+          maxItems: 20
+          uniqueItems: true
+          description: |
+            Названия списков, по которым зафиксировано совпадение. Пустой массив, если
+            `hit = false`. **Не логировать, не проксировать наружу.**
+          items:
+            type: string
+            minLength: 1
+            maxLength: 64
+            description: Название санкционного списка
+            examples:
+              - OFAC_SDN
+          examples:
+            - []
+        checkedAt:
+          type: [string, 'null']
+          format: date-time
+          description: |
+            Момент последнего скрининга, ISO-8601 UTC с миллисекундами и `Z`.
+            `null`, если скрининг не выполнялся.
+          examples:
+            - 2026-08-07T03:00:00.000Z
+            - null
+
+    KycPepCheck:
+      type: object
+      title: KycPepCheck
+      description: |
+        Результат проверки на статус публично значимого лица (PEP).
+        **Комплаенс-чувствительно**, наружу не транслируется.
+      additionalProperties: false
+      required: [isPep]
+      properties:
+        isPep:
+          type: boolean
+          description: |
+            Является ли пользователь PEP. `true` обычно требует уровня `ENHANCED`
+            и повышает риск-балл в S3 (фактор `PEP_RELATED`).
+          examples:
+            - false
+        category:
+          type: [string, 'null']
+          enum: [DOMESTIC, FOREIGN, INTERNATIONAL_ORGANISATION, FAMILY_MEMBER, CLOSE_ASSOCIATE, null]
+          description: |
+            Категория PEP по классификации FATF. `null`, если `isPep = false`.
+          examples:
+            - null
+            - FOREIGN
+        checkedAt:
+          type: [string, 'null']
+          format: date-time
+          description: Момент проверки, ISO-8601 UTC. `null`, если проверка не выполнялась.
+          examples:
+            - 2026-08-07T03:00:00.000Z
+            - null
+
+    KycStatus:
+      type: object
+      title: KycStatus
+      description: |
+        Текущий уровень и статус верификации — основной объект, который Exchange BFF
+        получает от S2 на шаге 14 канона §6.
+
+        Решение шага 14 принимается так:
+        1. `jurisdiction.allowed = false` или `EXCHANGE` в `jurisdiction.restrictedOperations`
+           → `KYC_REQUIRED` (403);
+        2. `status` ≠ `APPROVED` → маппинг из `KycProcessStatus`;
+        3. `validUntil` в прошлом → `KYC_EXPIRED` (403);
+        4. `levelCode` < уровня из `jurisdiction.requiredLevelForExchange`
+           → `KYC_LEVEL_INSUFFICIENT` (403);
+        5. `EXCHANGE` отсутствует в `allowedOperations` → `KYC_REQUIRED` (403);
+        6. иначе — проверка пройдена, переходим к шагу 15 (лимиты).
+      additionalProperties: false
+      required:
+        - userId
+        - level
+        - levelCode
+        - status
+        - provider
+        - jurisdiction
+        - allowedOperations
+        - sanctions
+        - pep
+        - lastUpdatedAt
+      properties:
+        userId:
+          type: string
+          pattern: '^usr_[0-9A-HJKMNP-TV-Z]{26}$'
+          minLength: 30
+          maxLength: 30
+          description: Идентификатор пользователя, `usr_` + ULID
+          examples:
+            - usr_01J8ZQ4H9K2M3N4P5R6S7T8V9W
+        level:
+          $ref: '#/components/schemas/KycLevel'
+        levelCode:
+          type: integer
+          minimum: 0
+          maximum: 3
+          description: |
+            Числовой эквивалент `level` для сравнения «не ниже требуемого»:
+            0 = `NONE`, 1 = `BASIC`, 2 = `VERIFIED`, 3 = `ENHANCED`.
+            Дублирование намеренно: сравнение строковых enum по порядку — хрупко.
+            Значения `level` и `levelCode` обязаны быть согласованы; расхождение —
+            дефект источника, BFF трактует его как отказ.
+          examples:
+            - 2
+        status:
+          $ref: '#/components/schemas/KycProcessStatus'
+        verificationMethod:
+          type: [string, 'null']
+          enum: [VIDEO_IDENT, AUTO_IDENT, EID, null]
+          description: |
+            Способ, которым была проведена идентификация:
+            `VIDEO_IDENT` — видеоидентификация с оператором;
+            `AUTO_IDENT` — автоматическая проверка документа и liveness;
+            `EID` — электронное удостоверение личности.
+            `null`, если верификация ещё не проводилась. Названия соответствуют
+            продуктовой линейке предполагаемого вендора (см. ASSUMPTION-01).
+          examples:
+            - AUTO_IDENT
+            - null
+        provider:
+          type: string
+          enum: [WEBID]
+          description: |
+            Идентификатор KYC-провайдера. Значение зафиксировано как `WEBID` согласно
+            ASSUMPTION-01 (см. `info.description`). При смене вендора расширяется enum,
+            форма контракта не меняется.
+          examples:
+            - WEBID
+        verifiedAt:
+          type: [string, 'null']
+          format: date-time
+          description: |
+            Момент успешного завершения верификации, ISO-8601 UTC с миллисекундами и `Z`.
+            `null`, если верификация не пройдена.
+          examples:
+            - 2025-04-30T12:41:07.310Z
+            - null
+        validUntil:
+          type: [string, 'null']
+          format: date-time
+          description: |
+            Момент истечения срока действия верификации, ISO-8601 UTC. После этого момента
+            статус переходит в `EXPIRED` → `KYC_EXPIRED` (403). `null` — бессрочно
+            (в практике провайдера встречается редко).
+            Фикстура канона §10.1: `kycValidUntil` = 2027-04-30.
+          examples:
+            - 2027-04-30T23:59:59.000Z
+            - null
+        expiresInDays:
+          type: [integer, 'null']
+          minimum: 0
+          maximum: 36500
+          description: |
+            Сколько полных суток осталось до `validUntil`. Вычисляемое поле, дублирует
+            `validUntil` для удобства UI-предупреждений («верификация истекает через N дней»).
+            `null`, если `validUntil` = `null`.
+          examples:
+            - 266
+            - null
+        jurisdiction:
+          $ref: '#/components/schemas/KycJurisdiction'
+        allowedOperations:
+          type: array
+          minItems: 0
+          maxItems: 10
+          uniqueItems: true
+          description: |
+            Операции, разрешённые пользователю при текущем уровне и юрисдикции.
+            Отсутствие `EXCHANGE` блокирует создание заявки на шаге 14 канона §6.
+          items:
+            type: string
+            enum: [EXCHANGE, DEPOSIT, WITHDRAWAL, TRANSFER, CARD_ISSUE]
+            description: Код разрешённой операции
+            examples:
+              - EXCHANGE
+          examples:
+            - [EXCHANGE, DEPOSIT, WITHDRAWAL, TRANSFER]
+        sanctions:
+          $ref: '#/components/schemas/KycSanctionsCheck'
+        pep:
+          $ref: '#/components/schemas/KycPepCheck'
+        rejectionReasons:
+          type: array
+          minItems: 0
+          maxItems: 20
+          description: |
+            Причины отказа, если `status = REJECTED`. Пустой массив в остальных случаях.
+            Упорядочены по `occurredAt` по возрастанию.
+          items:
+            $ref: '#/components/schemas/KycRejectionReason'
+        lastUpdatedAt:
+          type: string
+          format: date-time
+          description: |
+            Момент последнего изменения статуса, ISO-8601 UTC с миллисекундами и `Z`.
+            Используется для контроля возраста кеша (TTL 30 с) и для отбраковки
+            out-of-order событий совместно с `sequence` из webhook.
+          examples:
+            - 2026-08-07T09:12:44.018Z
+        nextActionUrl:
+          type: [string, 'null']
+          format: uri
+          maxLength: 2048
+          description: |
+            Ссылка, куда направить пользователя для продолжения или повторного
+            прохождения верификации. `null`, если действие не требуется.
+            **Содержит одноразовый токен — не логировать целиком, маскировать query-часть.**
+          examples:
+            - https://verify.webid.internal.wallet/session/kys_01J9X3B5N6P8Q0R2T4V6X8Z1C3
+            - null
+
+    KycSessionCreateRequest:
+      type: object
+      title: KycSessionCreateRequest
+      description: |
+        Тело запроса на создание сессии верификации. PII в запросе не передаются —
+        провайдер получает персональные данные напрямую от пользователя в своём потоке,
+        Exchange BFF их не пересылает.
+      additionalProperties: false
+      required: [userId, method]
+      properties:
+        userId:
+          type: string
+          pattern: '^usr_[0-9A-HJKMNP-TV-Z]{26}$'
+          minLength: 30
+          maxLength: 30
+          description: Пользователь, для которого создаётся сессия
+          examples:
+            - usr_01J8ZQ4H9K2M3N4P5R6S7T8V9W
+        method:
+          type: string
+          enum: [VIDEO_IDENT, AUTO_IDENT, EID]
+          description: |
+            Запрашиваемый способ идентификации. Провайдер может отклонить способ,
+            недоступный в юрисдикции пользователя → `422` `METHOD_NOT_AVAILABLE`.
+          examples:
+            - AUTO_IDENT
+        targetLevel:
+          $ref: '#/components/schemas/KycLevel'
+        redirectSuccessUrl:
+          type: string
+          format: uri
+          maxLength: 2048
+          description: |
+            Куда вернуть пользователя после успешного прохождения. Домен обязан входить
+            в allow-list провайдера, иначе `422`.
+          examples:
+            - https://app.wallet.internal/exchange?kyc=success
+        redirectFailureUrl:
+          type: string
+          format: uri
+          maxLength: 2048
+          description: Куда вернуть пользователя при отказе или прерывании сессии
+          examples:
+            - https://app.wallet.internal/exchange?kyc=failure
+        locale:
+          type: string
+          pattern: '^[a-z]{2}(-[A-Z]{2})?$'
+          minLength: 2
+          maxLength: 5
+          description: Язык интерфейса сессии верификации, BCP-47 (упрощённая форма)
+          examples:
+            - en-GB
+
+    KycSession:
+      type: object
+      title: KycSession
+      description: |
+        Ресурс сессии верификации. Асинхронный по природе: создаётся мгновенно,
+        завершается через минуты или часы. Итог приходит через webhook
+        `kyc.status.changed`, опрос `GET /v1/kyc/sessions/{sessionId}` — резервный канал.
+      additionalProperties: false
+      required: [sessionId, userId, method, status, expiresAt, createdAt, attemptsUsed, attemptsLimit]
+      properties:
+        sessionId:
+          type: string
+          pattern: '^kys_[0-9A-HJKMNP-TV-Z]{26}$'
+          minLength: 30
+          maxLength: 30
+          description: Идентификатор сессии, `kys_` + ULID (Crockford Base32)
+          examples:
+            - kys_01J9X3B5N6P8Q0R2T4V6X8Z1C3
+        userId:
+          type: string
+          pattern: '^usr_[0-9A-HJKMNP-TV-Z]{26}$'
+          minLength: 30
+          maxLength: 30
+          description: Пользователь, которому принадлежит сессия
+          examples:
+            - usr_01J8ZQ4H9K2M3N4P5R6S7T8V9W
+        method:
+          type: string
+          enum: [VIDEO_IDENT, AUTO_IDENT, EID]
+          description: Фактический способ идентификации, назначенный провайдером для сессии
+          examples:
+            - AUTO_IDENT
+        status:
+          $ref: '#/components/schemas/KycProcessStatus'
+        redirectUrl:
+          type: [string, 'null']
+          format: uri
+          maxLength: 2048
+          description: |
+            URL, на который нужно перенаправить пользователя для прохождения сессии.
+            `null` после завершения сессии.
+            **Содержит одноразовый токен — не логировать целиком.**
+          examples:
+            - https://verify.webid.internal.wallet/session/kys_01J9X3B5N6P8Q0R2T4V6X8Z1C3?t=eyJhb
+            - null
+        expiresAt:
+          type: string
+          format: date-time
+          description: |
+            Момент истечения сессии, ISO-8601 UTC с миллисекундами и `Z`. После него
+            `redirectUrl` перестаёт работать и требуется создать новую сессию.
+          examples:
+            - 2026-08-07T11:15:32.117Z
+        createdAt:
+          type: string
+          format: date-time
+          description: Момент создания сессии, ISO-8601 UTC с миллисекундами и `Z`
+          examples:
+            - 2026-08-07T10:15:32.117Z
+        attemptsUsed:
+          type: integer
+          minimum: 0
+          maximum: 100
+          description: Сколько попыток прохождения уже израсходовано пользователем
+          examples:
+            - 0
+        attemptsLimit:
+          type: integer
+          minimum: 1
+          maximum: 100
+          description: |
+            Максимум попыток. При `attemptsUsed >= attemptsLimit` создание новой сессии
+            отклоняется с `SESSION_LIMIT_REACHED` → `KYC_REQUIRED` (403) наружу.
+          examples:
+            - 3
+
+    KycDocumentMeta:
+      type: object
+      title: KycDocumentMeta
+      description: |
+        **Только метаданные документа.** Содержимое документа, его номер, сканы,
+        фотографии, видеозаписи и биометрические шаблоны **НИКОГДА не передаются
+        в Exchange BFF и не логируются** — они остаются в контуре KYC-провайдера.
+        Схема закрыта (`additionalProperties: false`) именно для того, чтобы такие
+        поля не могли просочиться при изменении на стороне вендора.
+      additionalProperties: false
+      required: [documentId, type, issuingCountry, verified]
+      properties:
+        documentId:
+          type: string
+          pattern: '^kdc_[0-9A-HJKMNP-TV-Z]{26}$'
+          minLength: 30
+          maxLength: 30
+          description: |
+            Внутренний суррогатный идентификатор записи о документе, `kdc_` + ULID.
+            **Это не номер документа** — номер в наш контур не попадает.
+          examples:
+            - kdc_01J9X3C7P2R4T6V8X0Z2B4D6F8
+        type:
+          type: string
+          enum: [PASSPORT, ID_CARD, RESIDENCE_PERMIT, DRIVERS_LICENSE]
+          description: |
+            Тип предъявленного документа:
+            `PASSPORT` — заграничный или внутренний паспорт;
+            `ID_CARD` — национальное удостоверение личности;
+            `RESIDENCE_PERMIT` — вид на жительство;
+            `DRIVERS_LICENSE` — водительское удостоверение (принимается не во всех юрисдикциях).
+          examples:
+            - PASSPORT
+        issuingCountry:
+          type: string
+          pattern: '^[A-Z]{2}$'
+          minLength: 2
+          maxLength: 2
+          description: Страна выдачи документа, ISO 3166-1 alpha-2
+          examples:
+            - GB
+        expiresAt:
+          type: [string, 'null']
+          format: date-time
+          description: |
+            Срок действия документа, ISO-8601 UTC с миллисекундами и `Z`. Истечение
+            приводит к `DOCUMENT_EXPIRED` при следующей переверификации.
+            `null` для бессрочных документов.
+          examples:
+            - 2029-06-12T23:59:59.000Z
+            - null
+        verified:
+          type: boolean
+          description: Успешно ли документ прошёл проверку провайдера
+          examples:
+            - true
+        verifiedAt:
+          type: [string, 'null']
+          format: date-time
+          description: Момент верификации документа, ISO-8601 UTC. `null`, если `verified = false`.
+          examples:
+            - 2025-04-30T12:41:07.310Z
+            - null
+
+    KycDocumentMetaList:
+      type: object
+      title: KycDocumentMetaList
+      description: |
+        Обёртка списка метаданных документов. Обёртка выбрана вместо «голого» массива,
+        чтобы можно было добавить метаданные без ломающего изменения контракта.
+      additionalProperties: false
+      required: [userId, items, total]
+      properties:
+        userId:
+          type: string
+          pattern: '^usr_[0-9A-HJKMNP-TV-Z]{26}$'
+          minLength: 30
+          maxLength: 30
+          description: Пользователь, которому принадлежат документы
+          examples:
+            - usr_01J8ZQ4H9K2M3N4P5R6S7T8V9W
+        items:
+          type: array
+          minItems: 0
+          maxItems: 20
+          description: Метаданные документов, упорядочены по `verifiedAt` по убыванию
+          items:
+            $ref: '#/components/schemas/KycDocumentMeta'
+        total:
+          type: integer
+          minimum: 0
+          maximum: 20
+          description: Общее количество документов; равно длине `items` (пагинации нет)
+          examples:
+            - 1
+        retrievedAt:
+          type: string
+          format: date-time
+          description: Момент формирования ответа, ISO-8601 UTC с миллисекундами и `Z`
+          examples:
+            - 2026-08-07T10:15:31.940Z
+
+    KycStatusChangedEvent:
+      type: object
+      title: KycStatusChangedEvent
+      description: |
+        Payload webhook-события `kyc.status.changed`. Не содержит PII, содержимого
+        документов и биометрии. Обрабатывается идемпотентно по `eventId` (окно 24 ч)
+        и упорядоченно по `sequence` в пределах `userId`.
+      additionalProperties: false
+      required: [eventId, eventType, occurredAt, sequence, userId, currentLevel, status, provider]
+      properties:
+        eventId:
+          type: string
+          format: uuid
+          minLength: 36
+          maxLength: 36
+          description: |
+            Уникальный идентификатор события (UUIDv4). **Ключ дедупликации**: повторная
+            доставка того же `eventId` в окне 24 ч обрабатывается как no-op с ответом `200`.
+          examples:
+            - b41e77a0-2c19-4b8f-9d33-6e05a7c8f102
+        eventType:
+          type: string
+          enum: [kyc.status.changed]
+          description: |
+            Тип события. Единственное значение в этом контракте; enum сохранён, чтобы
+            добавление новых типов было явным расширением, а не молчаливым изменением.
+          examples:
+            - kyc.status.changed
+        occurredAt:
+          type: string
+          format: date-time
+          description: |
+            Момент наступления события на стороне провайдера, ISO-8601 UTC с миллисекундами
+            и `Z`. Может заметно отставать от момента доставки при ретраях (до 6 ч).
+          examples:
+            - 2026-08-07T09:12:44.018Z
+        sequence:
+          type: integer
+          minimum: 1
+          maximum: 9223372036854775807
+          description: |
+            **Монотонно возрастающий счётчик в пределах одного `userId`.** Событие с
+            `sequence`, меньшим или равным уже обработанному для этого пользователя,
+            **отбрасывается** как out-of-order. Без этого правила поздно доставленный
+            старый callback мог бы понизить уровень верификации обратно.
+          examples:
+            - 42
+        userId:
+          type: string
+          pattern: '^usr_[0-9A-HJKMNP-TV-Z]{26}$'
+          minLength: 30
+          maxLength: 30
+          description: Пользователь, чей статус изменился
+          examples:
+            - usr_01J8ZQ4H9K2M3N4P5R6S7T8V9W
+        previousLevel:
+          type: [string, 'null']
+          enum: [NONE, BASIC, VERIFIED, ENHANCED, null]
+          description: |
+            Уровень до изменения. `null`, если предыдущее состояние неизвестно провайдеру
+            (например, первое событие для пользователя).
+          examples:
+            - BASIC
+            - null
+        currentLevel:
+          $ref: '#/components/schemas/KycLevel'
+        status:
+          $ref: '#/components/schemas/KycProcessStatus'
+        validUntil:
+          type: [string, 'null']
+          format: date-time
+          description: |
+            Новый срок действия верификации, ISO-8601 UTC. `null`, если неприменимо
+            (например, при переходе в `REJECTED`).
+          examples:
+            - 2027-04-30T23:59:59.000Z
+            - null
+        rejectionReasons:
+          type: array
+          minItems: 0
+          maxItems: 20
+          description: Причины отказа, если `status = REJECTED`; пустой массив в остальных случаях
+          items:
+            $ref: '#/components/schemas/KycRejectionReason'
+        provider:
+          type: string
+          enum: [WEBID]
+          description: Провайдер, сформировавший событие (см. ASSUMPTION-01)
+          examples:
+            - WEBID
+
+    WebhookAck:
+      type: object
+      title: WebhookAck
+      description: |
+        Подтверждение приёма webhook-события. Должно быть отдано в течение 5 с, иначе
+        провайдер начнёт ретраи (1 мин / 5 мин / 30 мин / 2 ч / 6 ч).
+      additionalProperties: false
+      required: [received, eventId]
+      properties:
+        received:
+          type: boolean
+          description: Признак приёма события. Всегда `true` при HTTP 200.
+          examples:
+            - true
+        eventId:
+          type: string
+          format: uuid
+          minLength: 36
+          maxLength: 36
+          description: Эхо `eventId` принятого события
+          examples:
+            - b41e77a0-2c19-4b8f-9d33-6e05a7c8f102
+        duplicate:
+          type: boolean
+          description: |
+            `true`, если событие с этим `eventId` уже обрабатывалось в окне дедупликации
+            24 ч и было проигнорировано как повтор.
+          examples:
+            - false
+        outOfOrderDiscarded:
+          type: boolean
+          description: |
+            `true`, если событие отброшено по правилу `sequence` (значение не превышает
+            уже обработанное для этого `userId`). Ответ всё равно `200` — ретраить нечего.
+          examples:
+            - false
+
+    KycServiceErrorDetail:
+      type: object
+      title: KycServiceErrorDetail
+      description: |
+        Элемент диагностики ошибки. Никогда не содержит PII, содержимого документов
+        и биометрических данных.
+      additionalProperties: false
+      required: [field, issue]
+      properties:
+        field:
+          type: string
+          minLength: 1
+          maxLength: 128
+          description: Путь к проблемному полю в dot-notation или JSON Pointer
+          examples:
+            - method
+        issue:
+          type: string
+          minLength: 1
+          maxLength: 256
+          description: Краткое машинно-ориентированное описание проблемы
+          examples:
+            - VIDEO_IDENT is not available in jurisdiction AE
+
+    KycServiceError:
+      type: object
+      title: KycServiceError
+      description: |
+        Собственный конверт ошибки KYC Service. Exchange BFF **транслирует** его в
+        канонический RFC 9457 Problem Details (канон §7) по маппингу из описания
+        поля `error`.
+      additionalProperties: false
+      required: [error, message, traceId, timestamp]
+      properties:
+        error:
+          type: string
+          enum:
+            - KYC_NOT_STARTED
+            - KYC_LEVEL_TOO_LOW
+            - KYC_IN_REVIEW
+            - KYC_EXPIRED
+            - KYC_REJECTED
+            - SESSION_LIMIT_REACHED
+            - SESSION_NOT_FOUND
+            - SESSION_EXPIRED
+            - METHOD_NOT_AVAILABLE
+            - JURISDICTION_NOT_SUPPORTED
+            - IDEMPOTENCY_CONFLICT
+            - INVALID_REQUEST
+            - INVALID_SIGNATURE
+            - UNAUTHORIZED
+            - FORBIDDEN
+            - RATE_LIMITED
+            - INTERNAL_ERROR
+            - SERVICE_UNAVAILABLE
+            - UPSTREAM_TIMEOUT
+          description: |
+            Машинный код ошибки KYC Service и его маппинг в каталог ошибок канона §7:
+
+            * `KYC_NOT_STARTED` (403) — верификация не начиналась.
+              → `KYC_REQUIRED` (403).
+            * `KYC_LEVEL_TOO_LOW` (403) — уровень ниже требуемого для обмена.
+              → `KYC_LEVEL_INSUFFICIENT` (403).
+            * `KYC_IN_REVIEW` (403) — верификация в процессе или на ручной проверке.
+              → `KYC_PENDING` (403), retryable — пользователю показывается
+              `Verification in progress`.
+            * `KYC_EXPIRED` (403) — срок действия верификации истёк.
+              → `KYC_EXPIRED` (403).
+            * `KYC_REJECTED` (403) — в верификации отказано.
+              → `KYC_REQUIRED` (403); причины в `details`, наружу не транслируются.
+            * `SESSION_LIMIT_REACHED` (429 или 403) — исчерпан `attemptsLimit`.
+              → `KYC_REQUIRED` (403). Намеренно **не** `RATE_LIMITED`: для пользователя
+              это состояние верификации, а не троттлинг — предлагать «повторить позже»
+              было бы ложным обещанием.
+            * `SESSION_NOT_FOUND` (404) — сессия не существует.
+              → `VALIDATION_ERROR` (400).
+            * `SESSION_EXPIRED` (410 или 409) — сессия истекла, нужна новая.
+              → `KYC_REQUIRED` (403).
+            * `METHOD_NOT_AVAILABLE` (422) — способ идентификации недоступен в юрисдикции.
+              → `VALIDATION_ERROR` (400) на пути создания сессии.
+            * `JURISDICTION_NOT_SUPPORTED` (403) — юрисдикция не обслуживается.
+              → `KYC_REQUIRED` (403); повышение уровня не поможет.
+            * `IDEMPOTENCY_CONFLICT` (409) — тот же `Idempotency-Key` с другим телом.
+              → `IDEMPOTENCY_CONFLICT` (409).
+            * `INVALID_REQUEST` (400) — нарушение схемы запроса.
+              → `VALIDATION_ERROR` (400).
+            * `INVALID_SIGNATURE` (401) — только для webhook: подпись
+              `X-WebID-Signature` неверна или timestamp вне окна 300 с. Наружу не
+              транслируется — это входящий вызов, не пользовательский путь.
+            * `UNAUTHORIZED` (401) — невалидный service JWT.
+              → `EXCHANGE_SERVICE_UNAVAILABLE` (503): наш дефект конфигурации.
+            * `FORBIDDEN` (403) — недостаточный scope сервиса-вызывающего.
+              → `EXCHANGE_SERVICE_UNAVAILABLE` (503), по той же причине.
+            * `RATE_LIMITED` (429) — превышен лимит обращений к S2.
+              → `RATE_LIMITED` (429), retryable.
+            * `INTERNAL_ERROR` (500) — внутренняя ошибка.
+              → `EXCHANGE_SERVICE_UNAVAILABLE` (503), retryable.
+            * `SERVICE_UNAVAILABLE` (503) — сервис или провайдер недоступен.
+              → `EXCHANGE_SERVICE_UNAVAILABLE` (503), retryable.
+              **Stale KYC отдавать запрещено (канон §11) — операция блокируется.**
+            * `UPSTREAM_TIMEOUT` (504) — истёк таймаут 1 000 мс (канон §11).
+              → `UPSTREAM_TIMEOUT` (504), retryable. **Stale не используется.**
+          examples:
+            - KYC_IN_REVIEW
+        message:
+          type: string
+          minLength: 1
+          maxLength: 1024
+          description: |
+            Человекочитаемое пояснение на английском для инженеров. **Пользователю не
+            показывается** — фронтенд ветвится только по каноническому `code` (канон §7).
+          examples:
+            - Verification is under manual compliance review
+        traceId:
+          type: string
+          minLength: 8
+          maxLength: 64
+          description: |
+            Внутренний идентификатор трассировки KYC Service. Логируется рядом с нашим
+            `correlationId` для связывания инцидентов между командами и с вендором.
+          examples:
+            - c73a01f9be5d4827
+        timestamp:
+          type: string
+          format: date-time
+          description: Момент возникновения ошибки, ISO-8601 UTC с миллисекундами и `Z`
+          examples:
+            - 2026-08-07T10:15:32.117Z
+        correlationId:
+          type: [string, 'null']
+          pattern: '^[0-9A-HJKMNP-TV-Z]{26}$'
+          minLength: 26
+          maxLength: 26
+          description: Эхо `X-Correlation-Id`. `null`, если заголовок не был передан.
+          examples:
+            - 01J9X2C4K7QF8N3M5T6V7W8Y9Z
+            - null
+        retryable:
+          type: boolean
+          description: |
+            Признак осмысленности повтора. `true` для `KYC_IN_REVIEW`, `INTERNAL_ERROR`,
+            `SERVICE_UNAVAILABLE`, `UPSTREAM_TIMEOUT`, `RATE_LIMITED`.
+          examples:
+            - true
+        details:
+          type: array
+          minItems: 0
+          maxItems: 20
+          description: Дополнительная диагностика; пустой массив, если детализации нет
+          items:
+            $ref: '#/components/schemas/KycServiceErrorDetail'
+
+  responses:
+
+    BadRequest:
+      description: |
+        Нарушение схемы запроса или отсутствие обязательного заголовка трассировки.
+        → `VALIDATION_ERROR` (400) в каноне §7.
+      headers:
+        X-Correlation-Id:
+          $ref: '#/components/headers/CorrelationIdResponse'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/KycServiceError'
+          examples:
+            invalidRequest:
+              $ref: '#/components/examples/ErrorInvalidRequest'
+
+    Unauthorized:
+      description: |
+        Невалидный, истёкший или отсутствующий service JWT.
+        → `EXCHANGE_SERVICE_UNAVAILABLE` (503): чужой 401 пользователю не показывается.
+      headers:
+        X-Correlation-Id:
+          $ref: '#/components/headers/CorrelationIdResponse'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/KycServiceError'
+          examples:
+            unauthorized:
+              $ref: '#/components/examples/ErrorUnauthorized'
+
+    Forbidden:
+      description: |
+        Состояние верификации не позволяет операцию либо у сервиса-вызывающего нет
+        нужного scope. → `KYC_REQUIRED` / `KYC_LEVEL_INSUFFICIENT` / `KYC_PENDING` /
+        `KYC_EXPIRED` (403) либо `EXCHANGE_SERVICE_UNAVAILABLE` (503).
+      headers:
+        X-Correlation-Id:
+          $ref: '#/components/headers/CorrelationIdResponse'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/KycServiceError'
+          examples:
+            kycNotStarted:
+              $ref: '#/components/examples/ErrorKycNotStarted'
+            kycLevelTooLow:
+              $ref: '#/components/examples/ErrorKycLevelTooLow'
+            kycInReview:
+              $ref: '#/components/examples/ErrorKycInReview'
+            kycExpired:
+              $ref: '#/components/examples/ErrorKycExpired'
+            sessionLimitReached:
+              $ref: '#/components/examples/ErrorSessionLimitReached'
+
+    NotFound:
+      description: |
+        Пользователь или сессия не найдены. → `VALIDATION_ERROR` (400) наружу:
+        факт существования учётной записи не раскрывается (Compliance First, канон §6).
+      headers:
+        X-Correlation-Id:
+          $ref: '#/components/headers/CorrelationIdResponse'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/KycServiceError'
+          examples:
+            sessionNotFound:
+              $ref: '#/components/examples/ErrorSessionNotFound'
+
+    Conflict:
+      description: |
+        Тот же `Idempotency-Key` использован с другим телом запроса.
+        → `IDEMPOTENCY_CONFLICT` (409) в каноне §7.
+      headers:
+        X-Correlation-Id:
+          $ref: '#/components/headers/CorrelationIdResponse'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/KycServiceError'
+          examples:
+            idempotencyConflict:
+              $ref: '#/components/examples/ErrorIdempotencyConflict'
+
+    UnprocessableEntity:
+      description: |
+        Запрос синтаксически корректен, но невыполним: способ идентификации недоступен
+        в юрисдикции пользователя. → `VALIDATION_ERROR` (400) на пути создания сессии.
+      headers:
+        X-Correlation-Id:
+          $ref: '#/components/headers/CorrelationIdResponse'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/KycServiceError'
+          examples:
+            methodNotAvailable:
+              $ref: '#/components/examples/ErrorMethodNotAvailable'
+
+    TooManyRequests:
+      description: Превышен лимит обращений Exchange BFF к KYC Service. → `RATE_LIMITED` (429), retryable.
+      headers:
+        X-Correlation-Id:
+          $ref: '#/components/headers/CorrelationIdResponse'
+        Retry-After:
+          $ref: '#/components/headers/RetryAfterHeader'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/KycServiceError'
+          examples:
+            rateLimited:
+              $ref: '#/components/examples/ErrorRateLimited'
+
+    InternalError:
+      description: Внутренняя ошибка KYC Service. → `EXCHANGE_SERVICE_UNAVAILABLE` (503), retryable.
+      headers:
+        X-Correlation-Id:
+          $ref: '#/components/headers/CorrelationIdResponse'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/KycServiceError'
+          examples:
+            internalError:
+              $ref: '#/components/examples/ErrorInternal'
+
+    ServiceUnavailable:
+      description: |
+        Сервис или KYC-провайдер недоступен. → `EXCHANGE_SERVICE_UNAVAILABLE` (503).
+        Критичность S2 — Blocking (канон §3). **Stale KYC-статус отдавать ЗАПРЕЩЕНО
+        (канон §11)** — операция блокируется, даже если свежая копия была секунды назад.
+      headers:
+        X-Correlation-Id:
+          $ref: '#/components/headers/CorrelationIdResponse'
+        Retry-After:
+          $ref: '#/components/headers/RetryAfterHeader'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/KycServiceError'
+          examples:
+            serviceUnavailable:
+              $ref: '#/components/examples/ErrorServiceUnavailable'
+
+    GatewayTimeout:
+      description: |
+        Истёк таймаут 1 000 мс (канон §11) или не ответил провайдер.
+        → `UPSTREAM_TIMEOUT` (504), retryable. Stale не используется — блокируем.
+      headers:
+        X-Correlation-Id:
+          $ref: '#/components/headers/CorrelationIdResponse'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/KycServiceError'
+          examples:
+            upstreamTimeout:
+              $ref: '#/components/examples/ErrorUpstreamTimeout'
+
+  examples:
+
+    KycStatusApproved:
+      summary: Уровень VERIFIED, одобрено (фикстура канона §10.1)
+      description: |
+        Эталонный happy-path шага 14 канона §6. Соответствует фикстуре:
+        `kycLevel` = 2 (`VERIFIED`), `kycValidUntil` = 2027-04-30, юрисдикция `AE`.
+      value:
+        userId: usr_01J8ZQ4H9K2M3N4P5R6S7T8V9W
+        level: VERIFIED
+        levelCode: 2
+        status: APPROVED
+        verificationMethod: AUTO_IDENT
+        provider: WEBID
+        verifiedAt: 2025-04-30T12:41:07.310Z
+        validUntil: 2027-04-30T23:59:59.000Z
+        expiresInDays: 266
+        lastUpdatedAt: 2026-08-07T09:12:44.018Z
+        nextActionUrl: null
+        jurisdiction:
+          country: AE
+          allowed: true
+          restrictedOperations: []
+          requiredLevelForExchange: VERIFIED
+        allowedOperations:
+          - EXCHANGE
+          - DEPOSIT
+          - WITHDRAWAL
+          - TRANSFER
+        sanctions:
+          checked: true
+          hit: false
+          listNames: []
+          checkedAt: 2026-08-07T03:00:00.000Z
+        pep:
+          isPep: false
+          category: null
+          checkedAt: 2026-08-07T03:00:00.000Z
+        rejectionReasons: []
+
+    KycStatusPendingReview:
+      summary: Верификация на ручной проверке → KYC_PENDING (403)
+      description: |
+        Соответствует сценарному переключателю прототипа `KYC_PENDING` (канон §10.6).
+        Пользователю показывается `Verification in progress`, ошибка retryable.
+      value:
+        userId: usr_01J8ZQ4H9K2M3N4P5R6S7T8V9W
+        level: BASIC
+        levelCode: 1
+        status: PENDING_REVIEW
+        verificationMethod: VIDEO_IDENT
+        provider: WEBID
+        verifiedAt: null
+        validUntil: null
+        expiresInDays: null
+        lastUpdatedAt: 2026-08-07T09:55:10.402Z
+        nextActionUrl: null
+        jurisdiction:
+          country: AE
+          allowed: true
+          restrictedOperations: []
+          requiredLevelForExchange: VERIFIED
+        allowedOperations:
+          - DEPOSIT
+        sanctions:
+          checked: true
+          hit: false
+          listNames: []
+          checkedAt: 2026-08-07T03:00:00.000Z
+        pep:
+          isPep: false
+          category: null
+          checkedAt: 2026-08-07T03:00:00.000Z
+        rejectionReasons: []
+
+    KycStatusNotStarted:
+      summary: Верификация не начиналась → KYC_REQUIRED (403)
+      description: Пользователю показывается `Verify your identity to exchange` с переходом по `nextActionUrl`.
+      value:
+        userId: usr_01J8ZQ4H9K2M3N4P5R6S7T8V9W
+        level: NONE
+        levelCode: 0
+        status: NOT_STARTED
+        verificationMethod: null
+        provider: WEBID
+        verifiedAt: null
+        validUntil: null
+        expiresInDays: null
+        lastUpdatedAt: 2026-08-01T06:00:00.000Z
+        nextActionUrl: https://verify.webid.internal.wallet/start
+        jurisdiction:
+          country: AE
+          allowed: true
+          restrictedOperations: []
+          requiredLevelForExchange: VERIFIED
+        allowedOperations: []
+        sanctions:
+          checked: false
+          hit: false
+          listNames: []
+          checkedAt: null
+        pep:
+          isPep: false
+          category: null
+          checkedAt: null
+        rejectionReasons: []
+
+    KycStatusExpired:
+      summary: Срок действия верификации истёк → KYC_EXPIRED (403)
+      description: |
+        `validUntil` в прошлом, `status = EXPIRED`. Пользователю показывается
+        `Your verification has expired`; ошибка не retryable — нужна новая сессия.
+      value:
+        userId: usr_01J8ZQ4H9K2M3N4P5R6S7T8V9W
+        level: VERIFIED
+        levelCode: 2
+        status: EXPIRED
+        verificationMethod: AUTO_IDENT
+        provider: WEBID
+        verifiedAt: 2024-04-30T12:41:07.310Z
+        validUntil: 2026-04-30T23:59:59.000Z
+        expiresInDays: 0
+        lastUpdatedAt: 2026-05-01T00:00:03.117Z
+        nextActionUrl: https://verify.webid.internal.wallet/renew
+        jurisdiction:
+          country: AE
+          allowed: true
+          restrictedOperations: []
+          requiredLevelForExchange: VERIFIED
+        allowedOperations: []
+        sanctions:
+          checked: true
+          hit: false
+          listNames: []
+          checkedAt: 2026-04-30T03:00:00.000Z
+        pep:
+          isPep: false
+          category: null
+          checkedAt: 2026-04-30T03:00:00.000Z
+        rejectionReasons: []
+
+    KycStatusRejected:
+      summary: Отказ в верификации → KYC_REQUIRED (403)
+      description: |
+        Причины отказа перечислены в `rejectionReasons` и наружу **не транслируются** —
+        пользователь видит обобщённое `Verify your identity to exchange`.
+      value:
+        userId: usr_01J8ZQ4H9K2M3N4P5R6S7T8V9W
+        level: NONE
+        levelCode: 0
+        status: REJECTED
+        verificationMethod: AUTO_IDENT
+        provider: WEBID
+        verifiedAt: null
+        validUntil: null
+        expiresInDays: null
+        lastUpdatedAt: 2026-07-19T11:03:42.660Z
+        nextActionUrl: https://verify.webid.internal.wallet/retry
+        jurisdiction:
+          country: AE
+          allowed: true
+          restrictedOperations: []
+          requiredLevelForExchange: VERIFIED
+        allowedOperations: []
+        sanctions:
+          checked: true
+          hit: false
+          listNames: []
+          checkedAt: 2026-07-19T03:00:00.000Z
+        pep:
+          isPep: false
+          category: null
+          checkedAt: 2026-07-19T03:00:00.000Z
+        rejectionReasons:
+          - code: DOCUMENT_EXPIRED
+            reason: Presented passport expired on 2026-03-14
+            occurredAt: 2026-07-19T11:03:42.660Z
+            retryable: true
+          - code: FACE_MISMATCH
+            reason: Face similarity score below acceptance threshold
+            occurredAt: 2026-07-19T11:03:43.120Z
+            retryable: true
+
+    KycSessionCreateVideoIdent:
+      summary: Запрос на создание сессии AutoIdent
+      value:
+        userId: usr_01J8ZQ4H9K2M3N4P5R6S7T8V9W
+        method: AUTO_IDENT
+        targetLevel: VERIFIED
+        redirectSuccessUrl: https://app.wallet.internal/exchange?kyc=success
+        redirectFailureUrl: https://app.wallet.internal/exchange?kyc=failure
+        locale: en-GB
+
+    KycSessionCreated:
+      summary: Сессия создана, пользователь ещё не начал прохождение
+      description: Ответ `201`; при идемпотентном повторе тот же объект возвращается с `200`.
+      value:
+        sessionId: kys_01J9X3B5N6P8Q0R2T4V6X8Z1C3
+        userId: usr_01J8ZQ4H9K2M3N4P5R6S7T8V9W
+        method: AUTO_IDENT
+        status: NOT_STARTED
+        redirectUrl: https://verify.webid.internal.wallet/session/kys_01J9X3B5N6P8Q0R2T4V6X8Z1C3
+        expiresAt: 2026-08-07T11:15:32.117Z
+        createdAt: 2026-08-07T10:15:32.117Z
+        attemptsUsed: 0
+        attemptsLimit: 3
+
+    KycSessionInProgress:
+      summary: Пользователь проходит верификацию
+      description: |
+        Промежуточное состояние. Финальный результат придёт webhook-ом
+        `kyc.status.changed`; опрос этого ресурса — резервный канал.
+      value:
+        sessionId: kys_01J9X3B5N6P8Q0R2T4V6X8Z1C3
+        userId: usr_01J8ZQ4H9K2M3N4P5R6S7T8V9W
+        method: AUTO_IDENT
+        status: IN_PROGRESS
+        redirectUrl: https://verify.webid.internal.wallet/session/kys_01J9X3B5N6P8Q0R2T4V6X8Z1C3
+        expiresAt: 2026-08-07T11:15:32.117Z
+        createdAt: 2026-08-07T10:15:32.117Z
+        attemptsUsed: 1
+        attemptsLimit: 3
+
+    KycDocumentsVerified:
+      summary: Метаданные верифицированного паспорта (без содержимого)
+      description: |
+        Обратите внимание: ни номера документа, ни изображений в ответе нет и быть
+        не может — схема закрыта.
+      value:
+        userId: usr_01J8ZQ4H9K2M3N4P5R6S7T8V9W
+        total: 1
+        retrievedAt: 2026-08-07T10:15:31.940Z
+        items:
+          - documentId: kdc_01J9X3C7P2R4T6V8X0Z2B4D6F8
+            type: PASSPORT
+            issuingCountry: GB
+            expiresAt: 2029-06-12T23:59:59.000Z
+            verified: true
+            verifiedAt: 2025-04-30T12:41:07.310Z
+
+    WebhookKycApproved:
+      summary: Верификация одобрена, уровень повышен до VERIFIED
+      description: |
+        Приводит к инвалидации кеша KYC-статуса. Обрабатывается идемпотентно по
+        `eventId`, упорядоченно по `sequence`.
+      value:
+        eventId: b41e77a0-2c19-4b8f-9d33-6e05a7c8f102
+        eventType: kyc.status.changed
+        occurredAt: 2026-08-07T09:12:44.018Z
+        sequence: 42
+        userId: usr_01J8ZQ4H9K2M3N4P5R6S7T8V9W
+        previousLevel: BASIC
+        currentLevel: VERIFIED
+        status: APPROVED
+        validUntil: 2027-04-30T23:59:59.000Z
+        rejectionReasons: []
+        provider: WEBID
+
+    WebhookKycRejected:
+      summary: Отказ в верификации
+      description: |
+        Уровень понижен до `NONE`. Событие с меньшим `sequence`, пришедшее после
+        этого, будет отброшено как out-of-order.
+      value:
+        eventId: 0f7c2e91-6b4a-4d18-8e52-91d3a7f60c44
+        eventType: kyc.status.changed
+        occurredAt: 2026-07-19T11:03:43.500Z
+        sequence: 41
+        userId: usr_01J8ZQ4H9K2M3N4P5R6S7T8V9W
+        previousLevel: BASIC
+        currentLevel: NONE
+        status: REJECTED
+        validUntil: null
+        provider: WEBID
+        rejectionReasons:
+          - code: DOCUMENT_EXPIRED
+            reason: Presented passport expired on 2026-03-14
+            occurredAt: 2026-07-19T11:03:42.660Z
+            retryable: true
+
+    WebhookAckAccepted:
+      summary: Событие принято
+      value:
+        received: true
+        eventId: b41e77a0-2c19-4b8f-9d33-6e05a7c8f102
+        duplicate: false
+        outOfOrderDiscarded: false
+
+    WebhookAckDuplicate:
+      summary: Повторная доставка того же eventId в окне 24 ч — no-op
+      value:
+        received: true
+        eventId: b41e77a0-2c19-4b8f-9d33-6e05a7c8f102
+        duplicate: true
+        outOfOrderDiscarded: false
+
+    ErrorInvalidRequest:
+      summary: Нарушение схемы запроса → VALIDATION_ERROR (400)
+      value:
+        error: INVALID_REQUEST
+        message: Request body failed schema validation
+        traceId: c73a01f9be5d4827
+        timestamp: 2026-08-07T10:15:32.117Z
+        correlationId: 01J9X2C4K7QF8N3M5T6V7W8Y9Z
+        retryable: false
+        details:
+          - field: userId
+            issue: does not match pattern ^usr_[0-9A-HJKMNP-TV-Z]{26}$
+
+    ErrorUnauthorized:
+      summary: Невалидный service JWT → EXCHANGE_SERVICE_UNAVAILABLE (503)
+      value:
+        error: UNAUTHORIZED
+        message: Service token is expired or signature verification failed
+        traceId: 8b1e07c4aa9f42d1
+        timestamp: 2026-08-07T10:15:32.117Z
+        correlationId: 01J9X2C4K7QF8N3M5T6V7W8Y9Z
+        retryable: false
+        details: []
+
+    ErrorKycNotStarted:
+      summary: Верификация не начиналась → KYC_REQUIRED (403)
+      value:
+        error: KYC_NOT_STARTED
+        message: User has not started identity verification
+        traceId: 2a8f04d1b6e94c37
+        timestamp: 2026-08-07T10:15:32.117Z
+        correlationId: 01J9X2C4K7QF8N3M5T6V7W8Y9Z
+        retryable: false
+        details:
+          - field: level
+            issue: current level NONE, required VERIFIED
+
+    ErrorKycLevelTooLow:
+      summary: Уровень ниже требуемого → KYC_LEVEL_INSUFFICIENT (403)
+      value:
+        error: KYC_LEVEL_TOO_LOW
+        message: Current verification level is insufficient for exchange operations
+        traceId: 5d0c93af71b24e68
+        timestamp: 2026-08-07T10:15:32.117Z
+        correlationId: 01J9X2C4K7QF8N3M5T6V7W8Y9Z
+        retryable: false
+        details:
+          - field: levelCode
+            issue: current 1, required 2
+
+    ErrorKycInReview:
+      summary: Верификация на проверке → KYC_PENDING (403, retryable)
+      value:
+        error: KYC_IN_REVIEW
+        message: Verification is under manual compliance review
+        traceId: 9c14e7b03fa5d286
+        timestamp: 2026-08-07T10:15:32.117Z
+        correlationId: 01J9X2C4K7QF8N3M5T6V7W8Y9Z
+        retryable: true
+        details:
+          - field: status
+            issue: PENDING_REVIEW since 2026-08-07T09:55:10.402Z
+
+    ErrorKycExpired:
+      summary: Срок верификации истёк → KYC_EXPIRED (403)
+      value:
+        error: KYC_EXPIRED
+        message: Verification has expired and must be renewed
+        traceId: 41b6d2e903c78a5f
+        timestamp: 2026-08-07T10:15:32.117Z
+        correlationId: 01J9X2C4K7QF8N3M5T6V7W8Y9Z
+        retryable: false
+        details:
+          - field: validUntil
+            issue: expired at 2026-04-30T23:59:59.000Z
+
+    ErrorSessionLimitReached:
+      summary: Исчерпан лимит попыток → KYC_REQUIRED (403)
+      description: |
+        Намеренно **не** маппится в `RATE_LIMITED`: для пользователя это состояние
+        верификации, а не троттлинг — «повторите позже» было бы ложным обещанием.
+      value:
+        error: SESSION_LIMIT_REACHED
+        message: Verification attempts limit reached, contact support
+        traceId: 7e29b4c150da8367
+        timestamp: 2026-08-07T10:15:32.117Z
+        correlationId: 01J9X2C4K7QF8N3M5T6V7W8Y9Z
+        retryable: false
+        details:
+          - field: attemptsUsed
+            issue: 3 of 3 attempts consumed
+
+    ErrorSessionNotFound:
+      summary: Сессия не найдена → VALIDATION_ERROR (400)
+      value:
+        error: SESSION_NOT_FOUND
+        message: Verification session does not exist or has been purged
+        traceId: 6f3d81a07be24591
+        timestamp: 2026-08-07T10:15:32.117Z
+        correlationId: 01J9X2C4K7QF8N3M5T6V7W8Y9Z
+        retryable: false
+        details: []
+
+    ErrorIdempotencyConflict:
+      summary: Тот же Idempotency-Key с другим телом → IDEMPOTENCY_CONFLICT (409)
+      value:
+        error: IDEMPOTENCY_CONFLICT
+        message: Idempotency-Key was already used with a different request body
+        traceId: 30c5f7a9e1b64d82
+        timestamp: 2026-08-07T10:15:32.117Z
+        correlationId: 01J9X2C4K7QF8N3M5T6V7W8Y9Z
+        retryable: false
+        details:
+          - field: Idempotency-Key
+            issue: 7c1d9b34-8f52-4a6e-b0c7-2e15d3f49a88 bound to a different payload hash
+
+    ErrorMethodNotAvailable:
+      summary: Способ идентификации недоступен в юрисдикции → VALIDATION_ERROR (400)
+      value:
+        error: METHOD_NOT_AVAILABLE
+        message: Requested verification method is not available in the user jurisdiction
+        traceId: 18e4a7c26b0f93d5
+        timestamp: 2026-08-07T10:15:32.117Z
+        correlationId: 01J9X2C4K7QF8N3M5T6V7W8Y9Z
+        retryable: false
+        details:
+          - field: method
+            issue: VIDEO_IDENT is not available in jurisdiction AE
+
+    ErrorRateLimited:
+      summary: Превышен лимит обращений → RATE_LIMITED (429)
+      value:
+        error: RATE_LIMITED
+        message: Too many requests from exchange-bff, quota exceeded for the current window
+        traceId: 7f2a4c6e8d0b1359
+        timestamp: 2026-08-07T10:15:32.117Z
+        correlationId: 01J9X2C4K7QF8N3M5T6V7W8Y9Z
+        retryable: true
+        details: []
+
+    ErrorInternal:
+      summary: Внутренняя ошибка → EXCHANGE_SERVICE_UNAVAILABLE (503)
+      value:
+        error: INTERNAL_ERROR
+        message: Unexpected internal error while reading verification status
+        traceId: 0a9b8c7d6e5f4321
+        timestamp: 2026-08-07T10:15:32.117Z
+        correlationId: 01J9X2C4K7QF8N3M5T6V7W8Y9Z
+        retryable: true
+        details: []
+
+    ErrorServiceUnavailable:
+      summary: Провайдер недоступен → EXCHANGE_SERVICE_UNAVAILABLE (503), stale запрещён
+      description: |
+        Канон §11: KYC-статус при недоступности источника **не** отдаётся из устаревшего
+        кеша. Операция блокируется.
+      value:
+        error: SERVICE_UNAVAILABLE
+        message: KYC provider is temporarily unavailable, stale status must not be served
+        traceId: 5e6f7a8b9c0d1e2f
+        timestamp: 2026-08-07T10:15:32.117Z
+        correlationId: 01J9X2C4K7QF8N3M5T6V7W8Y9Z
+        retryable: true
+        details: []
+
+    ErrorUpstreamTimeout:
+      summary: Таймаут 1000 мс → UPSTREAM_TIMEOUT (504)
+      value:
+        error: UPSTREAM_TIMEOUT
+        message: KYC provider did not respond within the configured deadline
+        traceId: 3b2a1908f7e6d5c4
+        timestamp: 2026-08-07T10:15:32.117Z
+        correlationId: 01J9X2C4K7QF8N3M5T6V7W8Y9Z
+        retryable: true
+        details: []
+
+    ErrorWebhookInvalidPayload:
+      summary: Невалидный payload webhook — провайдер не ретраит
+      value:
+        error: INVALID_REQUEST
+        message: Webhook payload failed schema validation
+        traceId: a1b2c3d4e5f60718
+        timestamp: 2026-08-07T09:12:44.220Z
+        correlationId: 01J9X2C4K7QF8N3M5T6V7W8Y9Z
+        retryable: false
+        details:
+          - field: sequence
+            issue: must be a positive integer
+
+    ErrorWebhookBadSignature:
+      summary: Подпись невалидна или timestamp вне окна 300 с
+      value:
+        error: INVALID_SIGNATURE
+        message: X-WebID-Signature verification failed or timestamp is outside the 300s window
+        traceId: f0e1d2c3b4a59687
+        timestamp: 2026-08-07T09:12:44.220Z
+        correlationId: 01J9X2C4K7QF8N3M5T6V7W8Y9Z
+        retryable: false
+        details:
+          - field: X-WebID-Signature
+            issue: timestamp skew 812s exceeds the 300s tolerance window

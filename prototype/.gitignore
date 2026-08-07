@@ -1,0 +1,7 @@
+node_modules/
+dist/
+.money-check/
+.render-check/
+.flow-check/
+*.tsbuildinfo
+install.log

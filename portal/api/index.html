@@ -1,0 +1,203 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Exchange Order — API (Swagger UI)</title>
+  <meta name="description" content="OpenAPI 3.1: основной контракт заявки на обмен и девять контрактов внешних сервисов.">
+  <link rel="icon" type="image/svg+xml" href="./favicon.svg">
+
+  <!-- Swagger UI: локальная копия из node_modules/swagger-ui-dist (кладёт tools/sync.py).
+       Если каталог vendor/ не собран, ниже сработает откат на CDN unpkg.com. -->
+  <link rel="stylesheet" href="./vendor/swagger-ui.css">
+  <style>
+    :root {
+      --brand:        #2563EB;
+      --brand-dark:   #1D4ED8;
+      --brand-ink:    #0F172A;
+      --brand-muted:  #64748B;
+      --brand-line:   #E2E8F0;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: #FAFAFA;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+    }
+
+    /* Шапка — тот же синий, что и в вики (--md-primary-fg-color: #2563EB) */
+    header.topbar {
+      display: flex;
+      align-items: center;
+      gap: 1rem;
+      padding: 0 1rem;
+      height: 3rem;
+      background: var(--brand);
+      color: #fff;
+      box-shadow: 0 2px 6px rgba(15, 23, 42, 0.2);
+      position: sticky;
+      top: 0;
+      z-index: 100;
+    }
+    header.topbar a.back {
+      color: #fff;
+      text-decoration: none;
+      font-size: 0.85rem;
+      padding: 0.35rem 0.6rem;
+      border-radius: 0.25rem;
+      white-space: nowrap;
+      transition: background 120ms;
+    }
+    header.topbar a.back:hover { background: rgba(255, 255, 255, 0.16); }
+    header.topbar .title {
+      font-size: 0.95rem;
+      font-weight: 600;
+      letter-spacing: 0.01em;
+    }
+    header.topbar .sub {
+      font-size: 0.78rem;
+      opacity: 0.8;
+      margin-left: auto;
+      white-space: nowrap;
+    }
+    @media (max-width: 640px) { header.topbar .sub { display: none; } }
+
+    #offline-warning {
+      display: none;
+      margin: 0;
+      padding: 0.7rem 1rem;
+      background: #FEF3C7;
+      color: #78350F;
+      font-size: 0.82rem;
+      border-bottom: 1px solid #FCD34D;
+    }
+
+    /* Swagger UI подкрашиваем под продукт.
+       ВНИМАНИЕ: .topbar не прячем — именно в нём живёт переключатель
+       спецификаций (SwaggerUIBundle рисует <select> из `urls`).
+       Убираем только логотип Swagger. */
+    .swagger-ui .topbar {
+      background: var(--brand-dark);
+      padding: 0.55rem 0;
+    }
+    .swagger-ui .topbar .topbar-wrapper .link { display: none; }
+    .swagger-ui .topbar .download-url-wrapper { flex: 1; }
+    .swagger-ui .topbar .download-url-wrapper .select-label {
+      max-width: none;
+      margin: 0;
+    }
+    .swagger-ui .topbar .download-url-wrapper .select-label span {
+      color: #fff;
+      font-size: 0.8rem;
+      font-weight: 600;
+      padding-right: 0.8rem;
+    }
+    .swagger-ui .topbar .download-url-wrapper .select-label select {
+      border: 2px solid rgba(255, 255, 255, 0.55);
+      border-radius: 0.25rem;
+      outline: none;
+    }
+    .swagger-ui .info { margin: 1.5rem 0; }
+    .swagger-ui .info .title { color: var(--brand-ink); }
+    .swagger-ui .scheme-container { box-shadow: none; border-bottom: 1px solid var(--brand-line); }
+    .swagger-ui .btn.authorize { border-color: var(--brand); color: var(--brand); }
+    .swagger-ui .btn.authorize svg { fill: var(--brand); }
+    .swagger-ui select { border-color: var(--brand-line); }
+  </style>
+</head>
+<body>
+  <header class="topbar">
+    <a class="back" id="back-link" href="../index.html">&larr; Документация</a>
+    <span class="title">Exchange Order — API</span>
+    <span class="sub">OpenAPI 3.1 · основной контракт + 9 внешних сервисов</span>
+  </header>
+
+  <p id="offline-warning">
+    Локальная сборка Swagger UI не найдена (<code>vendor/</code>), загружаем с
+    <code>unpkg.com</code> — нужен интернет. Чтобы работало офлайн, выполните
+    <code>npm install</code> и <code>npm run sync</code> в каталоге <code>portal/</code>.
+  </p>
+
+  <div id="swagger-ui"></div>
+
+  <script src="./vendor/swagger-ui-bundle.js" onerror="window.__swaggerVendorMissing = true"></script>
+  <script src="./vendor/swagger-ui-standalone-preset.js" onerror="window.__swaggerVendorMissing = true"></script>
+  <script>
+    // ── Список спецификаций: основная + девять контрактов внешних сервисов ──
+    // Порядок и названия соответствуют docs/api/INTEGRATIONS.md (разделы S1…S9).
+    var SPECS = [
+      { name: "Exchange Orders API (основной контракт)", url: "./specs/exchange-orders.openapi.yaml" },
+      { name: "S1 — Users Service",         url: "./specs/integrations/users.yaml" },
+      { name: "S2 — KYC Service (WebID)",   url: "./specs/integrations/kyc-webid.yaml" },
+      { name: "S3 — Scoring / AML Service", url: "./specs/integrations/scoring-aml.yaml" },
+      { name: "S4 — Limits & Fees Service", url: "./specs/integrations/limits-fees.yaml" },
+      { name: "S5 — Exchange Rate Service", url: "./specs/integrations/exchange-rates.yaml" },
+      { name: "S6 — Accounting Service",    url: "./specs/integrations/accounting.yaml" },
+      { name: "S7 — Crypto Provider",       url: "./specs/integrations/crypto-provider.yaml" },
+      { name: "S8 — Order Service",         url: "./specs/integrations/order-service.yaml" },
+      { name: "S9 — Notification Service",  url: "./specs/integrations/notifications.yaml" }
+    ];
+
+    // ── Ссылка «← Документация» ────────────────────────────────────────────
+    // В собранном портале страница лежит в /swagger/, вики — уровнем выше.
+    // В dev-режиме Swagger UI раздаётся с корня отдельного порта, поэтому
+    // отправляем на порт вики.
+    (function () {
+      var link = document.getElementById("back-link");
+      var path = location.pathname.replace(/index\.html$/, "");
+      if (!/\/swagger\/$/.test(path) && path !== "/swagger") {
+        link.href = location.protocol + "//" + location.hostname + ":8100/";
+      }
+    })();
+
+    // ── Откат на CDN, если vendor/ не собран ───────────────────────────────
+    function loadFromCdn(done) {
+      document.getElementById("offline-warning").style.display = "block";
+      var base = "https://unpkg.com/swagger-ui-dist@5/";
+      var css = document.createElement("link");
+      css.rel = "stylesheet";
+      css.href = base + "swagger-ui.css";
+      document.head.appendChild(css);
+      var left = 2;
+      ["swagger-ui-bundle.js", "swagger-ui-standalone-preset.js"].forEach(function (f) {
+        var s = document.createElement("script");
+        s.src = base + f;
+        s.onload = function () { if (--left === 0) { done(); } };
+        s.onerror = function () {
+          document.getElementById("swagger-ui").innerHTML =
+            '<p style="padding:2rem;font:14px/1.5 sans-serif">Swagger UI не загрузился: ' +
+            'локальной копии нет и CDN недоступен. Выполните <code>npm install</code> ' +
+            'и <code>npm run sync</code> в каталоге <code>portal/</code>.</p>';
+        };
+        document.body.appendChild(s);
+      });
+    }
+
+    function boot() {
+      window.ui = SwaggerUIBundle({
+        urls: SPECS,
+        "urls.primaryName": SPECS[0].name,
+        dom_id: "#swagger-ui",
+        deepLinking: true,
+        docExpansion: "list",
+        defaultModelsExpandDepth: 1,
+        defaultModelExpandDepth: 3,
+        displayRequestDuration: true,
+        filter: true,
+        tryItOutEnabled: false,
+        persistAuthorization: true,
+        syntaxHighlight: { activate: true, theme: "idea" },
+        presets: [SwaggerUIBundle.presets.apis, SwaggerUIStandalonePreset],
+        plugins: [SwaggerUIBundle.plugins.DownloadUrl],
+        layout: "StandaloneLayout"
+      });
+    }
+
+    if (typeof SwaggerUIBundle === "undefined" || window.__swaggerVendorMissing) {
+      loadFromCdn(boot);
+    } else {
+      boot();
+    }
+  </script>
+</body>
+</html>

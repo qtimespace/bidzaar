@@ -1,0 +1,18 @@
+{
+  "name": "exchange-order-portal",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Портал документации Exchange Order: вики (MkDocs Material) и Swagger UI по отдельным адресам",
+  "scripts": {
+    "sync": "python tools/sync.py",
+    "wiki": "npm run sync && cd wiki && python -m mkdocs serve --dev-addr 127.0.0.1:8100",
+    "api": "npm run sync && python -m http.server 8101 --bind 127.0.0.1 --directory api",
+    "build": "npm run sync && cd wiki && python -m mkdocs build --strict --clean",
+    "serve": "python -m http.server 8080 --bind 127.0.0.1 --directory dist",
+    "clean": "python -c \"import shutil,pathlib;[shutil.rmtree(p,ignore_errors=True) for p in [pathlib.Path('dist'),pathlib.Path('api/specs'),pathlib.Path('api/vendor'),pathlib.Path('wiki/docs/swagger')]]\""
+  },
+  "dependencies": {
+    "mermaid": "^11.16.1",
+    "swagger-ui-dist": "^5.32.12"
+  }
+}

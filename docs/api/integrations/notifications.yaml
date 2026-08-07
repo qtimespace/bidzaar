@@ -1,0 +1,2496 @@
+openapi: 3.1.0
+
+info:
+  title: S9 Notification Service API (inbound contract stub)
+  version: "1.0.0"
+  summary: Контракт постановки уведомления в очередь, чтения статуса доставки, шаблонов и согласий пользователя.
+  description: |
+    # S9 — Notification Service
+
+    ## Что это за документ
+
+    Это **стаб контракта ВХОДЯЩЕЙ информации**. Он описывает не то, что мы реализуем,
+    а то, что наше приложение — **Exchange BFF** — *получает* от внешнего сервиса
+    уведомлений. Реализация S9 вне нашего скоупа.
+
+    ## Назначение
+
+    Канон §3, S9: «Подтверждение доставки уведомления о созданной заявке». От S9 мы
+    получаем:
+
+    * `notificationId` — квитанцию о том, что уведомление принято в очередь;
+    * статус доставки по каналам (`EMAIL`, `PUSH`, `TELEGRAM`, `SMS`, `IN_APP`);
+    * справочник шаблонов — какие переменные обязательны и какие каналы поддержаны;
+    * каналы и согласия пользователя, чтобы не отправлять туда, куда он отписался;
+    * асинхронные события изменения статуса доставки через вебхук
+      `notification.delivery.updated`.
+
+    ## Критичность: Non-blocking (канон §3)
+
+    Правило класса из §3: «Отказ → заявка создана успешно, доставка уведомления уходит
+    в ретрай-очередь».
+
+    > **Никакая ошибка S9 не пробрасывается пользователю и не отменяет заявку.**
+
+    Это не смягчающая формулировка, а жёсткое правило. Обоснование простое: к моменту
+    вызова S9 заявка **уже зарегистрирована** в S8 и `orderId` **уже присвоен** — все
+    19 шагов цепочки валидации канона §6 пройдены. Отказать пользователю после этого
+    было бы прямой ложью: заявка существует, средства зарезервированы. Максимум,
+    что происходит при сбое S9, — пользователь не получит письмо; он всё равно видит
+    экран подтверждения с `orderId`.
+
+    ## Место в цепочке валидации (канон §6)
+
+    **S9 не участвует ни в одном из 19 шагов.** Вызов S9 идёт **после** шага 19
+    («Заявка зарегистрирована», S8), уже за пределами транзакции создания заявки,
+    в режиме **fire-and-forget**:
+
+    ```
+    шаг 19: S8 вернул orderId и status = PENDING
+            │
+            ├──> ответ пользователю (201 / 202)     ← НЕ ждёт S9
+            │
+            └──> POST /v1/notifications (S9)        ← асинхронно, таймаут 1000 мс
+                     успех  -> notificationId в лог
+                     ошибка -> лог + ретрай-очередь -> DLQ
+    ```
+
+    Ответ пользователю **не ждёт** результата S9. Даже успешная постановка в очередь
+    не блокирует отдачу ответа.
+
+    ## Таймауты и ретраи (канон §11)
+
+    | Параметр | Значение |
+    |---|---|
+    | Таймаут S9 | **1 000 мс** (согласовано с §11: «Таймаут S1/S2/S3/S4 — 1 000 мс» для нетранзакционных вызовов) |
+    | Режим вызова | **fire-and-forget** — ответ пользователю не ждёт S9 |
+    | Ретраи `GET` | 2 попытки, экспоненциальный backoff + jitter |
+    | Ретраи `POST /v1/notifications` | безопасны благодаря `Idempotency-Key`, но выполняются **асинхронно** из ретрай-очереди, а не на пути запроса |
+    | Ретрай-очередь | 1 м → 5 м → 15 м → 1 ч → 6 ч, затем **DLQ** |
+    | Circuit breaker | 50 % ошибок на окне 20 запросов, `open` 30 с — при `open` уведомление кладётся прямо в ретрай-очередь, минуя вызов |
+
+    Обратите внимание на отличие от S8: там ретрай `POST` **запрещён**, потому что вызов
+    лежит на денежном пути и его повтор мог бы привести к двойному списанию. Здесь
+    повтор `POST` безопасен — худший исход дубликата уведомления не финансовый,
+    а косметический, и он дополнительно гасится `deduplicationKey`.
+
+    ## Кеш и допустимость stale
+
+    | Данные | TTL | Stale |
+    |---|---|---|
+    | `POST /v1/notifications` | не кешируется | — (запись) |
+    | `GET /v1/notifications/{id}` | не кешируется | статус доставки нужен свежим при разборе |
+    | `GET /v1/templates` | 15 мин | **да**, без ограничения по возрасту — шаблоны меняются редко |
+    | `GET /v1/templates/{id}` | 15 мин | **да** |
+    | `GET /v1/users/{userId}/notification-preferences` | 60 с | **да, до 24 ч** — с оговоркой ниже |
+
+    ### Оговорка про stale-настройки согласий
+
+    Устаревшие настройки опасны в одну сторону: если пользователь **только что отписался**,
+    а мы работаем на кеше, мы отправим ему сообщение вопреки его воле. Поэтому:
+
+    * отписка (`enabled: false`, `optedOutAt != null`) в кеше **действует немедленно**
+      и никогда не «протухает» в сторону разрешения;
+    * авторитетную проверку согласий в любом случае выполняет **сам S9** при отправке:
+      если пользователь отписался, S9 вернёт `USER_OPTED_OUT` и переведёт уведомление
+      в `SUPPRESSED`. Кеш BFF — только оптимизация, а не механизм соблюдения согласий.
+
+    ## Поведение при недоступности
+
+    | Ситуация | Реакция BFF | Что видит пользователь |
+    |---|---|---|
+    | Таймаут 1 000 мс | уведомление в ретрай-очередь | **экран успеха с `orderId`** |
+    | 4xx (кроме 429) | лог как дефект интеграции, без ретрая | **экран успеха с `orderId`** |
+    | `USER_OPTED_OUT` | не ошибка — норма; статус `SUPPRESSED` | **экран успеха с `orderId`** |
+    | 429 / 5xx / брейкер `open` | ретрай-очередь → DLQ | **экран успеха с `orderId`** |
+    | S9 недоступен полностью | ретрай-очередь → DLQ, алерт дежурному | **экран успеха с `orderId`** |
+
+    Правая колонка одинакова во всех строках. Это и есть определение `Non-blocking`.
+
+    ## PII — самый чувствительный раздел контракта
+
+    S9 — единственная из девяти систем, которая по своей природе работает с **прямыми
+    контактными данными**: адресами email, номерами телефона, идентификаторами
+    мессенджеров. Отсюда жёсткие правила.
+
+    **Что запрещено класть в `variables` шаблона:**
+
+    * полный номер счёта или кошелька;
+    * токены, коды подтверждения, ссылки с одноразовыми секретами;
+    * полный email или номер телефона;
+    * паспортные данные, результаты KYC, риск-скор и причины скоринга;
+    * полное имя пользователя, если шаблон может уйти в SMS или Telegram.
+
+    **Что допустимо:** `orderId`, суммы, коды активов, названия сетей, курс, время
+    создания, локализуемые коды статусов.
+
+    Причина: содержимое `variables` попадает в тело письма и в лог доставки у оператора
+    связи. Всё, что там оказалось, следует считать вышедшим за периметр.
+
+    **Маскирование адресов.** В `NotificationPreferences.channels[].address` адрес
+    приходит **уже маскированным** (`a***n@example.com`, `+971 ** *** 4417`). Полный
+    адрес BFF не получает и не должен получать: он ему не нужен — адресация выполняется
+    по `userId` на стороне S9. Это применение принципа минимизации данных: система,
+    которой данные не нужны для работы, не должна их видеть.
+
+  contact:
+    name: Exchange BFF Team
+    email: exchange-bff@wallet.internal
+  license:
+    name: Proprietary (internal use only)
+    identifier: LicenseRef-Wallet-Internal
+
+servers:
+  - url: https://notify.internal.wallet
+    description: |
+      Продакшн-инстанс сервиса уведомлений. Полный базовый путь с учётом версии —
+      `https://notify.internal.wallet/v1`. Только внутренний периметр, mTLS обязателен.
+  - url: https://notify.staging.internal.wallet
+    description: |
+      Staging. Полный базовый путь — `https://notify.staging.internal.wallet/v1`.
+      Реальная отправка отключена, все каналы работают в режиме sink с логированием.
+  - url: https://notify.mock.internal.wallet
+    description: |
+      Mock-инстанс для контрактных тестов. Полный базовый путь —
+      `https://notify.mock.internal.wallet/v1`. Отдаёт фикстуры канона §10
+      и умеет воспроизводить исходы `SUPPRESSED` и `FAILED`.
+
+security:
+  - bearerAuth: []
+
+tags:
+  - name: notifications
+    description: |
+      Постановка уведомления в очередь и чтение статуса его доставки по каналам.
+  - name: templates
+    description: |
+      Справочник шаблонов уведомлений — какие каналы, локали и переменные поддержаны.
+  - name: preferences
+    description: |
+      Каналы связи пользователя и его согласия на получение уведомлений.
+  - name: webhooks
+    description: |
+      Асинхронные события изменения статуса доставки, которые S9 присылает
+      в наш приёмник.
+
+paths:
+
+  /v1/notifications:
+    post:
+      operationId: createNotification
+      summary: Enqueue a notification
+      tags: [notifications]
+      description: |
+        Ставит уведомление в очередь отправки и возвращает `notificationId`.
+
+        ## Почему `202 Accepted`, а не `201 Created`
+
+        Разница между этими кодами — не стилистическая, она про **честность контракта**.
+
+        * `201 Created` означает «ресурс создан и **работа завершена**». Клиент вправе
+          считать, что запрошенное действие выполнено.
+        * `202 Accepted` означает «запрос **принят к обработке**, результат будет позже,
+          и он ещё может оказаться неуспешным».
+
+        Здесь верно именно второе. В момент ответа S9 уведомление **ещё не отправлено**:
+        оно попало в очередь. Дальше его ждёт целая цепочка, каждый шаг которой может
+        не сработать:
+
+        ```
+        QUEUED -> SENDING -> SENT -> DELIVERED -> READ
+                     │         │         │
+                     └─> FAILED (провайдер канала отверг)
+                     └─> SUPPRESSED (пользователь отписан)
+        ```
+
+        Ответить `201` значило бы пообещать доставку, которую сервис гарантировать
+        не может — ни один канал связи такой гарантии не даёт. `202` честно сообщает:
+        «принято, следите за статусом». Именно поэтому ответ содержит `statusUrl`:
+        код `202` без способа узнать исход был бы бесполезен.
+
+        Побочное следствие, важное для нашей архитектуры: раз доставка не гарантирована
+        уже на уровне протокола, **опираться на уведомление как на подтверждение
+        создания заявки нельзя**. Подтверждение — это `orderId` на экране, полученный
+        от S8. Уведомление — приятное дополнение.
+
+        ## Идемпотентность
+
+        Заголовок `Idempotency-Key` (UUIDv4) **обязателен**, окно — 24 ч. Повтор с тем же
+        телом возвращает тот же `202` и тот же `notificationId`, второе уведомление
+        не ставится в очередь.
+
+        Дополнительно работает `deduplicationKey` в теле — это **другой** механизм,
+        и путать их не надо:
+
+        | Механизм | Область | Смысл |
+        |---|---|---|
+        | `Idempotency-Key` | транспорт | защита от повтора **одного и того же HTTP-запроса** (ретрай из очереди, двойной клик) |
+        | `deduplicationKey` | бизнес-логика | защита от **семантического дубликата**, пришедшего разными запросами: «не слать пользователю два письма про одну заявку», даже если BFF позвал дважды с разными ключами после рестарта |
+
+        ## Режим вызова
+
+        **Fire-and-forget.** Ответ пользователю на создание заявки **не ждёт** этого
+        вызова. Таймаут 1 000 мс; при его срабатывании уведомление уходит в ретрай-очередь.
+
+        ## PII
+
+        Перед вызовом BFF обязан проверить `variables` на отсутствие запрещённых значений
+        (см. раздел PII в `info.description`). Проверка выполняется по allow-list имён
+        переменных из `NotificationTemplate.requiredVariables`, а не по blocklist
+        подстрок — blocklist на такой задаче всегда дырявый.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKeyHeader'
+        - $ref: '#/components/parameters/CorrelationIdHeader'
+        - $ref: '#/components/parameters/RequestIdHeader'
+      requestBody:
+        required: true
+        description: Параметры уведомления.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/NotificationRequest'
+            examples:
+              orderCreated:
+                $ref: '#/components/examples/NotificationRequestOrderCreated'
+              manualReview:
+                $ref: '#/components/examples/NotificationRequestManualReview'
+      responses:
+        '202':
+          description: |
+            Уведомление принято в очередь. **Не означает, что оно отправлено или
+            доставлено** — см. обоснование выбора кода в описании операции.
+          headers:
+            Location:
+              $ref: '#/components/headers/Location'
+            X-Idempotent-Replay:
+              $ref: '#/components/headers/XIdempotentReplay'
+            X-Correlation-Id:
+              $ref: '#/components/headers/XCorrelationId'
+            X-Request-Id:
+              $ref: '#/components/headers/XRequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/NotificationAccepted'
+              examples:
+                accepted:
+                  $ref: '#/components/examples/NotificationAcceptedQueued'
+                suppressed:
+                  $ref: '#/components/examples/NotificationAcceptedSuppressed'
+        '400':
+          $ref: '#/components/responses/ValidationFailed'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/TemplateNotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/ChannelNotConfigured'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+        '504':
+          $ref: '#/components/responses/GatewayTimeout'
+
+  /v1/notifications/{notificationId}:
+    get:
+      operationId: getNotification
+      summary: Delivery status of a notification
+      tags: [notifications]
+      description: |
+        Возвращает текущий статус уведомления и построчную разбивку по каналам.
+
+        **Когда используется.** Это не часть пользовательского пути — экран подтверждения
+        заявки не ждёт доставки уведомления. Вызов нужен для наблюдаемости и разбора
+        обращений в поддержку («мне не пришло письмо»), а также для сверки, если вебхук
+        `notification.delivery.updated` был потерян.
+
+        **Ретраи.** Безопасное чтение, 2 попытки с backoff + jitter (канон §11).
+
+        **Кеш.** Не кешируется — при разборе инцидента нужен актуальный статус.
+
+        **Статус `SUPPRESSED` — не ошибка.** Он означает, что пользователь отписан
+        от канала, и система корректно исполнила его волю.
+      parameters:
+        - $ref: '#/components/parameters/NotificationIdPath'
+        - $ref: '#/components/parameters/CorrelationIdHeader'
+        - $ref: '#/components/parameters/RequestIdHeader'
+      responses:
+        '200':
+          description: Статус уведомления получен.
+          headers:
+            X-Correlation-Id:
+              $ref: '#/components/headers/XCorrelationId'
+            X-Request-Id:
+              $ref: '#/components/headers/XRequestId'
+            Cache-Control:
+              $ref: '#/components/headers/CacheControlNoStore'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/NotificationStatus'
+              examples:
+                delivered:
+                  $ref: '#/components/examples/NotificationStatusDelivered'
+                partialFailure:
+                  $ref: '#/components/examples/NotificationStatusPartialFailure'
+                suppressed:
+                  $ref: '#/components/examples/NotificationStatusSuppressed'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotificationNotFound'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+        '504':
+          $ref: '#/components/responses/GatewayTimeout'
+
+  /v1/templates:
+    get:
+      operationId: listTemplates
+      summary: List notification templates
+      tags: [templates]
+      description: |
+        Возвращает справочник шаблонов уведомлений.
+
+        **Зачем нужно.** Из него BFF берёт `requiredVariables` — allow-list имён
+        переменных для конкретного шаблона. Именно этот список используется как фильтр
+        при сборке `variables`, чтобы в тело письма не попало ничего лишнего
+        (см. раздел PII в `info.description`).
+
+        **Кеш.** TTL 15 мин, stale допустим без ограничения по возрасту: шаблоны меняются
+        редко и версионируются. Недоступность справочника не блокирует отправку —
+        BFF использует последнюю известную версию.
+      parameters:
+        - $ref: '#/components/parameters/TemplateChannelQuery'
+        - $ref: '#/components/parameters/TemplateLocaleQuery'
+        - $ref: '#/components/parameters/CorrelationIdHeader'
+        - $ref: '#/components/parameters/RequestIdHeader'
+      responses:
+        '200':
+          description: Список шаблонов получен.
+          headers:
+            X-Correlation-Id:
+              $ref: '#/components/headers/XCorrelationId'
+            X-Request-Id:
+              $ref: '#/components/headers/XRequestId'
+            Cache-Control:
+              $ref: '#/components/headers/CacheControlTemplates'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/NotificationTemplateList'
+              examples:
+                exchangeTemplates:
+                  $ref: '#/components/examples/TemplateListExchange'
+        '400':
+          $ref: '#/components/responses/ValidationFailed'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+        '504':
+          $ref: '#/components/responses/GatewayTimeout'
+
+  /v1/templates/{templateId}:
+    get:
+      operationId: getTemplate
+      summary: Get a notification template
+      tags: [templates]
+      description: |
+        Возвращает один шаблон с превью темы и тела.
+
+        **Превью — это превью.** `subjectPreview` и `bodyPreview` содержат плейсхолдеры
+        (`{{orderId}}`), а не подставленные значения; они нужны для админки и для
+        контрактных тестов, а не для рендеринга на нашей стороне. Рендерит **S9**:
+        иначе локализация и вёрстка разъехались бы между отправителями.
+
+        **Кеш.** TTL 15 мин, stale допустим.
+      parameters:
+        - $ref: '#/components/parameters/TemplateIdPath'
+        - $ref: '#/components/parameters/CorrelationIdHeader'
+        - $ref: '#/components/parameters/RequestIdHeader'
+      responses:
+        '200':
+          description: Шаблон получен.
+          headers:
+            X-Correlation-Id:
+              $ref: '#/components/headers/XCorrelationId'
+            X-Request-Id:
+              $ref: '#/components/headers/XRequestId'
+            Cache-Control:
+              $ref: '#/components/headers/CacheControlTemplates'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/NotificationTemplate'
+              examples:
+                orderCreated:
+                  $ref: '#/components/examples/TemplateOrderCreated'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/TemplateNotFound'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+        '504':
+          $ref: '#/components/responses/GatewayTimeout'
+
+  /v1/users/{userId}/notification-preferences:
+    get:
+      operationId: getNotificationPreferences
+      summary: User notification channels and consents
+      tags: [preferences]
+      description: |
+        Возвращает каналы связи пользователя, его согласия и тихие часы.
+
+        **Зачем нужно.** Чтобы не ставить в очередь заведомо бесполезную отправку
+        и чтобы показать в интерфейсе, куда именно уйдёт уведомление.
+
+        **Это оптимизация, а не механизм соблюдения согласий.** Авторитетную проверку
+        всегда делает сам S9 в момент отправки: даже если BFF пропустит отписанный канал,
+        уведомление получит статус `SUPPRESSED` и отправлено не будет. Строить соблюдение
+        согласий на клиентской проверке нельзя — она устаревает и её можно пропустить.
+
+        **Кеш.** TTL 60 с, stale допустим до 24 ч, **но только в сторону запрета**:
+        свежая отписка действует немедленно, устаревшее разрешение не может «воскресить»
+        отписанный канал.
+
+        **PII.** Поле `address` приходит **маскированным**. Полные адреса BFF не получает
+        и не должен получать — адресация выполняется по `userId` внутри S9.
+      parameters:
+        - $ref: '#/components/parameters/UserIdPath'
+        - $ref: '#/components/parameters/CorrelationIdHeader'
+        - $ref: '#/components/parameters/RequestIdHeader'
+      responses:
+        '200':
+          description: Настройки получены.
+          headers:
+            X-Correlation-Id:
+              $ref: '#/components/headers/XCorrelationId'
+            X-Request-Id:
+              $ref: '#/components/headers/XRequestId'
+            Cache-Control:
+              $ref: '#/components/headers/CacheControlPreferences'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/NotificationPreferences'
+              examples:
+                alexMorgan:
+                  $ref: '#/components/examples/PreferencesAlexMorgan'
+                partiallyOptedOut:
+                  $ref: '#/components/examples/PreferencesOptedOut'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/UserNotFound'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+        '504':
+          $ref: '#/components/responses/GatewayTimeout'
+
+webhooks:
+
+  notification.delivery.updated:
+    post:
+      operationId: onNotificationDeliveryUpdated
+      summary: Delivery status update delivered to our receiver
+      tags: [webhooks]
+      description: |
+        S9 доставляет это событие **нам** при каждом изменении статуса доставки
+        по каналу. Наш приёмник обязан принять его и ответить `2xx`.
+
+        ## Подпись запроса
+
+        Заголовок:
+
+        ```
+        X-Notify-Signature: t=<unix_seconds>,v1=<hex HMAC-SHA256(t + "." + rawBody)>
+        ```
+
+        Порядок проверки — тот же, что у вебхука S8, и по тем же причинам:
+
+        1. Распарсить `t` и `v1`; отсутствие любой части → `401`.
+        2. Проверить **окно 300 с**: `|now − t| ≤ 300`. Выход за окно → `401`.
+           Это и есть защита от replay: перехваченный запрос через пять минут
+           становится бесполезен, а переподписать его без секрета невозможно.
+        3. Составить строку `t + "." + rawBody` из **сырых байтов** тела, до
+           десериализации.
+        4. Вычислить `HMAC-SHA256` и сравнить с `v1` **в постоянном времени**.
+        5. Расхождение → `401`, событие отбрасывается, инцидент логируется.
+
+        Несколько частей `v1` допускаются — так делается ротация секрета без простоя.
+
+        ## Идемпотентность доставки
+
+        Доставка **at-least-once**. Дедупликация по **`eventId`**, окно 24 ч. Повторное
+        `eventId` → обработка пропускается, ответ `200`.
+
+        Обработчик обязан быть безопасен при повторе и без дедупа: он **устанавливает**
+        статус, а не накапливает его.
+
+        ## Порядок событий
+
+        Порядок доставки **не гарантирован**. Упорядочивание — по **`sequence`**,
+        монотонно возрастающему **в пределах одного `notificationId`**.
+
+        > Событие с `sequence` **меньше или равным** уже сохранённому для этого
+        > `notificationId` и канала — **отбрасывается**.
+
+        Без этого правила запоздавшее `SENT` затёрло бы уже полученное `DELIVERED`,
+        и в поддержке видели бы неверную картину. Естественный порядок статусов —
+        `QUEUED → SENDING → SENT → DELIVERED → READ`; терминальные ветки —
+        `FAILED` и `SUPPRESSED`.
+
+        В отличие от вебхука S8, здесь нет поля `version`: у уведомления нет агрегата
+        с оптимистической блокировкой, `sequence` полностью решает задачу упорядочивания.
+
+        ## Ответ и ретраи
+
+        Приёмник обязан ответить `2xx` в течение 5 с. Иначе S9 повторяет доставку
+        по расписанию **1 м → 5 м → 15 м → 1 ч → 6 ч**, затем событие уходит в **DLQ**.
+
+        ## Влияние на пользователя
+
+        **Никакого прямого.** События доставки питают наблюдаемость и поддержку.
+        Ни одно из них не меняет статус заявки и не показывается на экране создания
+        обмена — S9 класса `Non-blocking` (канон §3).
+      parameters:
+        - $ref: '#/components/parameters/NotifySignatureHeader'
+        - $ref: '#/components/parameters/WebhookDeliveryHeader'
+        - $ref: '#/components/parameters/CorrelationIdHeader'
+        - $ref: '#/components/parameters/RequestIdHeader'
+      requestBody:
+        required: true
+        description: |
+          Полезная нагрузка события. Именно эти байты участвуют в вычислении подписи.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/NotificationDeliveryUpdatedEvent'
+            examples:
+              emailDelivered:
+                $ref: '#/components/examples/EventDeliveryDelivered'
+              pushFailed:
+                $ref: '#/components/examples/EventDeliveryFailed'
+              suppressed:
+                $ref: '#/components/examples/EventDeliverySuppressed'
+      responses:
+        '200':
+          description: |
+            Событие принято (в том числе если оказалось дубликатом по `eventId`
+            или было отброшено по правилу `sequence`). S9 считает доставку успешной.
+          headers:
+            X-Correlation-Id:
+              $ref: '#/components/headers/XCorrelationId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WebhookAck'
+              examples:
+                accepted:
+                  $ref: '#/components/examples/WebhookAckAccepted'
+                duplicate:
+                  $ref: '#/components/examples/WebhookAckDuplicate'
+                outOfOrder:
+                  $ref: '#/components/examples/WebhookAckOutOfOrder'
+        '400':
+          description: |
+            Тело события не проходит схему. S9 повторит по расписанию; параллельно
+            поднимается алерт о рассогласовании контракта.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WebhookAck'
+        '401':
+          description: |
+            Подпись `X-Notify-Signature` отсутствует, не сходится или `t` вне окна 300 с.
+            Событие отбрасывается, инцидент безопасности логируется.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WebhookAck'
+        '500':
+          description: |
+            Внутренний сбой приёмника. Запускает расписание повторов
+            1 м / 5 м / 15 м / 1 ч / 6 ч, затем DLQ.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WebhookAck'
+
+components:
+
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: |
+        **Service-to-service JWT.** BFF предъявляет машинный токен
+        (`Authorization: Bearer <jwt>`), подписанный `RS256`, TTL 300 с. Обязательные
+        клеймы — `iss`, `sub` (`svc:exchange-bff`), `aud` (`svc:notification-service`),
+        `exp`, `iat`, `jti`. Скоупы — `notifications:write`, `notifications:read`,
+        `templates:read`, `preferences:read`. Скоупа на **изменение** согласий у BFF
+        нет: менять их вправе только сам пользователь через профиль.
+
+        **mTLS.** Канал защищён взаимным TLS 1.3 на сертификатах внутреннего PKI
+        с проверкой SAN по имени сервиса. Для **входящих вебхуков** клиентский
+        сертификат предъявляет S9, а наш приёмник его проверяет; это **дополняет**,
+        а не заменяет проверку HMAC-подписи `X-Notify-Signature`. mTLS подтверждает
+        канал, подпись — целостность и свежесть конкретного сообщения.
+
+  headers:
+    XCorrelationId:
+      description: |
+        Сквозной идентификатор бизнес-операции (канон §9). Возвращается в каждом ответе
+        и в каждой ошибке. Позволяет связать уведомление с заявкой, из-за которой
+        оно отправлено.
+      required: true
+      schema:
+        $ref: '#/components/schemas/CorrelationId'
+    XRequestId:
+      description: |
+        Идентификатор конкретной HTTP-попытки. Меняется на каждой попытке, включая
+        повторы из ретрай-очереди.
+      required: true
+      schema:
+        $ref: '#/components/schemas/Uuid'
+    XIdempotentReplay:
+      description: |
+        `true`, если ответ отдан из журнала идемпотентности и новое уведомление
+        в очередь **не** ставилось.
+      required: false
+      schema:
+        type: boolean
+        description: Признак идемпотентного повтора.
+        examples: [true, false]
+    Location:
+      description: URI ресурса статуса уведомления.
+      required: false
+      schema:
+        type: string
+        format: uri-reference
+        minLength: 1
+        maxLength: 256
+        description: Относительный путь к статусу уведомления.
+        examples: ["/v1/notifications/ntf_01J9X2C4KBQF8N3M5T6V7W8Y9Z"]
+    RetryAfter:
+      description: Через сколько секунд имеет смысл повторить запрос.
+      required: false
+      schema:
+        type: integer
+        minimum: 0
+        maximum: 3600
+        description: Задержка перед повтором, секунды.
+        examples: [30]
+    CacheControlNoStore:
+      description: Запрет кеширования — статус доставки нужен актуальным.
+      required: false
+      schema:
+        type: string
+        minLength: 1
+        maxLength: 128
+        description: Значение заголовка `Cache-Control`.
+        examples: ["no-store"]
+    CacheControlTemplates:
+      description: Кеширование справочника шаблонов на 15 мин с разрешением stale.
+      required: false
+      schema:
+        type: string
+        minLength: 1
+        maxLength: 128
+        description: Значение заголовка `Cache-Control`.
+        examples: ["public, max-age=900, stale-while-revalidate=86400"]
+    CacheControlPreferences:
+      description: |
+        Кеширование настроек на 60 с. Stale допустим только в сторону запрета отправки —
+        см. оговорку в `info.description`.
+      required: false
+      schema:
+        type: string
+        minLength: 1
+        maxLength: 128
+        description: Значение заголовка `Cache-Control`.
+        examples: ["private, max-age=60"]
+
+  parameters:
+
+    NotificationIdPath:
+      name: notificationId
+      in: path
+      required: true
+      description: Идентификатор уведомления, присвоенный S9.
+      schema:
+        $ref: '#/components/schemas/NotificationId'
+
+    TemplateIdPath:
+      name: templateId
+      in: path
+      required: true
+      description: Идентификатор шаблона.
+      schema:
+        $ref: '#/components/schemas/TemplateId'
+
+    UserIdPath:
+      name: userId
+      in: path
+      required: true
+      description: Идентификатор пользователя, чьи настройки запрашиваются.
+      schema:
+        $ref: '#/components/schemas/UserId'
+
+    IdempotencyKeyHeader:
+      name: Idempotency-Key
+      in: header
+      required: true
+      description: |
+        Ключ идемпотентности, **UUIDv4**, обязателен, окно 24 ч (канон §9). Защищает
+        от повтора **одного и того же HTTP-запроса**. Семантические дубликаты из разных
+        запросов гасит `deduplicationKey` в теле — это независимый механизм.
+      schema:
+        $ref: '#/components/schemas/IdempotencyKey'
+
+    TemplateChannelQuery:
+      name: channel
+      in: query
+      required: false
+      description: Оставить только шаблоны, поддерживающие указанный канал.
+      schema:
+        $ref: '#/components/schemas/Channel'
+
+    TemplateLocaleQuery:
+      name: locale
+      in: query
+      required: false
+      description: Оставить только шаблоны, поддерживающие указанную локаль.
+      schema:
+        $ref: '#/components/schemas/Locale'
+
+    CorrelationIdHeader:
+      name: X-Correlation-Id
+      in: header
+      required: true
+      description: |
+        Сквозной идентификатор бизнес-операции (канон §9). Тот же, что использовался
+        при создании заявки, — благодаря этому уведомление связывается с заявкой
+        в логах без дополнительных полей.
+      schema:
+        $ref: '#/components/schemas/CorrelationId'
+
+    RequestIdHeader:
+      name: X-Request-Id
+      in: header
+      required: false
+      description: |
+        Идентификатор конкретной HTTP-попытки. Меняется на каждой попытке, в отличие
+        от `X-Correlation-Id`.
+      schema:
+        $ref: '#/components/schemas/Uuid'
+
+    NotifySignatureHeader:
+      name: X-Notify-Signature
+      in: header
+      required: true
+      description: |
+        HMAC-подпись вебхука в формате `t=<unix_seconds>,v1=<hex>`. Подписываемая
+        строка — `t + "." + rawBody`, алгоритм — `HMAC-SHA256`, подпись — нижний регистр
+        hex (64 символа). Окно валидности `t` — **300 с**. Допускается несколько частей
+        `v1` для ротации секрета. Подробности проверки — в описании вебхука
+        `notification.delivery.updated`.
+      schema:
+        type: string
+        pattern: '^t=\d{10},v1=[0-9a-f]{64}(,v1=[0-9a-f]{64})*$'
+        minLength: 80
+        maxLength: 512
+        description: Значение заголовка подписи.
+        examples: ["t=1786205740,v1=9a8b7c6d5e4f30291a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f7081"]
+
+    WebhookDeliveryHeader:
+      name: X-Notify-Delivery-Attempt
+      in: header
+      required: false
+      description: |
+        Номер попытки доставки вебхука, начиная с 1. Позволяет приёмнику отличить первую
+        доставку от штатного повтора по расписанию 1 м / 5 м / 15 м / 1 ч / 6 ч.
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 6
+        description: Порядковый номер попытки доставки.
+        examples: [1, 4]
+
+  schemas:
+
+    DecimalString:
+      type: string
+      pattern: '^(0|[1-9]\d{0,18})(\.\d{1,18})?$'
+      minLength: 1
+      maxLength: 40
+      description: |
+        Неотрицательная десятичная величина в строковом виде (канон §5.1). Применяется
+        к суммам внутри `variables`: даже в тексте письма деньги передаются строкой,
+        иначе сериализация в `double` испортит последний знак.
+      examples: ["10000.00", "35.00", "106.010638"]
+
+    Timestamp:
+      type: string
+      format: date-time
+      pattern: '^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$'
+      minLength: 24
+      maxLength: 24
+      description: |
+        Момент времени в ISO-8601 UTC с миллисекундами и суффиксом `Z` (канон §9).
+      examples: ["2026-08-07T10:15:32.117Z"]
+
+    Uuid:
+      type: string
+      format: uuid
+      pattern: '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+      minLength: 36
+      maxLength: 36
+      description: Идентификатор в формате UUID, нижний регистр.
+      examples: ["e4b1f2a3-7c58-4d69-8a01-5f2c9b7d3e46"]
+
+    IdempotencyKey:
+      type: string
+      format: uuid
+      pattern: '^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$'
+      minLength: 36
+      maxLength: 36
+      description: |
+        Ключ идемпотентности, **UUIDv4** (канон §9). Версия и вариант зафиксированы
+        в паттерне: UUIDv1 содержит MAC-адрес и метку времени, то есть раскрывает
+        инфраструктуру, а последовательные ключи предсказуемы.
+      examples: ["5a2e9b71-3c84-4f06-91d7-6e0b8c4a2f53"]
+
+    CorrelationId:
+      type: string
+      pattern: '^[0-9A-HJKMNP-TV-Z]{26}$'
+      minLength: 26
+      maxLength: 26
+      description: |
+        Сквозной идентификатор операции, ULID (канон §7, пример
+        `"01J9X2C4K7QF8N3M5T6V7W8Y9Z"`). Crockford Base32 без `I`, `L`, `O`, `U`.
+      examples: ["01J9X2C4K7QF8N3M5T6V7W8Y9Z"]
+
+    NotificationId:
+      type: string
+      pattern: '^ntf_[0-9A-HJKMNP-TV-Z]{26}$'
+      minLength: 30
+      maxLength: 30
+      description: |
+        Идентификатор уведомления, префикс `ntf_` + ULID. Возвращается в ответе `202`
+        и служит единственным способом узнать исход доставки.
+      examples: ["ntf_01J9X2C4KBQF8N3M5T6V7W8Y9Z"]
+
+    UserId:
+      type: string
+      pattern: '^usr_[0-9A-HJKMNP-TV-Z]{26}$'
+      minLength: 30
+      maxLength: 30
+      description: |
+        Идентификатор пользователя, префикс `usr_` + ULID. Псевдонимизированный
+        идентификатор. Адресация уведомления выполняется **по нему**, а не по email
+        или телефону, — так контактные данные не покидают S9.
+      examples: ["usr_01J8ZQ4H9K2M3N4P5R6S7T8V9W"]
+
+    OrderId:
+      type: string
+      pattern: '^ord_[0-9A-HJKMNP-TV-Z]{26}$'
+      minLength: 30
+      maxLength: 30
+      description: |
+        Идентификатор заявки (канон §4.5). Используется как `referenceId` и как
+        переменная шаблона — это допустимое к отправке значение.
+      examples: ["ord_01J9X2C4K7QF8N3M5T6V7W8Y9Z"]
+
+    TemplateId:
+      type: string
+      enum:
+        - exchange_order_created
+        - exchange_order_manual_review
+        - exchange_order_rejected
+      description: |
+        Идентификатор шаблона. Перечень ограничен тремя значениями — ровно тремя
+        исходами создания заявки, отдаваемыми наружу (канон §8, граница скоупа §1):
+
+        | `templateId` | Когда отправляется | Статус заявки |
+        |---|---|---|
+        | `exchange_order_created` | заявка принята | `PENDING` |
+        | `exchange_order_manual_review` | скоринг вернул `REVIEW` (шаг 16 §6) | `MANUAL_REVIEW` |
+        | `exchange_order_rejected` | заявка отклонена | `REJECTED` |
+
+        Шаблонов для `EXECUTING` / `COMPLETED` / `FAILED` / `EXPIRED` здесь нет:
+        эти статусы лежат за границей скоупа задания (канон §1).
+      examples: ["exchange_order_created", "exchange_order_manual_review"]
+
+    Channel:
+      type: string
+      enum: [EMAIL, PUSH, TELEGRAM, SMS, IN_APP]
+      description: |
+        Канал доставки. `IN_APP` — сообщение внутри приложения, доставляется всегда
+        и не требует внешнего провайдера. `SMS` — самый дорогой и наименее приватный
+        канал (текст проходит через оператора), поэтому для него ограничения
+        на содержимое `variables` строже всего.
+      examples: ["EMAIL", "PUSH", "IN_APP"]
+
+    Locale:
+      type: string
+      enum: [en-US, ru-RU]
+      description: |
+        Локаль сообщения в формате BCP 47. Перечень ограничен поддерживаемыми языками
+        интерфейса. Если запрошенная локаль шаблоном не поддержана, S9 использует
+        локаль по умолчанию, а не отказывает в отправке.
+      examples: ["en-US", "ru-RU"]
+
+    Priority:
+      type: string
+      enum: [LOW, NORMAL, HIGH]
+      description: |
+        Приоритет обработки в очереди S9. `HIGH` игнорирует тихие часы
+        (`quietHours`) — предназначен для сообщений безопасности. Уведомления
+        о создании заявки отправляются с `NORMAL`: это информирование, а не тревога.
+      examples: ["NORMAL", "HIGH"]
+
+    NotificationVariables:
+      type: object
+      description: |
+        Значения подстановок для шаблона. Имена ключей обязаны входить
+        в `requiredVariables` шаблона.
+
+        ## Что класть СЮДА НЕЛЬЗЯ
+
+        Это нормативное ограничение, а не рекомендация. Содержимое `variables` попадает
+        в тело письма и в логи оператора связи — считайте, что оно вышло за периметр.
+
+        **Запрещено:**
+
+        * полный номер счёта или кошелька (`walletId` целиком);
+        * токены, коды подтверждения, ссылки с одноразовыми секретами;
+        * полный email или номер телефона;
+        * паспортные данные, результаты KYC, риск-скор, причины скоринга;
+        * полное имя пользователя, если шаблон может уйти в `SMS` или `TELEGRAM`.
+
+        **Допустимо:** `orderId`, суммы (строками, канон §5.1), коды активов, названия
+        сетей, курс, `inverseRate`, время создания, локализуемые коды статусов.
+
+        Проверка выполняется **по allow-list** имён из `requiredVariables`, а не
+        по blocklist подстрок: blocklist на такой задаче всегда оказывается дырявым.
+      additionalProperties:
+        type: [string, integer, boolean]
+        description: |
+          Значение подстановки. Скалярное: вложенные объекты и массивы не допускаются,
+          чтобы в шаблон нельзя было протащить целый объект с PII «за компанию».
+          Денежные величины — **строки** (канон §5.1).
+      examples:
+        - orderId: "ord_01J9X2C4K7QF8N3M5T6V7W8Y9Z"
+          fromAmount: "10000.00"
+          fromAsset: "RUB"
+          toAmount: "106.010638"
+          toAsset: "USDT"
+          network: "TRON"
+          rate: "0.010638297872"
+          inverseRate: "94.00"
+
+    NotificationRequest:
+      type: object
+      description: |
+        Запрос на постановку уведомления в очередь. Отправляется **после** успешной
+        регистрации заявки в S8 (шаг 19 цепочки §6), в режиме fire-and-forget.
+      additionalProperties: false
+      required: [userId, templateId, channels, locale, priority, variables, correlationId]
+      properties:
+        userId:
+          $ref: '#/components/schemas/UserId'
+          description: |
+            Получатель. Адресация идёт по идентификатору: контактные данные остаются
+            внутри S9.
+          examples: ["usr_01J8ZQ4H9K2M3N4P5R6S7T8V9W"]
+        templateId:
+          $ref: '#/components/schemas/TemplateId'
+          description: Шаблон сообщения.
+          examples: ["exchange_order_created"]
+        channels:
+          type: array
+          minItems: 1
+          maxItems: 5
+          uniqueItems: true
+          description: |
+            Каналы, по которым просим отправить. S9 отфильтрует те, что не настроены
+            у пользователя или от которых он отписался, — и это **не ошибка**: такой
+            канал получит статус `SUPPRESSED`. Пустой массив запрещён схемой:
+            уведомление без канала бессмысленно.
+          items:
+            $ref: '#/components/schemas/Channel'
+          examples:
+            - ["EMAIL", "PUSH", "IN_APP"]
+        locale:
+          $ref: '#/components/schemas/Locale'
+          description: |
+            Язык сообщения. Берётся из `clientMeta.locale` заявки, а при его отсутствии —
+            из профиля пользователя.
+          examples: ["en-US"]
+        priority:
+          $ref: '#/components/schemas/Priority'
+          description: |
+            Приоритет. Для уведомлений о заявке — `NORMAL`: это информирование,
+            а не сообщение безопасности, и оно обязано уважать тихие часы.
+          examples: ["NORMAL"]
+        variables:
+          $ref: '#/components/schemas/NotificationVariables'
+          description: |
+            Подстановки шаблона. Ограничения по PII — в описании схемы
+            `NotificationVariables`. Нарушение = дефект.
+        deduplicationKey:
+          type: [string, 'null']
+          pattern: '^[A-Za-z0-9:_-]{8,128}$'
+          minLength: 8
+          maxLength: 128
+          description: |
+            Ключ семантической дедупликации. Отличается от `Idempotency-Key`: тот
+            защищает от повтора **HTTP-запроса**, а этот — от **семантического
+            дубликата**, пришедшего разными запросами (например, BFF перезапустился
+            и сгенерировал новый `Idempotency-Key` для того же события).
+
+            Рекомендуемый вид — `{templateId}:{orderId}`. Окно дедупликации — 24 ч.
+            `null` отключает семантическую дедупликацию.
+          examples: ["exchange_order_created:ord_01J9X2C4K7QF8N3M5T6V7W8Y9Z", null]
+        scheduledAt:
+          type: [string, 'null']
+          format: date-time
+          pattern: '^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$'
+          minLength: 24
+          maxLength: 24
+          description: |
+            Отложенная отправка. `null` или отсутствие поля — отправить как можно скорее.
+            Для уведомлений о создании заявки всегда `null`: смысл сообщения
+            в немедленности.
+          examples: [null, "2026-08-07T18:00:00.000Z"]
+        correlationId:
+          $ref: '#/components/schemas/CorrelationId'
+          description: |
+            Трасса операции создания заявки. Связывает уведомление с заявкой
+            в логах без дополнительных полей.
+          examples: ["01J9X2C4K7QF8N3M5T6V7W8Y9Z"]
+        referenceType:
+          type: string
+          enum: [EXCHANGE_ORDER]
+          description: |
+            Тип объекта, породившего уведомление. В нашем скоупе — только заявка
+            на обмен. Enum, а не свободная строка, чтобы поле оставалось пригодным
+            для индексации и фильтрации.
+          examples: ["EXCHANGE_ORDER"]
+        referenceId:
+          $ref: '#/components/schemas/OrderId'
+          description: |
+            Идентификатор объекта — `orderId`. Позволяет в поддержке за один запрос
+            найти все уведомления по заявке.
+          examples: ["ord_01J9X2C4K7QF8N3M5T6V7W8Y9Z"]
+
+    NotificationAccepted:
+      type: object
+      description: |
+        Квитанция о приёме уведомления в очередь. Возвращается с кодом `202`,
+        а не `201`, — обоснование в описании операции `createNotification`.
+      additionalProperties: false
+      required: [notificationId, status, acceptedAt, statusUrl]
+      properties:
+        notificationId:
+          $ref: '#/components/schemas/NotificationId'
+          description: Идентификатор, по которому можно узнать исход доставки.
+          examples: ["ntf_01J9X2C4KBQF8N3M5T6V7W8Y9Z"]
+        status:
+          $ref: '#/components/schemas/DeliveryStatus'
+          description: |
+            Начальный статус — как правило `QUEUED`. Может сразу оказаться
+            `SUPPRESSED`, если пользователь отписан от всех запрошенных каналов;
+            это **нормальный** исход, а не ошибка.
+          examples: ["QUEUED", "SUPPRESSED"]
+        acceptedAt:
+          $ref: '#/components/schemas/Timestamp'
+          description: Момент приёма в очередь.
+          examples: ["2026-08-07T10:15:32.640Z"]
+        statusUrl:
+          type: string
+          format: uri-reference
+          minLength: 1
+          maxLength: 256
+          description: |
+            Ссылка на ресурс статуса. Обязательна именно потому, что ответ — `202`:
+            код «принято к обработке» без способа узнать исход был бы бесполезен.
+          examples: ["/v1/notifications/ntf_01J9X2C4KBQF8N3M5T6V7W8Y9Z"]
+        expiresAt:
+          $ref: '#/components/schemas/Timestamp'
+          description: |
+            Момент, после которого попытки доставки прекращаются, а уведомление
+            переходит в `FAILED`.
+          examples: ["2026-08-08T10:15:32.640Z"]
+
+    DeliveryStatus:
+      type: string
+      enum: [QUEUED, SENDING, SENT, DELIVERED, READ, FAILED, SUPPRESSED]
+      description: |
+        Статус доставки — агрегированный по уведомлению или частный по каналу.
+
+        ```
+        QUEUED -> SENDING -> SENT -> DELIVERED -> READ
+                     │         │         │
+                     └─> FAILED           └─> (READ доступен не во всех каналах)
+        QUEUED -> SUPPRESSED
+        ```
+
+        | Статус | Смысл | Это ошибка? |
+        |---|---|---|
+        | `QUEUED` | принято в очередь | нет |
+        | `SENDING` | передаётся провайдеру канала | нет |
+        | `SENT` | провайдер принял | нет |
+        | `DELIVERED` | подтверждена доставка на устройство или почтовый ящик | нет |
+        | `READ` | пользователь открыл; доступен только для `PUSH` и `IN_APP` | нет |
+        | `FAILED` | все попытки исчерпаны | да, но **не для пользователя** — только для наблюдаемости |
+        | `SUPPRESSED` | пользователь отписан от канала | **нет, это норма** |
+
+        Агрегированный статус уведомления выводится по каналам: `DELIVERED`, если хотя бы
+        один канал доставлен; `FAILED`, только если провалились все; `SUPPRESSED`,
+        если все каналы подавлены.
+      examples: ["QUEUED", "DELIVERED", "SUPPRESSED"]
+
+    ChannelDeliveryState:
+      type: object
+      description: Состояние доставки по одному каналу.
+      additionalProperties: false
+      required: [channel, status, attempts]
+      properties:
+        channel:
+          $ref: '#/components/schemas/Channel'
+          description: Канал доставки.
+          examples: ["EMAIL"]
+        status:
+          $ref: '#/components/schemas/DeliveryStatus'
+          description: Статус доставки по этому каналу.
+          examples: ["DELIVERED", "FAILED", "SUPPRESSED"]
+        providerMessageId:
+          type: [string, 'null']
+          minLength: 1
+          maxLength: 128
+          description: |
+            Идентификатор сообщения у внешнего провайдера канала. `null`, пока сообщение
+            не передано провайдеру, и при `SUPPRESSED`. Нужен поддержке, чтобы
+            запросить у оператора связи трассировку конкретного сообщения.
+          examples: ["ses-0c1d2e3f4a5b6c7d", null]
+        attempts:
+          type: integer
+          minimum: 0
+          maximum: 20
+          description: Сколько попыток отправки уже сделано по этому каналу.
+          examples: [1, 4]
+        lastAttemptAt:
+          type: [string, 'null']
+          format: date-time
+          pattern: '^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$'
+          minLength: 24
+          maxLength: 24
+          description: Момент последней попытки; `null`, если попыток ещё не было.
+          examples: ["2026-08-07T10:15:33.980Z", null]
+        nextRetryAt:
+          type: [string, 'null']
+          format: date-time
+          pattern: '^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$'
+          minLength: 24
+          maxLength: 24
+          description: |
+            Момент следующей попытки по расписанию 1 м / 5 м / 15 м / 1 ч / 6 ч.
+            `null`, если статус терминальный (`DELIVERED`, `READ`, `FAILED`,
+            `SUPPRESSED`) или попытки исчерпаны и уведомление ушло в DLQ.
+          examples: ["2026-08-07T10:20:33.980Z", null]
+        failureCode:
+          type: [string, 'null']
+          pattern: '^[A-Z][A-Z0-9_]{2,63}$'
+          minLength: 3
+          maxLength: 64
+          description: |
+            Машиночитаемый код причины неуспеха; `null` при успехе. Значения вроде
+            `PROVIDER_REJECTED`, `INVALID_ADDRESS`, `HARD_BOUNCE`, `RATE_LIMITED`,
+            `USER_OPTED_OUT`. Код, а не текст, — чтобы по нему можно было строить
+            метрики и чтобы в него не попала PII.
+          examples: ["HARD_BOUNCE", "USER_OPTED_OUT", null]
+        failureReason:
+          type: [string, 'null']
+          minLength: 1
+          maxLength: 512
+          description: |
+            Человекочитаемое пояснение от провайдера, для логов. **Никогда не показывается
+            пользователю** и не должно содержать полный адрес получателя — только
+            маскированный.
+          examples: ["Recipient mailbox does not exist", null]
+
+    NotificationStatus:
+      type: object
+      description: |
+        Полное состояние уведомления с разбивкой по каналам.
+      additionalProperties: false
+      required: [notificationId, userId, templateId, status, perChannel, createdAt, updatedAt]
+      properties:
+        notificationId:
+          $ref: '#/components/schemas/NotificationId'
+          description: Идентификатор уведомления.
+          examples: ["ntf_01J9X2C4KBQF8N3M5T6V7W8Y9Z"]
+        userId:
+          $ref: '#/components/schemas/UserId'
+          description: Получатель.
+          examples: ["usr_01J8ZQ4H9K2M3N4P5R6S7T8V9W"]
+        templateId:
+          $ref: '#/components/schemas/TemplateId'
+          description: Использованный шаблон.
+          examples: ["exchange_order_created"]
+        status:
+          $ref: '#/components/schemas/DeliveryStatus'
+          description: |
+            Агрегированный статус: `DELIVERED`, если доставлен хотя бы один канал;
+            `FAILED`, только если провалились все; `SUPPRESSED`, если все подавлены.
+          examples: ["DELIVERED"]
+        perChannel:
+          type: array
+          minItems: 1
+          maxItems: 5
+          description: Состояние по каждому запрошенному каналу.
+          items:
+            $ref: '#/components/schemas/ChannelDeliveryState'
+        referenceType:
+          type: [string, 'null']
+          enum: [EXCHANGE_ORDER, null]
+          description: Тип связанного объекта; `null`, если связи нет.
+          examples: ["EXCHANGE_ORDER", null]
+        referenceId:
+          type: [string, 'null']
+          pattern: '^ord_[0-9A-HJKMNP-TV-Z]{26}$'
+          minLength: 30
+          maxLength: 30
+          description: Идентификатор связанной заявки; `null`, если связи нет.
+          examples: ["ord_01J9X2C4K7QF8N3M5T6V7W8Y9Z", null]
+        correlationId:
+          $ref: '#/components/schemas/CorrelationId'
+          description: Трасса исходной операции.
+          examples: ["01J9X2C4K7QF8N3M5T6V7W8Y9Z"]
+        createdAt:
+          $ref: '#/components/schemas/Timestamp'
+          description: Момент постановки в очередь.
+          examples: ["2026-08-07T10:15:32.640Z"]
+        updatedAt:
+          $ref: '#/components/schemas/Timestamp'
+          description: Момент последнего изменения статуса.
+          examples: ["2026-08-07T10:15:36.204Z"]
+        expiresAt:
+          $ref: '#/components/schemas/Timestamp'
+          description: |
+            Момент прекращения попыток. После него уведомление переходит в `FAILED`
+            и уходит в DLQ.
+          examples: ["2026-08-08T10:15:32.640Z"]
+
+    NotificationTemplate:
+      type: object
+      description: |
+        Описание шаблона уведомления. Рендерингом занимается **S9**, а не BFF: иначе
+        локализация и вёрстка разъехались бы между разными отправителями.
+      additionalProperties: false
+      required:
+        [templateId, name, supportedChannels, supportedLocales, requiredVariables, version]
+      properties:
+        templateId:
+          $ref: '#/components/schemas/TemplateId'
+          description: Идентификатор шаблона.
+          examples: ["exchange_order_created"]
+        name:
+          type: string
+          minLength: 1
+          maxLength: 128
+          description: |
+            Человекочитаемое имя шаблона для админки. Не локализуется и пользователю
+            не показывается.
+          examples: ["Exchange order created"]
+        supportedChannels:
+          type: array
+          minItems: 1
+          maxItems: 5
+          uniqueItems: true
+          description: |
+            Каналы, для которых у шаблона есть вёрстка. Запрос отправки в канал,
+            которого здесь нет, приводит к `CHANNEL_NOT_CONFIGURED`.
+          items:
+            $ref: '#/components/schemas/Channel'
+          examples:
+            - ["EMAIL", "PUSH", "IN_APP"]
+        supportedLocales:
+          type: array
+          minItems: 1
+          maxItems: 16
+          uniqueItems: true
+          description: |
+            Локали, на которые шаблон переведён. Запрос неподдержанной локали
+            не приводит к ошибке — S9 использует локаль по умолчанию.
+          items:
+            $ref: '#/components/schemas/Locale'
+          examples:
+            - ["en-US", "ru-RU"]
+        requiredVariables:
+          type: array
+          minItems: 0
+          maxItems: 32
+          uniqueItems: true
+          description: |
+            Имена подстановок, которые обязан передать отправитель. **Это же —
+            allow-list**, по которому BFF фильтрует `variables` перед отправкой,
+            чтобы в шаблон не попало ничего лишнего (см. раздел PII
+            в `info.description`).
+          items:
+            type: string
+            pattern: '^[a-z][a-zA-Z0-9]{0,63}$'
+            minLength: 1
+            maxLength: 64
+            description: Имя переменной шаблона в camelCase.
+            examples: ["orderId", "fromAmount", "toAsset"]
+        version:
+          type: integer
+          minimum: 1
+          maximum: 2147483647
+          description: |
+            Версия шаблона. Растёт при изменении вёрстки или набора переменных;
+            позволяет BFF заметить, что закешированный allow-list устарел.
+          examples: [3]
+        subjectPreview:
+          type: [string, 'null']
+          minLength: 1
+          maxLength: 256
+          description: |
+            Превью темы **с плейсхолдерами**, не с подставленными значениями.
+            `null` для каналов без темы (`PUSH`, `IN_APP`).
+          examples: ["Your exchange order {{orderId}} is confirmed", null]
+        bodyPreview:
+          type: [string, 'null']
+          minLength: 1
+          maxLength: 2048
+          description: |
+            Превью тела с плейсхолдерами. Служит для админки и контрактных тестов;
+            рендерить его на нашей стороне нельзя.
+          examples: ["You exchanged {{fromAmount}} {{fromAsset}} for {{toAmount}} {{toAsset}} on {{network}}.", null]
+
+    NotificationTemplateList:
+      type: object
+      description: Справочник шаблонов.
+      additionalProperties: false
+      required: [templates, updatedAt]
+      properties:
+        templates:
+          type: array
+          minItems: 0
+          maxItems: 256
+          description: Шаблоны, отсортированные по `templateId`.
+          items:
+            $ref: '#/components/schemas/NotificationTemplate'
+        updatedAt:
+          $ref: '#/components/schemas/Timestamp'
+          description: Момент последнего обновления справочника.
+          examples: ["2026-08-01T00:00:00.000Z"]
+
+    ChannelPreference:
+      type: object
+      description: |
+        Настройка одного канала связи пользователя.
+
+        **PII.** Поле `address` приходит **маскированным**. Полный адрес BFF не получает
+        и не должен получать: адресация выполняется по `userId` внутри S9. Это принцип
+        минимизации — система, которой данные не нужны для работы, не должна их видеть.
+      additionalProperties: false
+      required: [channel, enabled, verified]
+      properties:
+        channel:
+          $ref: '#/components/schemas/Channel'
+          description: Канал связи.
+          examples: ["EMAIL"]
+        enabled:
+          type: boolean
+          description: |
+            Согласен ли пользователь получать уведомления по этому каналу.
+            `false` → отправка в канал даст `SUPPRESSED`, и это **норма**.
+          examples: [true, false]
+        address:
+          type: [string, 'null']
+          minLength: 1
+          maxLength: 128
+          description: |
+            **Маскированный** адрес получателя — только для отображения в интерфейсе
+            («мы отправим на a***n@example.com»). `null`, если адрес не задан или канал
+            его не требует (`IN_APP`). Полный адрес здесь **никогда не приходит**.
+          examples: ["a***n@example.com", "+971 ** *** 4417", null]
+        verified:
+          type: boolean
+          description: |
+            Подтверждён ли адрес. Неподтверждённый адрес не используется для отправки
+            даже при `enabled: true`: иначе система рассылала бы письма по чужому,
+            ошибочно введённому адресу.
+          examples: [true, false]
+        optedOutAt:
+          type: [string, 'null']
+          format: date-time
+          pattern: '^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$'
+          minLength: 24
+          maxLength: 24
+          description: |
+            Момент отписки; `null`, если пользователь не отписывался. Хранится отдельно
+            от `enabled`, потому что дата отписки — юридически значимый факт
+            для разбора претензий.
+          examples: ["2026-07-14T08:31:02.000Z", null]
+
+    QuietHours:
+      type: object
+      description: |
+        Интервал, в который пользователь не хочет получать уведомления. Игнорируется
+        только при `priority: HIGH`. Уведомления о создании заявки отправляются
+        с `NORMAL` и тихие часы уважают: если заявка создана ночью, письмо придёт утром.
+      additionalProperties: false
+      required: [from, to, timezone]
+      properties:
+        from:
+          type: string
+          pattern: '^([01]\d|2[0-3]):[0-5]\d$'
+          minLength: 5
+          maxLength: 5
+          description: Начало тихих часов, локальное время в формате `HH:MM`.
+          examples: ["22:00"]
+        to:
+          type: string
+          pattern: '^([01]\d|2[0-3]):[0-5]\d$'
+          minLength: 5
+          maxLength: 5
+          description: |
+            Конец тихих часов, `HH:MM`. Значение меньше `from` означает интервал
+            через полночь (`22:00`–`08:00`).
+          examples: ["08:00"]
+        timezone:
+          type: string
+          pattern: '^[A-Za-z]+/[A-Za-z_+-]+$'
+          minLength: 3
+          maxLength: 64
+          description: |
+            Часовой пояс в формате IANA. Именно IANA, а не фиксированное смещение:
+            смещение не учитывает переход на летнее время, и тихие часы поехали бы
+            дважды в год.
+          examples: ["Asia/Dubai", "Europe/Moscow"]
+
+    NotificationPreferences:
+      type: object
+      description: |
+        Каналы, согласия и тихие часы пользователя. Для BFF это **подсказка**:
+        авторитетную проверку согласий выполняет сам S9 при отправке.
+      additionalProperties: false
+      required: [userId, channels, locale, updatedAt]
+      properties:
+        userId:
+          $ref: '#/components/schemas/UserId'
+          description: Пользователь, к которому относятся настройки.
+          examples: ["usr_01J8ZQ4H9K2M3N4P5R6S7T8V9W"]
+        channels:
+          type: array
+          minItems: 0
+          maxItems: 5
+          description: Настройки по каналам.
+          items:
+            $ref: '#/components/schemas/ChannelPreference'
+        quietHours:
+          oneOf:
+            - $ref: '#/components/schemas/QuietHours'
+            - type: 'null'
+          description: |
+            Тихие часы; `null`, если пользователь их не настраивал. Записано
+            через `oneOf` с `type: 'null'`, а не `nullable`, — в OpenAPI 3.1
+            `nullable` отменено.
+        locale:
+          $ref: '#/components/schemas/Locale'
+          description: |
+            Предпочитаемый язык уведомлений. Используется, если в запросе локаль
+            не задана явно.
+          examples: ["en-US"]
+        updatedAt:
+          $ref: '#/components/schemas/Timestamp'
+          description: Момент последнего изменения настроек пользователем.
+          examples: ["2026-07-14T08:31:02.000Z"]
+
+    NotificationDeliveryUpdatedEvent:
+      type: object
+      description: |
+        Событие изменения статуса доставки по каналу. Семантика подписи, дедупликации
+        и упорядочивания — в описании вебхука `notification.delivery.updated`.
+      additionalProperties: false
+      required: [eventId, eventType, occurredAt, sequence, notificationId, channel, status]
+      properties:
+        eventId:
+          $ref: '#/components/schemas/Uuid'
+          description: |
+            Уникальный идентификатор события — **ключ дедупликации**, окно 24 ч.
+            Доставка at-least-once, поэтому одно и то же `eventId` может прийти
+            несколько раз; повтор → пропустить обработку и ответить `200`.
+          examples: ["e4b1f2a3-7c58-4d69-8a01-5f2c9b7d3e46"]
+        eventType:
+          type: string
+          enum: [notification.delivery.updated]
+          description: |
+            Тип события. Единственное значение в этом контракте; enum позволяет
+            приёмнику явно падать на неизвестном типе, а не игнорировать его молча.
+          examples: ["notification.delivery.updated"]
+        occurredAt:
+          $ref: '#/components/schemas/Timestamp'
+          description: |
+            Момент **наступления** события, не момент доставки. При повторе
+            по расписанию значение не меняется.
+          examples: ["2026-08-07T10:15:36.204Z"]
+        sequence:
+          type: integer
+          format: int64
+          minimum: 1
+          maximum: 9223372036854775807
+          description: |
+            Монотонно возрастающий номер события **в пределах одного `notificationId`**.
+
+            > Событие с `sequence` **меньше или равным** уже сохранённому для этого
+            > `notificationId` и канала — **отбрасывается**.
+
+            Без этого правила запоздавшее `SENT` затёрло бы уже полученное `DELIVERED`.
+          examples: [1, 3]
+        notificationId:
+          $ref: '#/components/schemas/NotificationId'
+          description: Уведомление, к которому относится событие.
+          examples: ["ntf_01J9X2C4KBQF8N3M5T6V7W8Y9Z"]
+        channel:
+          $ref: '#/components/schemas/Channel'
+          description: Канал, по которому изменился статус.
+          examples: ["EMAIL"]
+        status:
+          $ref: '#/components/schemas/DeliveryStatus'
+          description: Новый статус доставки по этому каналу.
+          examples: ["DELIVERED", "FAILED", "SUPPRESSED"]
+        providerMessageId:
+          type: [string, 'null']
+          minLength: 1
+          maxLength: 128
+          description: |
+            Идентификатор сообщения у провайдера канала; `null`, если сообщение
+            провайдеру не передавалось.
+          examples: ["ses-0c1d2e3f4a5b6c7d", null]
+        failureCode:
+          type: [string, 'null']
+          pattern: '^[A-Z][A-Z0-9_]{2,63}$'
+          minLength: 3
+          maxLength: 64
+          description: Машиночитаемый код неуспеха; `null` при успешном статусе.
+          examples: ["HARD_BOUNCE", "USER_OPTED_OUT", null]
+        failureReason:
+          type: [string, 'null']
+          minLength: 1
+          maxLength: 512
+          description: |
+            Пояснение от провайдера, для логов. Пользователю не показывается,
+            полного адреса получателя содержать не должно.
+          examples: ["Recipient mailbox does not exist", null]
+        correlationId:
+          $ref: '#/components/schemas/CorrelationId'
+          description: Трасса исходной операции создания заявки.
+          examples: ["01J9X2C4K7QF8N3M5T6V7W8Y9Z"]
+
+    WebhookAck:
+      type: object
+      description: |
+        Ответ нашего приёмника на вебхук. Для S9 значим только HTTP-код; поле `result`
+        существует ради ускорения разбора инцидентов доставки.
+      additionalProperties: false
+      required: [result]
+      properties:
+        result:
+          type: string
+          enum: [ACCEPTED, DUPLICATE_IGNORED, OUT_OF_ORDER_IGNORED, INVALID, UNAUTHORIZED]
+          description: |
+            Как приёмник поступил с событием. `ACCEPTED` — принято; `DUPLICATE_IGNORED` —
+            `eventId` уже виден в окне 24 ч; `OUT_OF_ORDER_IGNORED` — `sequence` не больше
+            сохранённого, событие отброшено. Все три сопровождаются HTTP `200`.
+          examples: ["ACCEPTED", "DUPLICATE_IGNORED", "OUT_OF_ORDER_IGNORED"]
+        eventId:
+          $ref: '#/components/schemas/Uuid'
+          description: Эхо `eventId` — для сопоставления в логах.
+          examples: ["e4b1f2a3-7c58-4d69-8a01-5f2c9b7d3e46"]
+        receivedAt:
+          $ref: '#/components/schemas/Timestamp'
+          description: Момент приёма события нашим приёмником.
+          examples: ["2026-08-07T10:15:36.310Z"]
+
+    NotificationErrorCode:
+      type: string
+      enum:
+        - VALIDATION_FAILED
+        - TEMPLATE_NOT_FOUND
+        - CHANNEL_NOT_CONFIGURED
+        - USER_OPTED_OUT
+        - USER_NOT_FOUND
+        - NOTIFICATION_NOT_FOUND
+        - DUPLICATE_IDEMPOTENCY_KEY_DIFFERENT_PAYLOAD
+        - RATE_LIMITED
+        - UNAUTHORIZED
+        - INTERNAL_ERROR
+        - SERVICE_UNAVAILABLE
+      description: |
+        Машиночитаемый код ошибки S9.
+
+        ## Главное правило маппинга: маппинга НЕТ — и это правильно
+
+        > **Ни один код ошибки S9 не имеет соответствия в каталоге ошибок канона §7,
+        > не пробрасывается пользователю и не отменяет заявку.**
+
+        Это не пробел в проектировании, а осознанное решение, и вот почему оно верное.
+        Каталог §7 описывает исходы, **влияющие на судьбу заявки**: пользователь видит
+        код, чтобы понять, что пошло не так с его обменом, и что делать дальше. Сбой
+        уведомления не влияет на судьбу заявки ни в одном сценарии: к моменту вызова S9
+        заявка уже зарегистрирована в S8, `orderId` присвоен, средства зарезервированы,
+        все 19 шагов цепочки §6 пройдены.
+
+        Если бы для сбоя S9 существовал код каталога §7, его пришлось бы **показать**
+        пользователю — а показывать нечего: с его точки зрения всё в порядке. Добавление
+        такого кода означало бы превращение `Non-blocking`-системы в источник тревоги
+        на пустом месте.
+
+        Вместо кодов §7 действует другой контур: **лог → метрика → алерт → ретрай-очередь
+        → DLQ**. Это инженерная проблема, а не пользовательская.
+
+        | Код S9 | HTTP | Куда идёт | Ретрай | Что видит пользователь |
+        |---|---|---|---|---|
+        | `VALIDATION_FAILED` | 400 | лог + алерт (дефект интеграции) | нет — повтор не поможет | экран успеха с `orderId` |
+        | `TEMPLATE_NOT_FOUND` | 404 | лог + алерт (шаблон не задеплоен) | нет | экран успеха с `orderId` |
+        | `CHANNEL_NOT_CONFIGURED` | 422 | лог; отправка по остальным каналам продолжается | нет | экран успеха с `orderId` |
+        | `USER_OPTED_OUT` | 200 / 422 | **не ошибка** — статус `SUPPRESSED`, это норма | нет | экран успеха с `orderId` |
+        | `USER_NOT_FOUND` | 404 | лог + алерт (рассогласование с S1) | нет | экран успеха с `orderId` |
+        | `NOTIFICATION_NOT_FOUND` | 404 | только для `GET` статуса | нет | не применимо |
+        | `DUPLICATE_IDEMPOTENCY_KEY_DIFFERENT_PAYLOAD` | 409 | лог (дефект — ключ переиспользован) | нет | экран успеха с `orderId` |
+        | `RATE_LIMITED` | 429 | **ретрай-очередь** 1 м / 5 м / 15 м / 1 ч / 6 ч | да, асинхронно | экран успеха с `orderId` |
+        | `UNAUTHORIZED` | 401 | лог + алерт дежурному | нет | экран успеха с `orderId` |
+        | `INTERNAL_ERROR` | 500 | **ретрай-очередь** → DLQ | да, асинхронно | экран успеха с `orderId` |
+        | `SERVICE_UNAVAILABLE` | 503 | **ретрай-очередь** → DLQ | да, асинхронно | экран успеха с `orderId` |
+        | *(таймаут 1 000 мс)* | — | **ретрай-очередь** → DLQ | да, асинхронно | экран успеха с `orderId` |
+
+        Последняя колонка одинакова во всех строках. Это определение класса
+        `Non-blocking` (канон §3) в табличной форме.
+
+        ### Отдельно про `USER_OPTED_OUT`
+
+        Это **не ошибка вообще**, и обращаться с ним как с ошибкой — дефект. Пользователь
+        воспользовался своим правом отписаться; система обязана это уважать. Корректная
+        реакция — статус `SUPPRESSED`, запись в лог на уровне `info`, **никакого алерта**.
+        Алерт на отписку означал бы, что систему раздражает соблюдение воли пользователя.
+
+        ### Отдельно про `RATE_LIMITED`
+
+        Код `RATE_LIMITED` (429) **существует** в каталоге §7, но он относится к лимитам
+        **нашего внешнего API** — когда слишком много запросов шлёт пользователь.
+        Лимит S9 превысили мы сами; пользователь тут ни при чём, и показывать ему `429`
+        было бы ложью. Совпадение имён не должно вводить в заблуждение.
+      examples: ["TEMPLATE_NOT_FOUND", "USER_OPTED_OUT", "SERVICE_UNAVAILABLE"]
+
+    NotificationError:
+      type: object
+      description: |
+        Собственный конверт ошибки сервиса уведомлений. Отличается от нашего внешнего
+        конверта (RFC 9457 Problem Details, канон §7) — и, в отличие от других
+        интеграций, **не переводится** в него: сбои S9 пользователю не показываются
+        (см. описание `NotificationErrorCode`). Конверт живёт только в логах и метриках.
+      additionalProperties: false
+      required: [error, message, traceId, timestamp]
+      properties:
+        error:
+          $ref: '#/components/schemas/NotificationErrorCode'
+          description: Машиночитаемый код. Единственное, по чему допустимо ветвиться.
+          examples: ["TEMPLATE_NOT_FOUND"]
+        message:
+          type: string
+          minLength: 1
+          maxLength: 512
+          description: |
+            Человекочитаемое пояснение на английском, для логов. PII содержать не должно:
+            адреса в сообщениях об ошибках приводятся только маскированными.
+          examples: ["Template 'exchange_order_created' has no layout for channel 'SMS'"]
+        traceId:
+          type: string
+          pattern: '^[0-9a-f]{32}$'
+          minLength: 32
+          maxLength: 32
+          description: |
+            Идентификатор трассировки на стороне S9 (W3C Trace Context, `trace-id`).
+            Логируется рядом с нашим `X-Correlation-Id`.
+          examples: ["4bf92f3577b34da6a3ce929d0e0e4736"]
+        timestamp:
+          $ref: '#/components/schemas/Timestamp'
+          description: Момент возникновения ошибки в S9.
+          examples: ["2026-08-07T10:15:32.640Z"]
+        details:
+          type: object
+          description: |
+            Структурированный контекст ошибки. PII содержать не должен: адреса —
+            только маскированные, никаких токенов и полных контактов.
+          additionalProperties: true
+          examples:
+            - { "templateId": "exchange_order_created", "channel": "SMS" }
+            - { "channel": "EMAIL", "optedOutAt": "2026-07-14T08:31:02.000Z" }
+        retryable:
+          type: boolean
+          description: |
+            Имеет ли смысл повтор. `true` → уведомление уходит в ретрай-очередь;
+            `false` → только лог и, при необходимости, алерт.
+          examples: [false, true]
+
+  responses:
+
+    ValidationFailed:
+      description: |
+        Тело запроса не проходит схему: неизвестная переменная, отсутствие обязательной
+        подстановки, некорректная сумма (не по паттерну канона §5.1).
+        **Кода каталога §7 нет.** Это дефект интеграции на нашей стороне: лог, алерт,
+        без ретрая — повтор того же тела даст ту же ошибку. Заявка **создана**,
+        пользователь видит экран успеха.
+      headers:
+        X-Correlation-Id:
+          $ref: '#/components/headers/XCorrelationId'
+        X-Request-Id:
+          $ref: '#/components/headers/XRequestId'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/NotificationError'
+          examples:
+            unknownVariable:
+              $ref: '#/components/examples/ErrorValidationFailed'
+
+    Unauthorized:
+      description: |
+        Service-JWT отсутствует, просрочен или не проходит проверку `aud`; либо нет
+        валидного клиентского сертификата mTLS. **Кода каталога §7 нет.** Алерт дежурному,
+        уведомление в ретрай-очередь. Заявка **создана**.
+      headers:
+        X-Correlation-Id:
+          $ref: '#/components/headers/XCorrelationId'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/NotificationError'
+          examples:
+            expiredServiceToken:
+              $ref: '#/components/examples/ErrorUnauthorized'
+
+    TemplateNotFound:
+      description: |
+        Шаблон не найден — как правило, не задеплоен в этом окружении.
+        **Кода каталога §7 нет.** Лог, алерт, без ретрая. Заявка **создана**.
+      headers:
+        X-Correlation-Id:
+          $ref: '#/components/headers/XCorrelationId'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/NotificationError'
+          examples:
+            missingTemplate:
+              $ref: '#/components/examples/ErrorTemplateNotFound'
+
+    ChannelNotConfigured:
+      description: |
+        Канал не поддержан шаблоном или не настроен у пользователя.
+        **Кода каталога §7 нет.** Отправка по остальным каналам продолжается; в лог
+        пишется предупреждение. Заявка **создана**.
+
+        Частный случай — `USER_OPTED_OUT`: пользователь отписан. Это **норма**, а не
+        ошибка: канал получает статус `SUPPRESSED`, лог на уровне `info`, алерта нет.
+      headers:
+        X-Correlation-Id:
+          $ref: '#/components/headers/XCorrelationId'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/NotificationError'
+          examples:
+            channelNotSupported:
+              $ref: '#/components/examples/ErrorChannelNotConfigured'
+            userOptedOut:
+              $ref: '#/components/examples/ErrorUserOptedOut'
+
+    NotificationNotFound:
+      description: |
+        Уведомление с указанным `notificationId` не найдено или вышло за срок хранения.
+        Касается только чтения статуса; **кода каталога §7 нет**.
+      headers:
+        X-Correlation-Id:
+          $ref: '#/components/headers/XCorrelationId'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/NotificationError'
+          examples:
+            unknownNotification:
+              $ref: '#/components/examples/ErrorNotificationNotFound'
+
+    UserNotFound:
+      description: |
+        Пользователь неизвестен S9 — признак рассогласования с S1 (Users Service).
+        **Кода каталога §7 нет.** Лог, алерт, без ретрая. Заявка **создана**.
+      headers:
+        X-Correlation-Id:
+          $ref: '#/components/headers/XCorrelationId'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/NotificationError'
+          examples:
+            unknownUser:
+              $ref: '#/components/examples/ErrorUserNotFound'
+
+    Conflict:
+      description: |
+        Тот же `Idempotency-Key` использован с другим телом. **Кода каталога §7 нет** —
+        в частности, `IDEMPOTENCY_CONFLICT` (409) наружу **не отдаётся**: это конфликт
+        нашего внутреннего вызова, а не запроса пользователя. Лог как дефект, без ретрая.
+        Заявка **создана**.
+      headers:
+        X-Correlation-Id:
+          $ref: '#/components/headers/XCorrelationId'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/NotificationError'
+          examples:
+            idempotencyConflict:
+              $ref: '#/components/examples/ErrorIdempotencyConflict'
+
+    TooManyRequests:
+      description: |
+        Превышен лимит запросов к S9. **Наружу `RATE_LIMITED` (429) НЕ отдаётся**:
+        код каталога §7 с тем же именем относится к лимитам нашего внешнего API,
+        которые превышает пользователь. Здесь лимит превысили мы. Уведомление уходит
+        в ретрай-очередь. Заявка **создана**.
+      headers:
+        X-Correlation-Id:
+          $ref: '#/components/headers/XCorrelationId'
+        Retry-After:
+          $ref: '#/components/headers/RetryAfter'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/NotificationError'
+          examples:
+            quotaExceeded:
+              $ref: '#/components/examples/ErrorRateLimited'
+
+    InternalError:
+      description: |
+        Внутренний сбой S9. **Кода каталога §7 нет; `500` наружу НЕ отдаётся.**
+        Уведомление уходит в ретрай-очередь 1 м / 5 м / 15 м / 1 ч / 6 ч, затем в DLQ.
+        Счётчик circuit breaker увеличивается (§11). Заявка **создана**.
+      headers:
+        X-Correlation-Id:
+          $ref: '#/components/headers/XCorrelationId'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/NotificationError'
+          examples:
+            queueFailure:
+              $ref: '#/components/examples/ErrorInternal'
+
+    ServiceUnavailable:
+      description: |
+        S9 недоступен: работы, перегрузка, открытый circuit breaker.
+        **Кода каталога §7 нет; `EXCHANGE_SERVICE_UNAVAILABLE` (503) наружу
+        НЕ отдаётся** — этот код зарезервирован за блокирующими системами (прежде всего
+        S8). Уведомление уходит в ретрай-очередь → DLQ. Заявка **создана**.
+      headers:
+        X-Correlation-Id:
+          $ref: '#/components/headers/XCorrelationId'
+        Retry-After:
+          $ref: '#/components/headers/RetryAfter'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/NotificationError'
+          examples:
+            maintenance:
+              $ref: '#/components/examples/ErrorServiceUnavailable'
+
+    GatewayTimeout:
+      description: |
+        S9 не ответил в срок (таймаут BFF — 1 000 мс). **Кода каталога §7 нет;
+        `UPSTREAM_TIMEOUT` (504) наружу НЕ отдаётся** — он зарезервирован
+        за блокирующими системами. Сверка, как у S8, здесь **не нужна**: дубликат
+        уведомления безвреден и гасится `Idempotency-Key` и `deduplicationKey`.
+        Уведомление уходит в ретрай-очередь. Заявка **создана**.
+      headers:
+        X-Correlation-Id:
+          $ref: '#/components/headers/XCorrelationId'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/NotificationError'
+          examples:
+            timeout:
+              $ref: '#/components/examples/ErrorTimeout'
+
+  examples:
+
+    NotificationRequestOrderCreated:
+      summary: Уведомление о принятой заявке (фикстуры канона §10)
+      description: |
+        Отправляется после шага 19 цепочки §6, когда S8 вернул `orderId` и статус
+        `PENDING`. Суммы и курс — из расчёта по §5.3 на фикстурах §10.3–§10.4
+        для пары `RUB→USDT` (`10000.00 RUB`, комиссия `0.35 %` = `35.00`,
+        `netFromAmount = 9965.00`, `rate = 0.010638297872`, `toAmount = 106.010638`).
+
+        Обратите внимание на состав `variables`: только `orderId`, суммы, коды активов,
+        сеть и курс. Ни `walletId`, ни email, ни имя пользователя — см. раздел PII
+        в `info.description`.
+      value:
+        userId: "usr_01J8ZQ4H9K2M3N4P5R6S7T8V9W"
+        templateId: "exchange_order_created"
+        channels: ["EMAIL", "PUSH", "IN_APP"]
+        locale: "en-US"
+        priority: "NORMAL"
+        variables:
+          orderId: "ord_01J9X2C4K7QF8N3M5T6V7W8Y9Z"
+          fromAmount: "10000.00"
+          fromAsset: "RUB"
+          feeAmount: "35.00"
+          toAmount: "106.010638"
+          toAsset: "USDT"
+          network: "TRON"
+          rate: "0.010638297872"
+          inverseRate: "94.00"
+        deduplicationKey: "exchange_order_created:ord_01J9X2C4K7QF8N3M5T6V7W8Y9Z"
+        scheduledAt: null
+        correlationId: "01J9X2C4K7QF8N3M5T6V7W8Y9Z"
+        referenceType: "EXCHANGE_ORDER"
+        referenceId: "ord_01J9X2C4K7QF8N3M5T6V7W8Y9Z"
+
+    NotificationRequestManualReview:
+      summary: Уведомление об отправке заявки на ручную проверку
+      description: |
+        Соответствует сценарию `SCORING_REVIEW` из §10.6 и статусу `MANUAL_REVIEW`
+        канона §8. В `variables` **нет** ни риск-скора, ни причин скоринга — это PII
+        и внутренняя информация комплаенса; пользователю сообщается только факт
+        и ожидаемый срок.
+      value:
+        userId: "usr_01J8ZQ4H9K2M3N4P5R6S7T8V9W"
+        templateId: "exchange_order_manual_review"
+        channels: ["EMAIL", "IN_APP"]
+        locale: "en-US"
+        priority: "NORMAL"
+        variables:
+          orderId: "ord_01J9X2C4K8QF8N3M5T6V7W8Y9Z"
+          fromAmount: "10000.00"
+          fromAsset: "RUB"
+          toAmount: "106.010638"
+          toAsset: "USDT"
+          expectedDecisionHours: 4
+        deduplicationKey: "exchange_order_manual_review:ord_01J9X2C4K8QF8N3M5T6V7W8Y9Z"
+        scheduledAt: null
+        correlationId: "01J9X2D5M1QF8N3M5T6V7W8Y9Z"
+        referenceType: "EXCHANGE_ORDER"
+        referenceId: "ord_01J9X2C4K8QF8N3M5T6V7W8Y9Z"
+
+    NotificationAcceptedQueued:
+      summary: Принято в очередь — 202, а не 201
+      description: |
+        В момент ответа уведомление **ещё не отправлено**. `statusUrl` обязателен:
+        код «принято к обработке» без способа узнать исход был бы бесполезен.
+      value:
+        notificationId: "ntf_01J9X2C4KBQF8N3M5T6V7W8Y9Z"
+        status: "QUEUED"
+        acceptedAt: "2026-08-07T10:15:32.640Z"
+        statusUrl: "/v1/notifications/ntf_01J9X2C4KBQF8N3M5T6V7W8Y9Z"
+        expiresAt: "2026-08-08T10:15:32.640Z"
+
+    NotificationAcceptedSuppressed:
+      summary: Пользователь отписан от всех каналов — это норма, не ошибка
+      description: |
+        S9 сразу вернул `SUPPRESSED`: пользователь отписан от всех запрошенных каналов.
+        Ответ по-прежнему `202` и по-прежнему успех — система корректно исполнила волю
+        пользователя. Алерт не поднимается, лог на уровне `info`.
+      value:
+        notificationId: "ntf_01J9X2C4KCQF8N3M5T6V7W8Y9Z"
+        status: "SUPPRESSED"
+        acceptedAt: "2026-08-07T10:15:32.700Z"
+        statusUrl: "/v1/notifications/ntf_01J9X2C4KCQF8N3M5T6V7W8Y9Z"
+        expiresAt: "2026-08-08T10:15:32.700Z"
+
+    NotificationStatusDelivered:
+      summary: Доставлено по всем каналам
+      value:
+        notificationId: "ntf_01J9X2C4KBQF8N3M5T6V7W8Y9Z"
+        userId: "usr_01J8ZQ4H9K2M3N4P5R6S7T8V9W"
+        templateId: "exchange_order_created"
+        status: "DELIVERED"
+        perChannel:
+          - channel: "EMAIL"
+            status: "DELIVERED"
+            providerMessageId: "ses-0c1d2e3f4a5b6c7d"
+            attempts: 1
+            lastAttemptAt: "2026-08-07T10:15:33.980Z"
+            nextRetryAt: null
+            failureCode: null
+            failureReason: null
+          - channel: "PUSH"
+            status: "READ"
+            providerMessageId: "fcm-91a2b3c4d5e6f708"
+            attempts: 1
+            lastAttemptAt: "2026-08-07T10:15:33.120Z"
+            nextRetryAt: null
+            failureCode: null
+            failureReason: null
+          - channel: "IN_APP"
+            status: "DELIVERED"
+            providerMessageId: "inapp-7f8091a2b3c4"
+            attempts: 1
+            lastAttemptAt: "2026-08-07T10:15:32.900Z"
+            nextRetryAt: null
+            failureCode: null
+            failureReason: null
+        referenceType: "EXCHANGE_ORDER"
+        referenceId: "ord_01J9X2C4K7QF8N3M5T6V7W8Y9Z"
+        correlationId: "01J9X2C4K7QF8N3M5T6V7W8Y9Z"
+        createdAt: "2026-08-07T10:15:32.640Z"
+        updatedAt: "2026-08-07T10:15:36.204Z"
+        expiresAt: "2026-08-08T10:15:32.640Z"
+
+    NotificationStatusPartialFailure:
+      summary: Часть каналов провалилась — агрегированный статус всё ещё DELIVERED
+      description: |
+        `EMAIL` дал `HARD_BOUNCE`, `PUSH` ещё повторяется, `IN_APP` доставлен.
+        Агрегированный статус — `DELIVERED`, потому что хотя бы один канал дошёл.
+        Пользователь ничего не замечает; заявка давно создана.
+      value:
+        notificationId: "ntf_01J9X2C4KDQF8N3M5T6V7W8Y9Z"
+        userId: "usr_01J8ZQ4H9K2M3N4P5R6S7T8V9W"
+        templateId: "exchange_order_created"
+        status: "DELIVERED"
+        perChannel:
+          - channel: "EMAIL"
+            status: "FAILED"
+            providerMessageId: "ses-1d2e3f4a5b6c7d8e"
+            attempts: 1
+            lastAttemptAt: "2026-08-07T10:15:34.010Z"
+            nextRetryAt: null
+            failureCode: "HARD_BOUNCE"
+            failureReason: "Recipient mailbox does not exist"
+          - channel: "PUSH"
+            status: "SENDING"
+            providerMessageId: null
+            attempts: 2
+            lastAttemptAt: "2026-08-07T10:20:34.100Z"
+            nextRetryAt: "2026-08-07T10:35:34.100Z"
+            failureCode: "PROVIDER_TIMEOUT"
+            failureReason: "Push gateway did not respond"
+          - channel: "IN_APP"
+            status: "DELIVERED"
+            providerMessageId: "inapp-8091a2b3c4d5"
+            attempts: 1
+            lastAttemptAt: "2026-08-07T10:15:32.910Z"
+            nextRetryAt: null
+            failureCode: null
+            failureReason: null
+        referenceType: "EXCHANGE_ORDER"
+        referenceId: "ord_01J9X2C4K7QF8N3M5T6V7W8Y9Z"
+        correlationId: "01J9X2C4K7QF8N3M5T6V7W8Y9Z"
+        createdAt: "2026-08-07T10:15:32.640Z"
+        updatedAt: "2026-08-07T10:20:34.100Z"
+        expiresAt: "2026-08-08T10:15:32.640Z"
+
+    NotificationStatusSuppressed:
+      summary: Все каналы подавлены — SUPPRESSED, это норма
+      description: |
+        `failureCode: USER_OPTED_OUT` в терминах доставки, но с точки зрения системы
+        это успешное исполнение воли пользователя. Алерта нет.
+      value:
+        notificationId: "ntf_01J9X2C4KCQF8N3M5T6V7W8Y9Z"
+        userId: "usr_01J8ZQ4H9K2M3N4P5R6S7T8V9W"
+        templateId: "exchange_order_created"
+        status: "SUPPRESSED"
+        perChannel:
+          - channel: "EMAIL"
+            status: "SUPPRESSED"
+            providerMessageId: null
+            attempts: 0
+            lastAttemptAt: null
+            nextRetryAt: null
+            failureCode: "USER_OPTED_OUT"
+            failureReason: "User opted out of EMAIL notifications"
+        referenceType: "EXCHANGE_ORDER"
+        referenceId: "ord_01J9X2C4K7QF8N3M5T6V7W8Y9Z"
+        correlationId: "01J9X2C4K7QF8N3M5T6V7W8Y9Z"
+        createdAt: "2026-08-07T10:15:32.700Z"
+        updatedAt: "2026-08-07T10:15:32.700Z"
+        expiresAt: "2026-08-08T10:15:32.700Z"
+
+    TemplateListExchange:
+      summary: Три шаблона — по числу исходов создания заявки в скоупе
+      description: |
+        Перечень соответствует статусам, отдаваемым наружу на пути создания заявки
+        (канон §8, граница скоупа §1): `PENDING`, `MANUAL_REVIEW`, `REJECTED`.
+      value:
+        templates:
+          - templateId: "exchange_order_created"
+            name: "Exchange order created"
+            supportedChannels: ["EMAIL", "PUSH", "IN_APP"]
+            supportedLocales: ["en-US", "ru-RU"]
+            requiredVariables:
+              ["orderId", "fromAmount", "fromAsset", "feeAmount", "toAmount", "toAsset",
+               "network", "rate", "inverseRate"]
+            version: 3
+            subjectPreview: "Your exchange order {{orderId}} is confirmed"
+            bodyPreview: "You exchanged {{fromAmount}} {{fromAsset}} for {{toAmount}} {{toAsset}} on {{network}}."
+          - templateId: "exchange_order_manual_review"
+            name: "Exchange order sent for manual review"
+            supportedChannels: ["EMAIL", "IN_APP"]
+            supportedLocales: ["en-US", "ru-RU"]
+            requiredVariables:
+              ["orderId", "fromAmount", "fromAsset", "toAmount", "toAsset",
+               "expectedDecisionHours"]
+            version: 2
+            subjectPreview: "Your exchange order {{orderId}} is under review"
+            bodyPreview: "We are reviewing your order. A decision is expected within {{expectedDecisionHours}} hours."
+          - templateId: "exchange_order_rejected"
+            name: "Exchange order rejected"
+            supportedChannels: ["EMAIL", "PUSH", "IN_APP"]
+            supportedLocales: ["en-US", "ru-RU"]
+            requiredVariables: ["orderId", "fromAmount", "fromAsset"]
+            version: 2
+            subjectPreview: "Your exchange order {{orderId}} was declined"
+            bodyPreview: "Your order for {{fromAmount}} {{fromAsset}} was declined. Reserved funds have been released."
+        updatedAt: "2026-08-01T00:00:00.000Z"
+
+    TemplateOrderCreated:
+      summary: Шаблон подтверждения заявки
+      description: |
+        `requiredVariables` — это allow-list, по которому BFF фильтрует `variables`
+        перед отправкой. Ни `walletId`, ни контактных данных в списке нет и быть
+        не должно.
+      value:
+        templateId: "exchange_order_created"
+        name: "Exchange order created"
+        supportedChannels: ["EMAIL", "PUSH", "IN_APP"]
+        supportedLocales: ["en-US", "ru-RU"]
+        requiredVariables:
+          ["orderId", "fromAmount", "fromAsset", "feeAmount", "toAmount", "toAsset",
+           "network", "rate", "inverseRate"]
+        version: 3
+        subjectPreview: "Your exchange order {{orderId}} is confirmed"
+        bodyPreview: "You exchanged {{fromAmount}} {{fromAsset}} for {{toAmount}} {{toAsset}} on {{network}}."
+
+    PreferencesAlexMorgan:
+      summary: Настройки пользователя из фикстуры §10.1
+      description: |
+        `userId` и профиль — из фикстуры канона §10.1 (`Alex Morgan`, резидентство `AE`),
+        отсюда часовой пояс `Asia/Dubai`. Адреса **маскированы**: полный email и телефон
+        BFF не получает.
+      value:
+        userId: "usr_01J8ZQ4H9K2M3N4P5R6S7T8V9W"
+        channels:
+          - channel: "EMAIL"
+            enabled: true
+            address: "a***n@example.com"
+            verified: true
+            optedOutAt: null
+          - channel: "PUSH"
+            enabled: true
+            address: null
+            verified: true
+            optedOutAt: null
+          - channel: "IN_APP"
+            enabled: true
+            address: null
+            verified: true
+            optedOutAt: null
+          - channel: "SMS"
+            enabled: false
+            address: "+971 ** *** 4417"
+            verified: true
+            optedOutAt: "2026-07-14T08:31:02.000Z"
+        quietHours:
+          from: "22:00"
+          to: "08:00"
+          timezone: "Asia/Dubai"
+        locale: "en-US"
+        updatedAt: "2026-07-14T08:31:02.000Z"
+
+    PreferencesOptedOut:
+      summary: Пользователь отписан от EMAIL — отправка туда даст SUPPRESSED
+      description: |
+        `enabled: false` и заполненный `optedOutAt`. BFF может исключить канал заранее,
+        но авторитетную проверку в любом случае выполнит сам S9. `quietHours: null` —
+        пользователь их не настраивал.
+      value:
+        userId: "usr_01J8ZQ4H9K2M3N4P5R6S7T8V9W"
+        channels:
+          - channel: "EMAIL"
+            enabled: false
+            address: "a***n@example.com"
+            verified: true
+            optedOutAt: "2026-08-01T12:00:00.000Z"
+          - channel: "IN_APP"
+            enabled: true
+            address: null
+            verified: true
+            optedOutAt: null
+        quietHours: null
+        locale: "ru-RU"
+        updatedAt: "2026-08-01T12:00:00.000Z"
+
+    EventDeliveryDelivered:
+      summary: Email доставлен
+      value:
+        eventId: "e4b1f2a3-7c58-4d69-8a01-5f2c9b7d3e46"
+        eventType: "notification.delivery.updated"
+        occurredAt: "2026-08-07T10:15:36.204Z"
+        sequence: 3
+        notificationId: "ntf_01J9X2C4KBQF8N3M5T6V7W8Y9Z"
+        channel: "EMAIL"
+        status: "DELIVERED"
+        providerMessageId: "ses-0c1d2e3f4a5b6c7d"
+        failureCode: null
+        failureReason: null
+        correlationId: "01J9X2C4K7QF8N3M5T6V7W8Y9Z"
+
+    EventDeliveryFailed:
+      summary: Push провалился — только наблюдаемость, пользователь не затронут
+      description: |
+        Событие не меняет статус заявки и не показывается на экране обмена.
+        Оно питает метрику неуспешных доставок и, при превышении порога, алерт.
+      value:
+        eventId: "f5c2a3b4-8d69-4e70-9b12-6a3d0c8e4f57"
+        eventType: "notification.delivery.updated"
+        occurredAt: "2026-08-07T10:20:34.100Z"
+        sequence: 4
+        notificationId: "ntf_01J9X2C4KDQF8N3M5T6V7W8Y9Z"
+        channel: "PUSH"
+        status: "FAILED"
+        providerMessageId: null
+        failureCode: "PROVIDER_TIMEOUT"
+        failureReason: "Push gateway did not respond"
+        correlationId: "01J9X2C4K7QF8N3M5T6V7W8Y9Z"
+
+    EventDeliverySuppressed:
+      summary: Канал подавлен из-за отписки — норма, лог на уровне info
+      value:
+        eventId: "a6d3b4c5-9e70-4f81-8c23-7b4e1d9f5a68"
+        eventType: "notification.delivery.updated"
+        occurredAt: "2026-08-07T10:15:32.700Z"
+        sequence: 1
+        notificationId: "ntf_01J9X2C4KCQF8N3M5T6V7W8Y9Z"
+        channel: "EMAIL"
+        status: "SUPPRESSED"
+        providerMessageId: null
+        failureCode: "USER_OPTED_OUT"
+        failureReason: "User opted out of EMAIL notifications"
+        correlationId: "01J9X2C4K7QF8N3M5T6V7W8Y9Z"
+
+    WebhookAckAccepted:
+      summary: Событие принято
+      value:
+        result: "ACCEPTED"
+        eventId: "e4b1f2a3-7c58-4d69-8a01-5f2c9b7d3e46"
+        receivedAt: "2026-08-07T10:15:36.310Z"
+
+    WebhookAckDuplicate:
+      summary: Дубликат по eventId — 200, повтор не нужен
+      description: |
+        At-least-once доставка: дубликаты штатны. Отвечаем `200`, чтобы S9 не запускал
+        расписание повторов.
+      value:
+        result: "DUPLICATE_IGNORED"
+        eventId: "e4b1f2a3-7c58-4d69-8a01-5f2c9b7d3e46"
+        receivedAt: "2026-08-07T10:16:41.002Z"
+
+    WebhookAckOutOfOrder:
+      summary: Событие пришло не по порядку — отброшено, ответ 200
+      description: |
+        Пришло `sequence: 2`, когда для этого канала уже сохранён `sequence: 3`.
+        По правилу упорядочивания событие отбрасывается — иначе запоздавшее `SENT`
+        затёрло бы уже полученное `DELIVERED`. Ответ `200`: транспорт сработал,
+        повторять не нужно.
+      value:
+        result: "OUT_OF_ORDER_IGNORED"
+        eventId: "b7e4c5d6-0f81-4a92-9d34-8c5f2e0a6b79"
+        receivedAt: "2026-08-07T10:15:37.500Z"
+
+    ErrorValidationFailed:
+      summary: Переменная вне allow-list шаблона — дефект интеграции, кода §7 нет
+      description: |
+        Попытка передать `walletId` в `variables`. Шаблон такой переменной не объявлял,
+        и это правильно: полный идентификатор кошелька в тело письма попадать
+        не должен (см. раздел PII в `info.description`).
+      value:
+        error: "VALIDATION_FAILED"
+        message: "Variable 'walletId' is not declared by template 'exchange_order_created'"
+        traceId: "4bf92f3577b34da6a3ce929d0e0e4736"
+        timestamp: "2026-08-07T10:15:32.640Z"
+        details:
+          templateId: "exchange_order_created"
+          unexpectedVariables: ["walletId"]
+        retryable: false
+
+    ErrorTemplateNotFound:
+      summary: Шаблон не задеплоен — лог и алерт, заявка создана
+      value:
+        error: "TEMPLATE_NOT_FOUND"
+        message: "Template 'exchange_order_created' is not deployed in this environment"
+        traceId: "a1b2c3d4e5f60718293a4b5c6d7e8f90"
+        timestamp: "2026-08-07T10:15:32.640Z"
+        details:
+          templateId: "exchange_order_created"
+        retryable: false
+
+    ErrorChannelNotConfigured:
+      summary: Канал не поддержан шаблоном — остальные каналы отправляются
+      value:
+        error: "CHANNEL_NOT_CONFIGURED"
+        message: "Template 'exchange_order_created' has no layout for channel 'SMS'"
+        traceId: "b2c3d4e5f60718293a4b5c6d7e8f9012"
+        timestamp: "2026-08-07T10:15:32.640Z"
+        details:
+          templateId: "exchange_order_created"
+          channel: "SMS"
+          supportedChannels: ["EMAIL", "PUSH", "IN_APP"]
+        retryable: false
+
+    ErrorUserOptedOut:
+      summary: Пользователь отписан — это НОРМА, а не ошибка
+      description: |
+        Корректная реакция — статус `SUPPRESSED`, лог на уровне `info`, **никакого
+        алерта**. Алерт на отписку означал бы, что систему раздражает соблюдение воли
+        пользователя. Кода каталога §7 для этого нет и не требуется.
+      value:
+        error: "USER_OPTED_OUT"
+        message: "User opted out of channel EMAIL"
+        traceId: "c3d4e5f60718293a4b5c6d7e8f901234"
+        timestamp: "2026-08-07T10:15:32.700Z"
+        details:
+          channel: "EMAIL"
+          optedOutAt: "2026-07-14T08:31:02.000Z"
+        retryable: false
+
+    ErrorUserNotFound:
+      summary: Пользователь неизвестен S9 — рассогласование с S1
+      value:
+        error: "USER_NOT_FOUND"
+        message: "User is unknown to the notification service"
+        traceId: "d4e5f60718293a4b5c6d7e8f90123456"
+        timestamp: "2026-08-07T10:15:32.640Z"
+        details:
+          userId: "usr_01J8ZQ4H9K2M3N4P5R6S7T8V9W"
+        retryable: false
+
+    ErrorNotificationNotFound:
+      summary: Уведомление не найдено или вышло за срок хранения
+      value:
+        error: "NOTIFICATION_NOT_FOUND"
+        message: "Notification not found or expired"
+        traceId: "e5f60718293a4b5c6d7e8f9012345678"
+        timestamp: "2026-08-09T09:00:00.000Z"
+        details:
+          notificationId: "ntf_01J9X2C4KBQF8N3M5T6V7W8Y9Z"
+        retryable: false
+
+    ErrorIdempotencyConflict:
+      summary: Тот же ключ, другое тело — IDEMPOTENCY_CONFLICT наружу НЕ отдаётся
+      description: |
+        Это конфликт нашего внутреннего вызова, а не запроса пользователя. Код §7
+        `IDEMPOTENCY_CONFLICT` (409) здесь неприменим.
+      value:
+        error: "DUPLICATE_IDEMPOTENCY_KEY_DIFFERENT_PAYLOAD"
+        message: "Idempotency key was already used with a different request payload"
+        traceId: "f60718293a4b5c6d7e8f901234567890"
+        timestamp: "2026-08-07T10:15:33.000Z"
+        details:
+          existingNotificationId: "ntf_01J9X2C4KBQF8N3M5T6V7W8Y9Z"
+        retryable: false
+
+    ErrorRateLimited:
+      summary: Лимит превысили МЫ — 429 наружу не отдаём, уходим в ретрай-очередь
+      value:
+        error: "RATE_LIMITED"
+        message: "Rate limit exceeded for client 'svc:exchange-bff'"
+        traceId: "0718293a4b5c6d7e8f90123456789012"
+        timestamp: "2026-08-07T10:15:32.640Z"
+        details:
+          limit: 10000
+          windowSeconds: 60
+        retryable: true
+
+    ErrorUnauthorized:
+      summary: Просрочен service-JWT — алерт дежурному, заявка создана
+      value:
+        error: "UNAUTHORIZED"
+        message: "Service token expired"
+        traceId: "18293a4b5c6d7e8f9012345678901234"
+        timestamp: "2026-08-07T10:15:32.640Z"
+        details:
+          reason: "exp_in_past"
+        retryable: false
+
+    ErrorInternal:
+      summary: Сбой S9 — ретрай-очередь → DLQ, заявка создана
+      value:
+        error: "INTERNAL_ERROR"
+        message: "Failed to enqueue notification"
+        traceId: "293a4b5c6d7e8f901234567890123456"
+        timestamp: "2026-08-07T10:15:32.640Z"
+        details: {}
+        retryable: true
+
+    ErrorServiceUnavailable:
+      summary: S9 недоступен — заявка всё равно создана
+      description: |
+        Определяющий пример класса `Non-blocking` (канон §3): сервис уведомлений лежит,
+        а пользователь видит экран успеха с `orderId`.
+      value:
+        error: "SERVICE_UNAVAILABLE"
+        message: "Notification service is temporarily unavailable"
+        traceId: "3a4b5c6d7e8f90123456789012345678"
+        timestamp: "2026-08-07T10:15:32.640Z"
+        details:
+          reason: "maintenance"
+        retryable: true
+
+    ErrorTimeout:
+      summary: Таймаут 1000 мс — сверка не нужна, дубликат безвреден
+      description: |
+        В отличие от S8, здесь процедура сверки не требуется: повторная отправка
+        уведомления не имеет финансовых последствий и гасится `Idempotency-Key`
+        и `deduplicationKey`.
+      value:
+        error: "SERVICE_UNAVAILABLE"
+        message: "Upstream did not respond within the deadline"
+        traceId: "4b5c6d7e8f9012345678901234567890"
+        timestamp: "2026-08-07T10:15:33.640Z"
+        details:
+          deadlineMs: 1000
+        retryable: true

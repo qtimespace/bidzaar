@@ -1,0 +1,2099 @@
+openapi: 3.1.0
+
+info:
+  title: Scoring / AML Service API (S3) — Integration Stub
+  version: "1.0.0"
+  summary: Контракт входящих данных от сервиса скоринга и AML в Exchange BFF
+  description: |
+    # Scoring / AML Service (S3) — стаб внешнего контракта
+
+    Документ описывает **входящую к нам** информацию: что Exchange BFF **получает** от
+    сервиса скоринга и AML. Это НЕ спецификация на реализацию сервиса. Цель — зафиксировать
+    форму риск-оценки, семантику решения, контракт webhook и маппинг в канонический
+    каталог ошибок (`docs/00-canonical-model.md` §7).
+
+    ## Назначение
+
+    Сервис отвечает на один вопрос: **можно ли провести конкретную операцию этому
+    пользователю прямо сейчас**. Возвращает числовой балл, полосу риска, решение
+    `ALLOW` / `REVIEW` / `DENY` и перечень сработавших факторов.
+
+    Дополнительно предоставляет фоновый риск-профиль пользователя (агрегат, обновляемый
+    вне запроса) и статус кейса ручной проверки комплаенса.
+
+    ## Место в цепочке валидации (канон §6)
+
+    Используется на **шаге 16** — «Скоринг разрешает операцию». Провал даёт
+    `SCORING_DENIED` (403) или `SCORING_REVIEW_REQUIRED` (202).
+
+    Шаг 16 выполняется ПОСЛЕ статуса пользователя (13), KYC (14) и лимитов (15),
+    но ДО проверки баланса (17) и создания холда (18). Порядок нормативен: скоринг
+    получает уже провалидированные сумму и пару, но ещё не резервирует средства —
+    отказ на шаге 16 не требует компенсирующего снятия холда.
+
+    ## Три исхода, а не два
+
+    Это **единственный** шаг цепочки с тремя исходами:
+
+    | `decision` | Что происходит | Ответ наружу |
+    |------------|----------------|--------------|
+    | `ALLOW` | цепочка продолжается на шаг 17 | заявка `PENDING` (201) |
+    | `REVIEW` | заявка создаётся в статусе `MANUAL_REVIEW`, средства резервируются | `SCORING_REVIEW_REQUIRED` (**202**) |
+    | `DENY` | заявка не создаётся | `SCORING_DENIED` (403) |
+
+    `SCORING_REVIEW_REQUIRED` (202) — **не ошибка**, а альтернативный успешный исход
+    (канон §7, примечание после таблицы; канон §8, ветка `MANUAL_REVIEW`). Тело ответа
+    содержит заявку в статусе `MANUAL_REVIEW`, средства **зарезервированы**.
+    Дальнейшая судьба кейса приходит через webhook `risk.case.resolved` — и это уже
+    за границей скоупа задания (канон §1, §8).
+
+    ## Критичность (канон §3)
+
+    **Blocking.** Политика — **fail-closed**: при недоступности S3 операция **НЕ
+    создаётся**. `EXCHANGE_SERVICE_UNAVAILABLE` (503) или `UPSTREAM_TIMEOUT` (504).
+
+    Fail-open здесь недопустим: пропустить операцию «на всякий случай» означает провести
+    транзакцию, которую AML-контур мог бы заблокировать. Стоимость ложного отказа —
+    неудобство пользователя; стоимость ложного пропуска — регуляторный инцидент.
+    Асимметрия однозначна.
+
+    ## TTL решения и допустимый stale
+
+    Решение имеет собственный **TTL** (`ttlSeconds`, типично **300 с**), заданный
+    сервисом, а не нашим кешем. В пределах TTL повторное использование ранее полученного
+    решения для **той же операции** допустимо — это и есть единственная разрешённая форма
+    stale для S3.
+
+    За пределами `expiresAt` решение считается недействительным: требуется новая оценка.
+    Отдавать просроченное решение при недоступности сервиса **запрещено** — работает
+    fail-closed.
+
+    Различие с S2 существенно: у KYC stale запрещён полностью, у S3 stale ограничен
+    рамками `ttlSeconds`, потому что оценка привязана к конкретным параметрам операции
+    и её «свежесть» определена самим поставщиком решения.
+
+    ## Таймауты и ретраи (канон §11)
+
+    * Таймаут вызова: **1 000 мс** (общий бюджет S1/S2/S3/S4).
+    * Ретраи: `GET` — 2 попытки, экспоненциальный backoff + jitter.
+      `POST /v1/risk-assessments` ретраится **только** при наличии `Idempotency-Key`:
+      без него повтор породил бы вторую оценку и, возможно, второй кейс ручной проверки.
+    * Circuit breaker: 50 % ошибок на окне 20 запросов, open 30 с. При open —
+      немедленный fail-closed отказ.
+
+    ## Ограничения по PII
+
+    * `ipAddress` — **PII**. В логах маскируется: IPv4 до /24 (`203.0.113.0/24`),
+      IPv6 до /48. Полное значение передаётся сервису, но не логируется нашей стороной
+      и не возвращается на фронтенд.
+    * `deviceId` — псевдонимный идентификатор устройства; не связывается в логах с
+      `email`/`phone` из S1.
+    * `factors[].description` и `reasons[]` — внутренняя аналитика риска. **Никогда**
+      не показываются пользователю: раскрытие сработавших правил — прямая подсказка
+      для обхода AML-контура. Наружу уходит только `Operation declined. Contact support.`
+    * `caseId` пользователю не раскрывается; он используется поддержкой по обращению.
+
+    ## Безопасность транспорта
+
+    Service-to-service: **mTLS** + `Bearer` JWT. Webhook-вызовы подписываются
+    HMAC-SHA256 (`X-Scoring-Signature`), см. секцию `webhooks`.
+
+servers:
+  - url: https://scoring.internal.wallet/v1
+    description: Production — внутренняя сеть, доступ только по mTLS
+  - url: https://scoring.staging.internal.wallet/v1
+    description: Staging — теневая модель, решения не имеют регуляторной силы
+  - url: https://scoring.mock.internal.wallet/v1
+    description: Mock — детерминированные фикстуры канона §10.1 (score 17, LOW, ALLOW)
+
+tags:
+  - name: Risk Assessments
+    description: Оценка риска конкретной операции — то, что BFF запрашивает на шаге 16 цепочки валидации
+  - name: Risk Profiles
+    description: Фоновый агрегированный риск-профиль пользователя с собственным TTL
+  - name: Cases
+    description: Кейсы ручной проверки комплаенса, создаваемые при решении REVIEW
+  - name: Webhooks
+    description: Асинхронные уведомления о разрешении кейса ручной проверки
+
+security:
+  - bearerAuth: []
+
+paths:
+
+  /v1/risk-assessments:
+    post:
+      tags: [Risk Assessments]
+      operationId: createRiskAssessment
+      summary: Create a risk assessment for a specific operation
+      description: |
+        Создаёт **ресурс оценки риска** под конкретную операцию обмена. Это создание
+        ресурса, а не RPC-вызов действия: результат — адресуемая сущность `RiskAssessment`
+        с собственным `assessmentId`, доступная по `GET /v1/risk-assessments/{assessmentId}`,
+        с собственным TTL и правом на повторное чтение. Именно поэтому путь — существительное
+        во множественном числе, а не `/evaluate` или `/check`.
+
+        Вызывается Exchange BFF на **шаге 16** канона §6, после проверки лимитов (15)
+        и до проверки баланса (17).
+
+        **Идемпотентность:** заголовок `Idempotency-Key` (UUIDv4) обязателен. Окно
+        хранения — 24 ч (канон §9). Повтор с тем же телом возвращает ту же оценку с тем же
+        `assessmentId`; повтор с другим телом → `409` `IDEMPOTENCY_CONFLICT`. Практически
+        всегда используется `Idempotency-Key` исходного `POST /v1/exchange-orders` —
+        так ретрай создания заявки не порождает второй кейс ручной проверки.
+
+        **Три исхода** описаны в `info.description`. Ответ `201` возвращается во всех трёх
+        случаях: `DENY` и `REVIEW` — это валидные результаты оценки, а не ошибки HTTP-уровня.
+        Отображением их в `403` / `202` занимается Exchange BFF.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKeyHeader'
+        - $ref: '#/components/parameters/CorrelationIdHeader'
+        - $ref: '#/components/parameters/RequestIdHeader'
+      requestBody:
+        required: true
+        description: Параметры операции, для которой запрашивается оценка риска
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RiskAssessmentRequest'
+            examples:
+              exchangeRubToUsdt:
+                $ref: '#/components/examples/RiskAssessmentRequestExample'
+      responses:
+        '201':
+          description: |
+            Оценка создана. Значение `decision` может быть любым из `ALLOW` / `REVIEW` /
+            `DENY` — все три являются успешным результатом оценки на уровне HTTP.
+          headers:
+            X-Correlation-Id:
+              $ref: '#/components/headers/CorrelationIdResponse'
+            X-Request-Id:
+              $ref: '#/components/headers/RequestIdResponse'
+            Location:
+              $ref: '#/components/headers/LocationResponse'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RiskAssessment'
+              examples:
+                allowLowRisk:
+                  $ref: '#/components/examples/RiskAssessmentAllow'
+                reviewRequired:
+                  $ref: '#/components/examples/RiskAssessmentReview'
+                denied:
+                  $ref: '#/components/examples/RiskAssessmentDeny'
+        '200':
+          description: |
+            Идемпотентный повтор: оценка с этим `Idempotency-Key` уже создавалась,
+            возвращается ранее созданный ресурс без побочных эффектов и без повторного
+            прогона модели.
+          headers:
+            X-Correlation-Id:
+              $ref: '#/components/headers/CorrelationIdResponse'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RiskAssessment'
+              examples:
+                replayed:
+                  $ref: '#/components/examples/RiskAssessmentAllow'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/UnprocessableEntity'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+        '504':
+          $ref: '#/components/responses/GatewayTimeout'
+
+  /v1/risk-assessments/{assessmentId}:
+    get:
+      tags: [Risk Assessments]
+      operationId: getRiskAssessment
+      summary: Get a previously created risk assessment
+      description: |
+        Возвращает ранее созданную оценку. Используется для аудита, для повторного чтения
+        решения в пределах `ttlSeconds` и для разбора инцидентов.
+
+        После `expiresAt` ресурс продолжает существовать (аудит), но решение считается
+        **недействительным** для принятия новых операционных решений — поле `expiresAt`
+        обязано проверяться потребителем.
+
+        Идемпотентно, допускает 2 ретрая.
+      parameters:
+        - $ref: '#/components/parameters/AssessmentIdPath'
+        - $ref: '#/components/parameters/CorrelationIdHeader'
+        - $ref: '#/components/parameters/RequestIdHeader'
+      responses:
+        '200':
+          description: Оценка получена
+          headers:
+            X-Correlation-Id:
+              $ref: '#/components/headers/CorrelationIdResponse'
+            X-Request-Id:
+              $ref: '#/components/headers/RequestIdResponse'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RiskAssessment'
+              examples:
+                allowLowRisk:
+                  $ref: '#/components/examples/RiskAssessmentAllow'
+                reviewRequired:
+                  $ref: '#/components/examples/RiskAssessmentReview'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+        '504':
+          $ref: '#/components/responses/GatewayTimeout'
+
+  /v1/users/{userId}/risk-profile:
+    get:
+      tags: [Risk Profiles]
+      operationId: getUserRiskProfile
+      summary: Get background risk profile of a user
+      description: |
+        Возвращает фоновый агрегированный риск-профиль пользователя: балл, полосу,
+        поведенческие агрегаты и постоянные факторы. Профиль пересчитывается вне
+        пользовательского запроса (батчем и по событиям) и имеет собственный **TTL**.
+
+        Отличие от `RiskAssessment`: профиль **не привязан к конкретной операции** и
+        **не является решением**. Он не может заменить вызов `POST /v1/risk-assessments`
+        на шаге 16 — операционное решение принимается только с учётом суммы, пары,
+        устройства и контекста сессии.
+
+        Используется вне критического пути: для предзаполнения контекста и для
+        отображения в комплаенс-инструментах.
+      parameters:
+        - $ref: '#/components/parameters/UserIdPath'
+        - $ref: '#/components/parameters/CorrelationIdHeader'
+        - $ref: '#/components/parameters/RequestIdHeader'
+      responses:
+        '200':
+          description: Риск-профиль получен
+          headers:
+            X-Correlation-Id:
+              $ref: '#/components/headers/CorrelationIdResponse'
+            X-Request-Id:
+              $ref: '#/components/headers/RequestIdResponse'
+            Cache-Control:
+              $ref: '#/components/headers/CacheControlResponse'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UserRiskProfile'
+              examples:
+                lowRisk:
+                  $ref: '#/components/examples/UserRiskProfileLow'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+        '504':
+          $ref: '#/components/responses/GatewayTimeout'
+
+  /v1/cases/{caseId}:
+    get:
+      tags: [Cases]
+      operationId: getRiskCase
+      summary: Get manual review case state
+      description: |
+        Возвращает состояние кейса ручной проверки комплаенса, созданного при
+        `decision = REVIEW`.
+
+        Разрешение кейса приходит через webhook `risk.case.resolved`; опрос этого ресурса —
+        резервный канал и инструмент поддержки.
+
+        **Содержимое кейса за границей скоупа задания** (канон §1): наша ответственность
+        заканчивается на создании заявки в статусе `MANUAL_REVIEW`. Эндпоинт описан,
+        потому что он определяет форму входящих данных, но на пути создания заявки
+        не вызывается.
+      parameters:
+        - $ref: '#/components/parameters/CaseIdPath'
+        - $ref: '#/components/parameters/CorrelationIdHeader'
+        - $ref: '#/components/parameters/RequestIdHeader'
+      responses:
+        '200':
+          description: Состояние кейса получено
+          headers:
+            X-Correlation-Id:
+              $ref: '#/components/headers/CorrelationIdResponse'
+            X-Request-Id:
+              $ref: '#/components/headers/RequestIdResponse'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RiskCase'
+              examples:
+                openCase:
+                  $ref: '#/components/examples/RiskCaseOpen'
+                resolvedCase:
+                  $ref: '#/components/examples/RiskCaseResolved'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+        '504':
+          $ref: '#/components/responses/GatewayTimeout'
+
+webhooks:
+
+  risk.case.resolved:
+    post:
+      tags: [Webhooks]
+      operationId: onRiskCaseResolved
+      summary: Manual review case resolved callback (service to Exchange BFF)
+      description: |
+        Сервис вызывает **наш** эндпоинт, когда комплаенс-офицер разрешил кейс ручной
+        проверки. Направление вызова: Scoring / AML Service → Exchange BFF.
+
+        Событие переводит заявку из `MANUAL_REVIEW` в `PENDING` (при `APPROVED`) или в
+        `REJECTED` со снятием холда (при `REJECTED`). **Этот переход находится за границей
+        скоупа задания** (канон §1, §8) — контракт зафиксирован, чтобы форма входящих
+        данных была известна заранее.
+
+        ## Подпись
+
+        Заголовок `X-Scoring-Signature` имеет форму:
+
+        ```
+        X-Scoring-Signature: t=<unix_seconds>,v1=<hex>
+        ```
+
+        где `v1 = HMAC-SHA256(secret, t + "." + rawBody)` в нижнем регистре hex.
+        Проверяется по **сырому телу** до JSON-парсинга, сравнение constant-time.
+        Окно валидности timestamp — **300 с**; за его пределами запрос отклоняется
+        как потенциальный replay.
+
+        ## Идемпотентность
+
+        Дедупликация по `eventId` (UUIDv4), окно **24 ч**. Повторная доставка того же
+        `eventId` — no-op с ответом `200`. Доставка гарантируется at-least-once.
+
+        ## Порядок доставки
+
+        Поле `sequence` — монотонно возрастающий счётчик в пределах одного `caseId`.
+        Событие с `sequence`, не превышающим уже обработанное, отбрасывается как
+        out-of-order.
+
+        ## Ответ и ретраи
+
+        Отвечать `200` в течение **5 с**. При не-`2xx` или таймауте сервис ретраит с
+        экспоненциальным backoff: **1 мин → 5 мин → 30 мин → 2 ч → 6 ч**, далее
+        dead-letter на стороне отправителя.
+
+        ## Ограничения
+
+        Поле `comment` — внутренняя формулировка комплаенса, пользователю **не
+        показывается** и не логируется в пользовательских трейсах.
+      parameters:
+        - $ref: '#/components/parameters/ScoringSignatureHeader'
+        - $ref: '#/components/parameters/CorrelationIdHeader'
+        - $ref: '#/components/parameters/RequestIdHeader'
+      requestBody:
+        required: true
+        description: Событие разрешения кейса ручной проверки
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RiskCaseResolvedEvent'
+            examples:
+              approved:
+                $ref: '#/components/examples/WebhookCaseApproved'
+              rejected:
+                $ref: '#/components/examples/WebhookCaseRejected'
+      responses:
+        '200':
+          description: |
+            Событие принято (или распознано как дубликат по `eventId`). Должно быть
+            отдано в течение 5 с.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WebhookAck'
+              examples:
+                accepted:
+                  $ref: '#/components/examples/WebhookAckAccepted'
+                duplicate:
+                  $ref: '#/components/examples/WebhookAckDuplicate'
+        '400':
+          description: |
+            Невалидный payload. Отправитель **не** ретраит — форма события повтором
+            не исправится; событие уходит в наш dead-letter.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ScoringServiceError'
+              examples:
+                invalidPayload:
+                  $ref: '#/components/examples/ErrorWebhookInvalidPayload'
+        '401':
+          description: |
+            Подпись `X-Scoring-Signature` невалидна или timestamp вне окна 300 с.
+            Ретрай бессмысленен.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ScoringServiceError'
+              examples:
+                badSignature:
+                  $ref: '#/components/examples/ErrorWebhookBadSignature'
+
+components:
+
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: |
+        Service-to-service аутентификация для исходящих вызовов Exchange BFF → S3.
+
+        **Транспорт:** обязательный **mTLS**, клиентский сертификат Exchange BFF выпущен
+        внутренним CA, CN проверяется сервисом по allow-list.
+
+        **Токен:** короткоживущий JWT (TTL 300 с). Claims: `iss`, `aud=scoring-service`,
+        `sub=exchange-bff`, `exp`, `jti`, `scope` (`risk:assessments:write`,
+        `risk:assessments:read`, `risk:profile:read`, `risk:cases:read`).
+        Scope `risk:cases:write` Exchange BFF не выдаётся — решение по кейсу принимает
+        только комплаенс-контур.
+
+        **Входящие webhook-вызовы аутентифицируются иначе** — HMAC-подписью
+        `X-Scoring-Signature` (см. секцию `webhooks`) поверх mTLS с pinning сертификата.
+
+  parameters:
+
+    UserIdPath:
+      name: userId
+      in: path
+      required: true
+      description: Идентификатор пользователя, `usr_` + ULID (Crockford Base32, 26 символов)
+      schema:
+        type: string
+        pattern: '^usr_[0-9A-HJKMNP-TV-Z]{26}$'
+        minLength: 30
+        maxLength: 30
+        description: Идентификатор пользователя
+        examples:
+          - usr_01J8ZQ4H9K2M3N4P5R6S7T8V9W
+
+    AssessmentIdPath:
+      name: assessmentId
+      in: path
+      required: true
+      description: Идентификатор оценки риска, `rsk_` + ULID (Crockford Base32)
+      schema:
+        type: string
+        pattern: '^rsk_[0-9A-HJKMNP-TV-Z]{26}$'
+        minLength: 30
+        maxLength: 30
+        description: Идентификатор оценки риска
+        examples:
+          - rsk_01J9X4D8Q3S5V7X9Z1B3D5F7H9
+
+    CaseIdPath:
+      name: caseId
+      in: path
+      required: true
+      description: Идентификатор кейса ручной проверки, `cas_` + ULID (Crockford Base32)
+      schema:
+        type: string
+        pattern: '^cas_[0-9A-HJKMNP-TV-Z]{26}$'
+        minLength: 30
+        maxLength: 30
+        description: Идентификатор кейса ручной проверки
+        examples:
+          - cas_01J9X5E9R4T6W8Y0A2C4E6G8J0
+
+    IdempotencyKeyHeader:
+      name: Idempotency-Key
+      in: header
+      required: true
+      description: |
+        Ключ идемпотентности (UUIDv4). Окно хранения — 24 ч (канон §9). Повтор с тем же
+        телом возвращает ту же оценку; повтор с другим телом → `409` `IDEMPOTENCY_CONFLICT`.
+        Обычно совпадает с ключом исходного `POST /v1/exchange-orders`, чтобы ретрай
+        создания заявки не породил второй кейс ручной проверки.
+      schema:
+        type: string
+        format: uuid
+        minLength: 36
+        maxLength: 36
+        description: UUIDv4-ключ идемпотентности
+        examples:
+          - 7c1d9b34-8f52-4a6e-b0c7-2e15d3f49a88
+
+    CorrelationIdHeader:
+      name: X-Correlation-Id
+      in: header
+      required: true
+      description: |
+        Сквозной идентификатор бизнес-операции (ULID, 26 символов Crockford Base32),
+        передаётся без изменений во все downstream-вызовы (канон §9).
+      schema:
+        type: string
+        pattern: '^[0-9A-HJKMNP-TV-Z]{26}$'
+        minLength: 26
+        maxLength: 26
+        description: Сквозной ULID корреляции операции
+        examples:
+          - 01J9X2C4K7QF8N3M5T6V7W8Y9Z
+
+    RequestIdHeader:
+      name: X-Request-Id
+      in: header
+      required: false
+      description: |
+        Идентификатор конкретного HTTP-вызова (UUIDv4), уникален для каждой попытки,
+        включая ретраи.
+      schema:
+        type: string
+        format: uuid
+        minLength: 36
+        maxLength: 36
+        description: Уникальный идентификатор HTTP-вызова
+        examples:
+          - 3f2a9c18-5b6d-4e21-9a77-0c4f8e2b1d33
+
+    ScoringSignatureHeader:
+      name: X-Scoring-Signature
+      in: header
+      required: true
+      description: |
+        Подпись webhook-события: `t=<unix_seconds>,v1=<hex HMAC-SHA256(secret, t + "." + rawBody)>`.
+        Проверяется по сырому телу до JSON-парсинга, constant-time сравнение,
+        окно валидности timestamp — 300 с.
+      schema:
+        type: string
+        pattern: '^t=\d{10},v1=[0-9a-f]{64}$'
+        minLength: 80
+        maxLength: 80
+        description: HMAC-SHA256 подпись события с временной меткой
+        examples:
+          - t=1786205732,v1=2c26b46b68ffc68ff99b453c1d30413413422d706483bfa0f98a5e886266e7ae
+
+  headers:
+
+    CorrelationIdResponse:
+      description: Эхо сквозного идентификатора операции, полученного в запросе
+      required: true
+      schema:
+        type: string
+        pattern: '^[0-9A-HJKMNP-TV-Z]{26}$'
+        minLength: 26
+        maxLength: 26
+        description: Сквозной ULID корреляции операции
+        examples:
+          - 01J9X2C4K7QF8N3M5T6V7W8Y9Z
+
+    RequestIdResponse:
+      description: Эхо идентификатора HTTP-вызова; при отсутствии генерируется сервисом
+      required: false
+      schema:
+        type: string
+        format: uuid
+        minLength: 36
+        maxLength: 36
+        description: Уникальный идентификатор HTTP-вызова
+        examples:
+          - 3f2a9c18-5b6d-4e21-9a77-0c4f8e2b1d33
+
+    CacheControlResponse:
+      description: |
+        Директива кеширования. Применяется к фоновому риск-профилю; операционные решения
+        `RiskAssessment` кешируются не по HTTP, а по собственному `ttlSeconds` ресурса.
+      required: false
+      schema:
+        type: string
+        maxLength: 128
+        description: Директива кеширования HTTP
+        examples:
+          - private, max-age=300
+
+    LocationResponse:
+      description: URI созданного ресурса оценки риска
+      required: false
+      schema:
+        type: string
+        format: uri-reference
+        maxLength: 512
+        description: Относительный URI ресурса `RiskAssessment`
+        examples:
+          - /v1/risk-assessments/rsk_01J9X4D8Q3S5V7X9Z1B3D5F7H9
+
+    RetryAfterHeader:
+      description: Через сколько секунд допустима повторная попытка
+      required: false
+      schema:
+        type: integer
+        minimum: 0
+        maximum: 3600
+        description: Пауза перед повтором в секундах
+        examples:
+          - 30
+
+  schemas:
+
+    DecimalAmount:
+      type: string
+      title: DecimalAmount
+      pattern: '^(0|[1-9]\d{0,18})(\.\d{1,18})?$'
+      minLength: 1
+      maxLength: 40
+      description: |
+        Денежная величина в десятичной строковой записи (канон §5.1). Двоичные
+        `float`/`double` **запрещены** на всём пути: API, BFF, состояние фронтенда,
+        отображение. Значение неотрицательное; количество знаков после точки не должно
+        превышать `decimals` соответствующего актива (инвариант I5 канона §5.4).
+      examples:
+        - "25450.00"
+        - "135.270000"
+        - "0.01420000"
+
+    AssetRef:
+      type: object
+      title: AssetRef
+      description: |
+        Ссылка на актив. Для крипто-активов уникальность обеспечивается парой
+        `assetId + network`: `USDT@TRON` и `USDT@ETHEREUM` — разные балансы (канон §2).
+        Сеть влияет на риск: некоторые сети имеют более высокий базовый профиль AML.
+      additionalProperties: false
+      required: [assetId]
+      properties:
+        assetId:
+          type: string
+          pattern: '^[A-Z0-9]{2,12}$'
+          minLength: 2
+          maxLength: 12
+          description: Код актива в верхнем регистре
+          examples:
+            - RUB
+            - USDT
+        network:
+          type: [string, 'null']
+          enum: [TRON, ETHEREUM, BITCOIN, null]
+          description: Блокчейн-сеть; обязательна для крипто-активов, `null` для фиата
+          examples:
+            - TRON
+            - null
+
+    RiskBand:
+      type: string
+      title: RiskBand
+      enum: [LOW, MEDIUM, HIGH, CRITICAL]
+      description: |
+        Полоса риска — дискретизация числового `score`:
+        `LOW` (0–29) — обычно `ALLOW`;
+        `MEDIUM` (30–59) — `ALLOW` или `REVIEW` в зависимости от политики;
+        `HIGH` (60–84) — как правило `REVIEW`;
+        `CRITICAL` (85–100) — как правило `DENY`.
+        Границы задаются `policyVersion` и могут меняться без изменения контракта —
+        потребитель обязан ветвиться по `decision`, а не вычислять решение из `score`.
+      examples:
+        - LOW
+
+    RiskDecision:
+      type: string
+      title: RiskDecision
+      enum: [ALLOW, REVIEW, DENY]
+      description: |
+        Операционное решение и его маппинг в каталог ошибок канона §7:
+        `ALLOW` — операция разрешена, цепочка валидации продолжается на шаг 17 (баланс);
+        `REVIEW` — требуется ручная проверка → `SCORING_REVIEW_REQUIRED`, HTTP **202**,
+        заявка создаётся в статусе `MANUAL_REVIEW`, средства резервируются;
+        **это не ошибка**, а альтернативный успешный исход (канон §7, §8);
+        `DENY` — операция запрещена → `SCORING_DENIED` (403), заявка не создаётся,
+        пользователю показывается `Operation declined. Contact support.` без деталей.
+      examples:
+        - ALLOW
+
+    RiskFactor:
+      type: object
+      title: RiskFactor
+      description: |
+        Сработавший фактор риска. **Внутренняя аналитика**: перечень факторов
+        пользователю никогда не показывается — раскрытие сработавших правил является
+        прямой подсказкой для обхода AML-контура.
+      additionalProperties: false
+      required: [code, weight, severity]
+      properties:
+        code:
+          type: string
+          enum:
+            - VELOCITY_ANOMALY
+            - NEW_DEVICE
+            - GEO_MISMATCH
+            - SANCTIONS_PROXIMITY
+            - STRUCTURING_PATTERN
+            - HIGH_RISK_JURISDICTION
+            - PEP_RELATED
+            - DORMANT_ACCOUNT_REACTIVATION
+            - COUNTERPARTY_RISK
+          description: |
+            Машинный код фактора:
+            `VELOCITY_ANOMALY` — аномальная частота или объём операций за окно;
+            `NEW_DEVICE` — операция с ранее неизвестного устройства;
+            `GEO_MISMATCH` — расхождение геолокации IP со страной резидентства из S1;
+            `SANCTIONS_PROXIMITY` — близость к санкционному субъекту по графу связей;
+            `STRUCTURING_PATTERN` — дробление сумм под пороги отчётности (smurfing);
+            `HIGH_RISK_JURISDICTION` — юрисдикция из списка повышенного риска FATF;
+            `PEP_RELATED` — связь с публично значимым лицом (коррелирует с `flags.isPep` из S1);
+            `DORMANT_ACCOUNT_REACTIVATION` — возобновление активности спящего счёта;
+            `COUNTERPARTY_RISK` — риск, унаследованный от контрагента операции.
+          examples:
+            - NEW_DEVICE
+        weight:
+          type: integer
+          minimum: 0
+          maximum: 100
+          description: |
+            Вклад фактора в итоговый `score` в баллах. Целое число, **не** денежная
+            величина — поэтому допустим `integer`, а не decimal-строка. Сумма весов
+            не обязана равняться `score`: модель применяет нелинейную агрегацию.
+          examples:
+            - 12
+        severity:
+          type: string
+          enum: [LOW, MEDIUM, HIGH]
+          description: |
+            Качественная серьёзность фактора. Ортогональна `weight`: фактор может иметь
+            малый вес, но высокую серьёзность (сигнал для ручного разбора).
+          examples:
+            - LOW
+        description:
+          type: string
+          minLength: 1
+          maxLength: 512
+          description: |
+            Пояснение на английском для аналитиков риска. **Пользователю не показывается
+            и наружу не проксируется.**
+          examples:
+            - Device fingerprint first seen 2 hours ago
+
+    RiskAssessmentRequest:
+      type: object
+      title: RiskAssessmentRequest
+      description: |
+        Контекст операции, для которой запрашивается оценка. Суммы передаются
+        строками-децималами (канон §5.1). Содержит PII (`ipAddress`) — правила обращения
+        описаны в `info.description`.
+      additionalProperties: false
+      required: [userId, operationType, fromAsset, toAsset, amount, normalizedAmountRub, correlationId]
+      properties:
+        userId:
+          type: string
+          pattern: '^usr_[0-9A-HJKMNP-TV-Z]{26}$'
+          minLength: 30
+          maxLength: 30
+          description: Пользователь, инициировавший операцию
+          examples:
+            - usr_01J8ZQ4H9K2M3N4P5R6S7T8V9W
+        operationType:
+          type: string
+          enum: [EXCHANGE]
+          description: |
+            Тип оцениваемой операции. В скоупе задания — только `EXCHANGE` (канон §1).
+            Enum сохранён, чтобы добавление других типов было явным расширением.
+          examples:
+            - EXCHANGE
+        fromAsset:
+          $ref: '#/components/schemas/AssetRef'
+        toAsset:
+          $ref: '#/components/schemas/AssetRef'
+        amount:
+          $ref: '#/components/schemas/DecimalAmount'
+        normalizedAmountRub:
+          $ref: '#/components/schemas/DecimalAmount'
+        deviceId:
+          type: [string, 'null']
+          pattern: '^[0-9a-f]{32,64}$'
+          minLength: 32
+          maxLength: 64
+          description: |
+            Псевдонимный отпечаток устройства (hex). Питает фактор `NEW_DEVICE`.
+            `null`, если отпечаток недоступен — отсутствие само по себе повышает риск.
+            В логах не связывается с `email`/`phone` из S1.
+          examples:
+            - 9a1c7f4e2b6d8035a4c1e7f92b0d63a8
+            - null
+        ipAddress:
+          type: [string, 'null']
+          minLength: 3
+          maxLength: 45
+          description: |
+            **PII.** IP-адрес клиента (IPv4 или IPv6). Питает факторы `GEO_MISMATCH`
+            и `HIGH_RISK_JURISDICTION`.
+            **Логировать только в маскированном виде:** IPv4 — до /24 (`203.0.113.0/24`),
+            IPv6 — до /48. Полное значение передаётся сервису, но не логируется нашей
+            стороной и никогда не возвращается на фронтенд.
+            `null`, если адрес недоступен.
+          examples:
+            - 203.0.113.42
+            - null
+        sessionAge:
+          type: [integer, 'null']
+          minimum: 0
+          maximum: 2592000
+          description: |
+            Возраст пользовательской сессии в секундах на момент операции. Не денежная
+            величина, поэтому `integer`. Очень малый возраст в сочетании с крупной суммой —
+            типичный признак компрометации учётной записи.
+            `null`, если возраст сессии неизвестен.
+          examples:
+            - 842
+            - null
+        correlationId:
+          type: string
+          pattern: '^[0-9A-HJKMNP-TV-Z]{26}$'
+          minLength: 26
+          maxLength: 26
+          description: |
+            Сквозной идентификатор операции (ULID). Дублируется в теле, а не только в
+            заголовке, чтобы сохраниться в аудиторской записи оценки: тело оценки хранится
+            дольше, чем логи транспортного уровня.
+          examples:
+            - 01J9X2C4K7QF8N3M5T6V7W8Y9Z
+
+    RiskAssessment:
+      type: object
+      title: RiskAssessment
+      description: |
+        Результат оценки риска операции — основной объект, который Exchange BFF получает
+        от S3 на шаге 16 канона §6.
+
+        Потребитель обязан ветвиться по `decision`, а **не** вычислять решение
+        самостоятельно из `score` или `riskBand`: пороги задаются политикой
+        (`policyVersion`) и меняются без изменения контракта.
+      additionalProperties: false
+      required:
+        - assessmentId
+        - userId
+        - operationType
+        - score
+        - riskBand
+        - decision
+        - factors
+        - decidedAt
+        - ttlSeconds
+        - expiresAt
+        - policyVersion
+        - modelVersion
+      properties:
+        assessmentId:
+          type: string
+          pattern: '^rsk_[0-9A-HJKMNP-TV-Z]{26}$'
+          minLength: 30
+          maxLength: 30
+          description: Идентификатор оценки, `rsk_` + ULID (Crockford Base32)
+          examples:
+            - rsk_01J9X4D8Q3S5V7X9Z1B3D5F7H9
+        userId:
+          type: string
+          pattern: '^usr_[0-9A-HJKMNP-TV-Z]{26}$'
+          minLength: 30
+          maxLength: 30
+          description: Пользователь, для которого выполнена оценка
+          examples:
+            - usr_01J8ZQ4H9K2M3N4P5R6S7T8V9W
+        operationType:
+          type: string
+          enum: [EXCHANGE]
+          description: Тип оценённой операции; в скоупе задания — только `EXCHANGE`
+          examples:
+            - EXCHANGE
+        score:
+          type: integer
+          minimum: 0
+          maximum: 100
+          description: |
+            Числовой риск-балл: 0 — минимальный риск, 100 — максимальный. Не денежная
+            величина, поэтому `integer` допустим (канон §5.1 ограничивает только деньги).
+            Фикстура канона §10.1: `riskScore` = 17.
+          examples:
+            - 17
+        riskBand:
+          $ref: '#/components/schemas/RiskBand'
+        decision:
+          $ref: '#/components/schemas/RiskDecision'
+        factors:
+          type: array
+          minItems: 0
+          maxItems: 50
+          description: |
+            Сработавшие факторы риска, упорядочены по `weight` по убыванию.
+            **Внутренняя аналитика — пользователю не показывается.**
+          items:
+            $ref: '#/components/schemas/RiskFactor'
+        reasons:
+          type: array
+          minItems: 0
+          maxItems: 20
+          description: |
+            Краткие текстовые обоснования решения на английском, для аналитиков и аудита.
+            **Наружу не транслируются** — пользователь видит только
+            `Operation declined. Contact support.`
+          items:
+            type: string
+            minLength: 1
+            maxLength: 256
+            description: Обоснование решения для внутреннего использования
+            examples:
+              - Aggregate risk score below ALLOW threshold for TIER_2
+          examples:
+            - []
+        caseId:
+          type: [string, 'null']
+          pattern: '^cas_[0-9A-HJKMNP-TV-Z]{26}$'
+          minLength: 30
+          maxLength: 30
+          description: |
+            Идентификатор созданного кейса ручной проверки. Заполняется **только** при
+            `decision = REVIEW`; для `ALLOW` и `DENY` равен `null`.
+            Пользователю не раскрывается — используется поддержкой по обращению.
+          examples:
+            - cas_01J9X5E9R4T6W8Y0A2C4E6G8J0
+            - null
+        slaHours:
+          type: [integer, 'null']
+          minimum: 1
+          maximum: 720
+          description: |
+            Целевой срок разбора кейса ручной проверки в часах. Заполняется только при
+            `decision = REVIEW`; `null` в остальных случаях. Используется для формирования
+            ожидания пользователя на экране `MANUAL_REVIEW`.
+          examples:
+            - 24
+            - null
+        decidedAt:
+          type: string
+          format: date-time
+          description: Момент принятия решения, ISO-8601 UTC с миллисекундами и `Z`
+          examples:
+            - 2026-08-07T10:15:32.117Z
+        ttlSeconds:
+          type: integer
+          minimum: 1
+          maximum: 86400
+          description: |
+            Срок действия решения в секундах, заданный **сервисом**, а не нашим кешем.
+            В пределах TTL повторное использование решения для той же операции допустимо —
+            это единственная разрешённая форма stale для S3. Типичное значение — 300.
+          examples:
+            - 300
+        expiresAt:
+          type: string
+          format: date-time
+          description: |
+            Момент истечения решения (`decidedAt` + `ttlSeconds`), ISO-8601 UTC.
+            После него решение недействительно для принятия новых операционных решений;
+            требуется новая оценка. Отдавать просроченное решение при недоступности
+            сервиса **запрещено** — действует fail-closed.
+          examples:
+            - 2026-08-07T10:20:32.117Z
+        policyVersion:
+          type: string
+          pattern: '^[0-9]+\.[0-9]+\.[0-9]+$'
+          minLength: 5
+          maxLength: 20
+          description: |
+            Версия набора правил и порогов, применённая при вынесении решения.
+            Обязательна для воспроизводимости при аудите: одна и та же операция при
+            разных `policyVersion` может получить разное решение.
+          examples:
+            - 4.12.0
+        modelVersion:
+          type: string
+          pattern: '^[A-Za-z0-9._-]{1,40}$'
+          minLength: 1
+          maxLength: 40
+          description: |
+            Версия скоринговой модели. Отделена от `policyVersion` намеренно: модель
+            (расчёт балла) и политика (пороги решения) версионируются независимо.
+          examples:
+            - aml-gbm-2026.07.3
+
+    UserRiskProfile:
+      type: object
+      title: UserRiskProfile
+      description: |
+        Фоновый агрегированный риск-профиль пользователя. **Не является решением** и не
+        может заменить `RiskAssessment` на шаге 16: операционное решение учитывает сумму,
+        пару, устройство и контекст сессии, которых в профиле нет.
+      additionalProperties: false
+      required: [userId, score, riskBand, calculatedAt, ttlSeconds, expiresAt, policyVersion]
+      properties:
+        userId:
+          type: string
+          pattern: '^usr_[0-9A-HJKMNP-TV-Z]{26}$'
+          minLength: 30
+          maxLength: 30
+          description: Пользователь, к которому относится профиль
+          examples:
+            - usr_01J8ZQ4H9K2M3N4P5R6S7T8V9W
+        score:
+          type: integer
+          minimum: 0
+          maximum: 100
+          description: Фоновый риск-балл пользователя вне контекста конкретной операции
+          examples:
+            - 17
+        riskBand:
+          $ref: '#/components/schemas/RiskBand'
+        factors:
+          type: array
+          minItems: 0
+          maxItems: 50
+          description: Постоянные факторы профиля. Внутренняя аналитика, наружу не транслируется.
+          items:
+            $ref: '#/components/schemas/RiskFactor'
+        openCasesCount:
+          type: integer
+          minimum: 0
+          maximum: 1000
+          description: |
+            Количество незакрытых кейсов ручной проверки. Ненулевое значение обычно
+            повышает вероятность решения `REVIEW` для новых операций.
+          examples:
+            - 0
+        lastAssessmentAt:
+          type: [string, 'null']
+          format: date-time
+          description: |
+            Момент последней операционной оценки, ISO-8601 UTC. `null`, если оценок
+            ещё не было.
+          examples:
+            - 2026-08-07T10:15:32.117Z
+            - null
+        calculatedAt:
+          type: string
+          format: date-time
+          description: Момент последнего пересчёта профиля, ISO-8601 UTC с миллисекундами и `Z`
+          examples:
+            - 2026-08-07T06:00:00.000Z
+        ttlSeconds:
+          type: integer
+          minimum: 1
+          maximum: 86400
+          description: Срок действия профиля в секундах, заданный сервисом
+          examples:
+            - 3600
+        expiresAt:
+          type: string
+          format: date-time
+          description: Момент истечения профиля (`calculatedAt` + `ttlSeconds`), ISO-8601 UTC
+          examples:
+            - 2026-08-07T07:00:00.000Z
+        policyVersion:
+          type: string
+          pattern: '^[0-9]+\.[0-9]+\.[0-9]+$'
+          minLength: 5
+          maxLength: 20
+          description: Версия политики, применённая при расчёте профиля
+          examples:
+            - 4.12.0
+
+    RiskCase:
+      type: object
+      title: RiskCase
+      description: |
+        Кейс ручной проверки комплаенса, созданный при `decision = REVIEW`.
+        **Разрешение кейса находится за границей скоупа задания** (канон §1, §8) —
+        контракт зафиксирован для полноты формы входящих данных.
+      additionalProperties: false
+      required: [caseId, userId, status, createdAt, slaHours]
+      properties:
+        caseId:
+          type: string
+          pattern: '^cas_[0-9A-HJKMNP-TV-Z]{26}$'
+          minLength: 30
+          maxLength: 30
+          description: Идентификатор кейса, `cas_` + ULID (Crockford Base32)
+          examples:
+            - cas_01J9X5E9R4T6W8Y0A2C4E6G8J0
+        userId:
+          type: string
+          pattern: '^usr_[0-9A-HJKMNP-TV-Z]{26}$'
+          minLength: 30
+          maxLength: 30
+          description: Пользователь, к которому относится кейс
+          examples:
+            - usr_01J8ZQ4H9K2M3N4P5R6S7T8V9W
+        assessmentId:
+          type: [string, 'null']
+          pattern: '^rsk_[0-9A-HJKMNP-TV-Z]{26}$'
+          minLength: 30
+          maxLength: 30
+          description: Оценка, породившая кейс. `null`, если кейс заведён вручную комплаенсом.
+          examples:
+            - rsk_01J9X4D8Q3S5V7X9Z1B3D5F7H9
+            - null
+        orderId:
+          type: [string, 'null']
+          pattern: '^ord_[0-9A-HJKMNP-TV-Z]{26}$'
+          minLength: 30
+          maxLength: 30
+          description: |
+            Заявка в статусе `MANUAL_REVIEW`, ожидающая решения по кейсу (канон §4.5, §8).
+            `null`, если кейс не связан с конкретной заявкой.
+          examples:
+            - ord_01J9X6F0S5V7Y9A1C3E5G7J9L1
+            - null
+        status:
+          type: string
+          enum: [OPEN, IN_PROGRESS, RESOLVED, CANCELLED]
+          description: |
+            Состояние кейса:
+            `OPEN` — заведён, не взят в работу;
+            `IN_PROGRESS` — разбирается комплаенс-офицером;
+            `RESOLVED` — решение принято, см. `resolution`;
+            `CANCELLED` — отозван (например, пользователь отменил заявку).
+          examples:
+            - OPEN
+        resolution:
+          type: [string, 'null']
+          enum: [APPROVED, REJECTED, null]
+          description: |
+            Итог разбора. Заполняется только при `status = RESOLVED`:
+            `APPROVED` — заявка переходит `MANUAL_REVIEW` → `PENDING`;
+            `REJECTED` — заявка переходит `MANUAL_REVIEW` → `REJECTED`, холд снимается.
+            `null` для незавершённых кейсов.
+          examples:
+            - null
+            - APPROVED
+        resolvedBy:
+          type: [string, 'null']
+          minLength: 1
+          maxLength: 64
+          description: |
+            Идентификатор комплаенс-офицера, принявшего решение (внутренний логин или
+            суррогатный ID). Пользователю не раскрывается. `null` для незавершённых кейсов.
+          examples:
+            - compliance.officer.42
+            - null
+        comment:
+          type: [string, 'null']
+          minLength: 1
+          maxLength: 2048
+          description: |
+            Внутренний комментарий комплаенса. **Пользователю не показывается** и не
+            логируется в пользовательских трейсах. `null`, если комментарий не оставлен.
+          examples:
+            - Source of funds documentation reviewed and accepted
+            - null
+        slaHours:
+          type: integer
+          minimum: 1
+          maximum: 720
+          description: Целевой срок разбора кейса в часах от `createdAt`
+          examples:
+            - 24
+        createdAt:
+          type: string
+          format: date-time
+          description: Момент создания кейса, ISO-8601 UTC с миллисекундами и `Z`
+          examples:
+            - 2026-08-07T10:15:32.400Z
+        resolvedAt:
+          type: [string, 'null']
+          format: date-time
+          description: Момент принятия решения, ISO-8601 UTC. `null` для незавершённых кейсов.
+          examples:
+            - 2026-08-08T08:02:19.775Z
+            - null
+
+    RiskCaseResolvedEvent:
+      type: object
+      title: RiskCaseResolvedEvent
+      description: |
+        Payload webhook-события `risk.case.resolved`. Не содержит PII. Обрабатывается
+        идемпотентно по `eventId` (окно 24 ч) и упорядоченно по `sequence` в пределах
+        `caseId`.
+      additionalProperties: false
+      required: [eventId, eventType, occurredAt, sequence, caseId, userId, resolution]
+      properties:
+        eventId:
+          type: string
+          format: uuid
+          minLength: 36
+          maxLength: 36
+          description: |
+            Уникальный идентификатор события (UUIDv4). **Ключ дедупликации**: повтор
+            того же `eventId` в окне 24 ч — no-op с ответом `200`.
+          examples:
+            - d8c3f105-49ab-4c72-9f61-3b0e7a25d914
+        eventType:
+          type: string
+          enum: [risk.case.resolved]
+          description: |
+            Тип события. Единственное значение в этом контракте; enum сохранён, чтобы
+            добавление новых типов было явным расширением.
+          examples:
+            - risk.case.resolved
+        occurredAt:
+          type: string
+          format: date-time
+          description: |
+            Момент принятия решения на стороне сервиса, ISO-8601 UTC с миллисекундами
+            и `Z`. Может отставать от момента доставки при ретраях (до 6 ч).
+          examples:
+            - 2026-08-08T08:02:19.775Z
+        sequence:
+          type: integer
+          minimum: 1
+          maximum: 9223372036854775807
+          description: |
+            Монотонно возрастающий счётчик в пределах одного `caseId`. Событие с
+            `sequence`, не превышающим уже обработанное, **отбрасывается** как
+            out-of-order — иначе поздно доставленный старый callback мог бы откатить
+            решение по кейсу.
+          examples:
+            - 3
+        caseId:
+          type: string
+          pattern: '^cas_[0-9A-HJKMNP-TV-Z]{26}$'
+          minLength: 30
+          maxLength: 30
+          description: Кейс, по которому принято решение
+          examples:
+            - cas_01J9X5E9R4T6W8Y0A2C4E6G8J0
+        userId:
+          type: string
+          pattern: '^usr_[0-9A-HJKMNP-TV-Z]{26}$'
+          minLength: 30
+          maxLength: 30
+          description: Пользователь, к которому относится кейс
+          examples:
+            - usr_01J8ZQ4H9K2M3N4P5R6S7T8V9W
+        orderId:
+          type: [string, 'null']
+          pattern: '^ord_[0-9A-HJKMNP-TV-Z]{26}$'
+          minLength: 30
+          maxLength: 30
+          description: |
+            Заявка в статусе `MANUAL_REVIEW`, судьба которой определяется этим событием.
+            `null`, если кейс не связан с заявкой.
+          examples:
+            - ord_01J9X6F0S5V7Y9A1C3E5G7J9L1
+            - null
+        resolution:
+          type: string
+          enum: [APPROVED, REJECTED]
+          description: |
+            Итог разбора:
+            `APPROVED` — заявка `MANUAL_REVIEW` → `PENDING`, холд сохраняется;
+            `REJECTED` — заявка `MANUAL_REVIEW` → `REJECTED`, холд снимается (канон §8).
+            Оба перехода — **за границей скоупа задания** (канон §1).
+          examples:
+            - APPROVED
+        resolvedBy:
+          type: [string, 'null']
+          minLength: 1
+          maxLength: 64
+          description: |
+            Идентификатор комплаенс-офицера. Пользователю не раскрывается. `null`, если
+            решение принято автоматическим правилом (например, по истечении SLA).
+          examples:
+            - compliance.officer.42
+            - null
+        comment:
+          type: [string, 'null']
+          minLength: 1
+          maxLength: 2048
+          description: |
+            Внутренний комментарий. **Пользователю не показывается**, в пользовательские
+            трейсы не пишется. `null`, если комментарий не оставлен.
+          examples:
+            - Source of funds documentation reviewed and accepted
+            - null
+
+    WebhookAck:
+      type: object
+      title: WebhookAck
+      description: |
+        Подтверждение приёма webhook-события. Должно быть отдано в течение 5 с, иначе
+        отправитель начнёт ретраи (1 мин / 5 мин / 30 мин / 2 ч / 6 ч).
+      additionalProperties: false
+      required: [received, eventId]
+      properties:
+        received:
+          type: boolean
+          description: Признак приёма события. Всегда `true` при HTTP 200.
+          examples:
+            - true
+        eventId:
+          type: string
+          format: uuid
+          minLength: 36
+          maxLength: 36
+          description: Эхо `eventId` принятого события
+          examples:
+            - d8c3f105-49ab-4c72-9f61-3b0e7a25d914
+        duplicate:
+          type: boolean
+          description: |
+            `true`, если событие с этим `eventId` уже обрабатывалось в окне дедупликации
+            24 ч и было проигнорировано как повтор.
+          examples:
+            - false
+        outOfOrderDiscarded:
+          type: boolean
+          description: |
+            `true`, если событие отброшено по правилу `sequence`. Ответ всё равно `200` —
+            ретраить нечего.
+          examples:
+            - false
+
+    ScoringServiceErrorDetail:
+      type: object
+      title: ScoringServiceErrorDetail
+      description: |
+        Элемент диагностики ошибки. Никогда не содержит PII: полный `ipAddress` в
+        диагностику не попадает, только маскированный префикс сети.
+      additionalProperties: false
+      required: [field, issue]
+      properties:
+        field:
+          type: string
+          minLength: 1
+          maxLength: 128
+          description: Путь к проблемному полю в dot-notation или JSON Pointer
+          examples:
+            - amount
+        issue:
+          type: string
+          minLength: 1
+          maxLength: 256
+          description: Краткое машинно-ориентированное описание проблемы
+          examples:
+            - does not match decimal-string pattern
+
+    ScoringServiceError:
+      type: object
+      title: ScoringServiceError
+      description: |
+        Собственный конверт ошибки Scoring / AML Service. Exchange BFF **транслирует**
+        его в канонический RFC 9457 Problem Details (канон §7) по маппингу из описания
+        поля `error`.
+
+        Важно: `DENY` и `REVIEW` **не являются ошибками этого конверта** — они приходят
+        как поле `decision` в успешном ответе `201`. Ошибочный конверт описывает только
+        сбои самого сервиса и нарушения контракта.
+      additionalProperties: false
+      required: [error, message, traceId, timestamp]
+      properties:
+        error:
+          type: string
+          enum:
+            - INVALID_REQUEST
+            - ASSESSMENT_NOT_FOUND
+            - CASE_NOT_FOUND
+            - PROFILE_NOT_FOUND
+            - ASSESSMENT_EXPIRED
+            - UNSUPPORTED_OPERATION
+            - IDEMPOTENCY_CONFLICT
+            - INVALID_SIGNATURE
+            - UNAUTHORIZED
+            - FORBIDDEN
+            - RATE_LIMITED
+            - MODEL_UNAVAILABLE
+            - INTERNAL_ERROR
+            - SERVICE_UNAVAILABLE
+            - UPSTREAM_TIMEOUT
+          description: |
+            Машинный код ошибки Scoring / AML Service и его маппинг в каталог ошибок
+            канона §7:
+
+            * `INVALID_REQUEST` (400) — нарушение схемы, в том числе сумма не в формате
+              decimal-строки (канон §5.1).
+              → `VALIDATION_ERROR` (400).
+            * `ASSESSMENT_NOT_FOUND` (404) — оценка не существует.
+              → `VALIDATION_ERROR` (400).
+            * `CASE_NOT_FOUND` (404) — кейс не существует.
+              → `VALIDATION_ERROR` (400).
+            * `PROFILE_NOT_FOUND` (404) — риск-профиль ещё не рассчитан.
+              → `EXCHANGE_SERVICE_UNAVAILABLE` (503) на критическом пути: без профиля
+              решение принимать нельзя (fail-closed).
+            * `ASSESSMENT_EXPIRED` (409) — попытка использовать решение после `expiresAt`.
+              → `EXCHANGE_SERVICE_UNAVAILABLE` (503); BFF обязан запросить новую оценку,
+              а не переиспользовать просроченную.
+            * `UNSUPPORTED_OPERATION` (422) — `operationType` не поддерживается моделью.
+              → `VALIDATION_ERROR` (400).
+            * `IDEMPOTENCY_CONFLICT` (409) — тот же `Idempotency-Key` с другим телом.
+              → `IDEMPOTENCY_CONFLICT` (409).
+            * `INVALID_SIGNATURE` (401) — только для webhook: подпись `X-Scoring-Signature`
+              неверна или timestamp вне окна 300 с. Наружу не транслируется.
+            * `UNAUTHORIZED` (401) — невалидный service JWT.
+              → `EXCHANGE_SERVICE_UNAVAILABLE` (503): наш дефект конфигурации.
+            * `FORBIDDEN` (403) — недостаточный scope сервиса-вызывающего.
+              → `EXCHANGE_SERVICE_UNAVAILABLE` (503), по той же причине.
+            * `RATE_LIMITED` (429) — превышен лимит обращений к S3.
+              → `RATE_LIMITED` (429), retryable.
+            * `MODEL_UNAVAILABLE` (503) — скоринговая модель не загружена или деградирует.
+              → `EXCHANGE_SERVICE_UNAVAILABLE` (503). **Fail-closed:** операция не
+              создаётся, дефолтное «разрешить» не применяется.
+            * `INTERNAL_ERROR` (500) — внутренняя ошибка.
+              → `EXCHANGE_SERVICE_UNAVAILABLE` (503), retryable.
+            * `SERVICE_UNAVAILABLE` (503) — сервис недоступен.
+              → `EXCHANGE_SERVICE_UNAVAILABLE` (503), retryable. **Fail-closed.**
+            * `UPSTREAM_TIMEOUT` (504) — истёк таймаут 1 000 мс (канон §11).
+              → `UPSTREAM_TIMEOUT` (504), retryable. **Fail-closed.**
+
+            Отдельно, для полноты (это не коды ошибок, а значения `decision` в успешном
+            ответе `201`):
+            `decision = DENY` → `SCORING_DENIED` (403);
+            `decision = REVIEW` → `SCORING_REVIEW_REQUIRED` (**202**, `MANUAL_REVIEW`) —
+            **не ошибка**, альтернативный успешный исход (канон §7, §8).
+          examples:
+            - MODEL_UNAVAILABLE
+        message:
+          type: string
+          minLength: 1
+          maxLength: 1024
+          description: |
+            Человекочитаемое пояснение на английском для инженеров. **Пользователю не
+            показывается** — фронтенд ветвится только по каноническому `code` (канон §7).
+          examples:
+            - Scoring model is not available, failing closed
+        traceId:
+          type: string
+          minLength: 8
+          maxLength: 64
+          description: |
+            Внутренний идентификатор трассировки Scoring / AML Service. Логируется рядом
+            с нашим `correlationId` для связывания инцидентов между командами.
+          examples:
+            - e21f8b47c05a396d
+        timestamp:
+          type: string
+          format: date-time
+          description: Момент возникновения ошибки, ISO-8601 UTC с миллисекундами и `Z`
+          examples:
+            - 2026-08-07T10:15:32.117Z
+        correlationId:
+          type: [string, 'null']
+          pattern: '^[0-9A-HJKMNP-TV-Z]{26}$'
+          minLength: 26
+          maxLength: 26
+          description: Эхо `X-Correlation-Id`. `null`, если заголовок не был передан.
+          examples:
+            - 01J9X2C4K7QF8N3M5T6V7W8Y9Z
+            - null
+        retryable:
+          type: boolean
+          description: |
+            Признак осмысленности повтора. `true` для `MODEL_UNAVAILABLE`,
+            `INTERNAL_ERROR`, `SERVICE_UNAVAILABLE`, `UPSTREAM_TIMEOUT`, `RATE_LIMITED`.
+          examples:
+            - true
+        details:
+          type: array
+          minItems: 0
+          maxItems: 20
+          description: Дополнительная диагностика; пустой массив, если детализации нет
+          items:
+            $ref: '#/components/schemas/ScoringServiceErrorDetail'
+
+  responses:
+
+    BadRequest:
+      description: |
+        Нарушение схемы запроса, в том числе сумма не в формате decimal-строки
+        (канон §5.1). → `VALIDATION_ERROR` (400).
+      headers:
+        X-Correlation-Id:
+          $ref: '#/components/headers/CorrelationIdResponse'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ScoringServiceError'
+          examples:
+            invalidRequest:
+              $ref: '#/components/examples/ErrorInvalidRequest'
+
+    Unauthorized:
+      description: |
+        Невалидный, истёкший или отсутствующий service JWT.
+        → `EXCHANGE_SERVICE_UNAVAILABLE` (503): чужой 401 пользователю не показывается.
+      headers:
+        X-Correlation-Id:
+          $ref: '#/components/headers/CorrelationIdResponse'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ScoringServiceError'
+          examples:
+            unauthorized:
+              $ref: '#/components/examples/ErrorUnauthorized'
+
+    Forbidden:
+      description: |
+        У сервиса-вызывающего нет нужного scope. → `EXCHANGE_SERVICE_UNAVAILABLE` (503).
+
+        Обратите внимание: отказ по риску (`DENY`) сюда **не** относится — он приходит
+        как `decision` в успешном ответе `201` и транслируется в `SCORING_DENIED` (403).
+      headers:
+        X-Correlation-Id:
+          $ref: '#/components/headers/CorrelationIdResponse'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ScoringServiceError'
+          examples:
+            forbidden:
+              $ref: '#/components/examples/ErrorForbidden'
+
+    NotFound:
+      description: |
+        Оценка, кейс или профиль не найдены. → `VALIDATION_ERROR` (400) для оценки и
+        кейса; для отсутствующего профиля на критическом пути — `EXCHANGE_SERVICE_UNAVAILABLE`
+        (503), fail-closed.
+      headers:
+        X-Correlation-Id:
+          $ref: '#/components/headers/CorrelationIdResponse'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ScoringServiceError'
+          examples:
+            assessmentNotFound:
+              $ref: '#/components/examples/ErrorAssessmentNotFound'
+            caseNotFound:
+              $ref: '#/components/examples/ErrorCaseNotFound'
+
+    Conflict:
+      description: |
+        Тот же `Idempotency-Key` использован с другим телом, либо попытка использовать
+        просроченное решение. → `IDEMPOTENCY_CONFLICT` (409) /
+        `EXCHANGE_SERVICE_UNAVAILABLE` (503) соответственно.
+      headers:
+        X-Correlation-Id:
+          $ref: '#/components/headers/CorrelationIdResponse'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ScoringServiceError'
+          examples:
+            idempotencyConflict:
+              $ref: '#/components/examples/ErrorIdempotencyConflict'
+            assessmentExpired:
+              $ref: '#/components/examples/ErrorAssessmentExpired'
+
+    UnprocessableEntity:
+      description: |
+        Запрос синтаксически корректен, но невыполним: тип операции не поддерживается
+        моделью. → `VALIDATION_ERROR` (400).
+      headers:
+        X-Correlation-Id:
+          $ref: '#/components/headers/CorrelationIdResponse'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ScoringServiceError'
+          examples:
+            unsupportedOperation:
+              $ref: '#/components/examples/ErrorUnsupportedOperation'
+
+    TooManyRequests:
+      description: Превышен лимит обращений Exchange BFF к Scoring Service. → `RATE_LIMITED` (429), retryable.
+      headers:
+        X-Correlation-Id:
+          $ref: '#/components/headers/CorrelationIdResponse'
+        Retry-After:
+          $ref: '#/components/headers/RetryAfterHeader'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ScoringServiceError'
+          examples:
+            rateLimited:
+              $ref: '#/components/examples/ErrorRateLimited'
+
+    InternalError:
+      description: Внутренняя ошибка сервиса. → `EXCHANGE_SERVICE_UNAVAILABLE` (503), retryable, fail-closed.
+      headers:
+        X-Correlation-Id:
+          $ref: '#/components/headers/CorrelationIdResponse'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ScoringServiceError'
+          examples:
+            internalError:
+              $ref: '#/components/examples/ErrorInternal'
+
+    ServiceUnavailable:
+      description: |
+        Сервис недоступен или модель не загружена. → `EXCHANGE_SERVICE_UNAVAILABLE` (503).
+        Критичность S3 — Blocking (канон §3), политика **fail-closed**: операция
+        **не создаётся**. Stale-решение допустимо только в пределах `ttlSeconds`
+        уже полученной оценки; просроченное решение использовать запрещено.
+      headers:
+        X-Correlation-Id:
+          $ref: '#/components/headers/CorrelationIdResponse'
+        Retry-After:
+          $ref: '#/components/headers/RetryAfterHeader'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ScoringServiceError'
+          examples:
+            modelUnavailable:
+              $ref: '#/components/examples/ErrorModelUnavailable'
+            serviceUnavailable:
+              $ref: '#/components/examples/ErrorServiceUnavailable'
+
+    GatewayTimeout:
+      description: |
+        Истёк таймаут 1 000 мс (канон §11). → `UPSTREAM_TIMEOUT` (504), retryable.
+        Fail-closed: операция не создаётся.
+      headers:
+        X-Correlation-Id:
+          $ref: '#/components/headers/CorrelationIdResponse'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ScoringServiceError'
+          examples:
+            upstreamTimeout:
+              $ref: '#/components/examples/ErrorUpstreamTimeout'
+
+  examples:
+
+    RiskAssessmentRequestExample:
+      summary: Запрос оценки для обмена RUB → USDT@TRON
+      description: |
+        Суммы — строки-децималы (канон §5.1). `normalizedAmountRub` приведена к
+        RUB-эквиваленту для сопоставления с порогами политики и лимитами канона §10.5.
+      value:
+        userId: usr_01J8ZQ4H9K2M3N4P5R6S7T8V9W
+        operationType: EXCHANGE
+        fromAsset:
+          assetId: RUB
+          network: null
+        toAsset:
+          assetId: USDT
+          network: TRON
+        amount: "10000.00"
+        normalizedAmountRub: "10000.00"
+        deviceId: 9a1c7f4e2b6d8035a4c1e7f92b0d63a8
+        ipAddress: 203.0.113.42
+        sessionAge: 842
+        correlationId: 01J9X2C4K7QF8N3M5T6V7W8Y9Z
+
+    RiskAssessmentAllow:
+      summary: Низкий риск, операция разрешена (фикстура канона §10.1)
+      description: |
+        Эталонный happy-path шага 16 канона §6. Соответствует фикстуре прототипа:
+        `riskScore` = 17, полоса `LOW`, решение `ALLOW`. `caseId` и `slaHours` равны
+        `null` — кейс не создаётся. Цепочка продолжается на шаг 17 (баланс).
+      value:
+        assessmentId: rsk_01J9X4D8Q3S5V7X9Z1B3D5F7H9
+        userId: usr_01J8ZQ4H9K2M3N4P5R6S7T8V9W
+        operationType: EXCHANGE
+        score: 17
+        riskBand: LOW
+        decision: ALLOW
+        caseId: null
+        slaHours: null
+        decidedAt: 2026-08-07T10:15:32.117Z
+        ttlSeconds: 300
+        expiresAt: 2026-08-07T10:20:32.117Z
+        policyVersion: 4.12.0
+        modelVersion: aml-gbm-2026.07.3
+        reasons:
+          - Aggregate risk score below ALLOW threshold for TIER_2
+        factors:
+          - code: NEW_DEVICE
+            weight: 12
+            severity: LOW
+            description: Device fingerprint first seen 2 hours ago
+          - code: GEO_MISMATCH
+            weight: 5
+            severity: LOW
+            description: IP geolocation AE matches residency AE, minor ASN deviation
+
+    RiskAssessmentReview:
+      summary: Требуется ручная проверка → SCORING_REVIEW_REQUIRED (202), НЕ ошибка
+      description: |
+        Соответствует сценарному переключателю прототипа `SCORING_REVIEW` (канон §10.6).
+        Exchange BFF создаёт заявку в статусе `MANUAL_REVIEW`, **резервирует средства**
+        и возвращает `202` с телом заявки. Пользователь видит `Sent for manual review`.
+        Поля `caseId` и `slaHours` заполнены.
+      value:
+        assessmentId: rsk_01J9X4D8Q3S5V7X9Z1B3D5F7H9
+        userId: usr_01J8ZQ4H9K2M3N4P5R6S7T8V9W
+        operationType: EXCHANGE
+        score: 68
+        riskBand: HIGH
+        decision: REVIEW
+        caseId: cas_01J9X5E9R4T6W8Y0A2C4E6G8J0
+        slaHours: 24
+        decidedAt: 2026-08-07T10:15:32.117Z
+        ttlSeconds: 300
+        expiresAt: 2026-08-07T10:20:32.117Z
+        policyVersion: 4.12.0
+        modelVersion: aml-gbm-2026.07.3
+        reasons:
+          - Velocity pattern consistent with structuring, manual review required
+        factors:
+          - code: STRUCTURING_PATTERN
+            weight: 34
+            severity: HIGH
+            description: Five transactions just below the reporting threshold within 48 hours
+          - code: VELOCITY_ANOMALY
+            weight: 21
+            severity: MEDIUM
+            description: Daily volume is 4.2x the 30-day median
+          - code: NEW_DEVICE
+            weight: 13
+            severity: LOW
+            description: Device fingerprint first seen 20 minutes ago
+
+    RiskAssessmentDeny:
+      summary: Операция запрещена → SCORING_DENIED (403)
+      description: |
+        Заявка **не создаётся**. Пользователю показывается только
+        `Operation declined. Contact support.` — ни `factors`, ни `reasons`, ни `score`
+        наружу не транслируются: раскрытие сработавших правил помогает обходить AML-контур.
+      value:
+        assessmentId: rsk_01J9X4D8Q3S5V7X9Z1B3D5F7H9
+        userId: usr_01J8ZQ4H9K2M3N4P5R6S7T8V9W
+        operationType: EXCHANGE
+        score: 93
+        riskBand: CRITICAL
+        decision: DENY
+        caseId: null
+        slaHours: null
+        decidedAt: 2026-08-07T10:15:32.117Z
+        ttlSeconds: 300
+        expiresAt: 2026-08-07T10:20:32.117Z
+        policyVersion: 4.12.0
+        modelVersion: aml-gbm-2026.07.3
+        reasons:
+          - Sanctions proximity within two hops of a listed entity
+        factors:
+          - code: SANCTIONS_PROXIMITY
+            weight: 58
+            severity: HIGH
+            description: Counterparty graph distance 2 to an OFAC SDN listed entity
+          - code: HIGH_RISK_JURISDICTION
+            weight: 25
+            severity: HIGH
+            description: Originating IP resolves to a FATF high-risk jurisdiction
+
+    UserRiskProfileLow:
+      summary: Фоновый профиль с низким риском (фикстура канона §10.1)
+      description: |
+        Профиль **не является решением** и не заменяет вызов `POST /v1/risk-assessments`
+        на шаге 16.
+      value:
+        userId: usr_01J8ZQ4H9K2M3N4P5R6S7T8V9W
+        score: 17
+        riskBand: LOW
+        openCasesCount: 0
+        lastAssessmentAt: 2026-08-07T10:15:32.117Z
+        calculatedAt: 2026-08-07T06:00:00.000Z
+        ttlSeconds: 3600
+        expiresAt: 2026-08-07T07:00:00.000Z
+        policyVersion: 4.12.0
+        factors:
+          - code: NEW_DEVICE
+            weight: 12
+            severity: LOW
+            description: One new device observed in the last 30 days
+
+    RiskCaseOpen:
+      summary: Кейс заведён, ожидает разбора
+      description: Заявка находится в статусе `MANUAL_REVIEW`, средства зарезервированы (канон §8).
+      value:
+        caseId: cas_01J9X5E9R4T6W8Y0A2C4E6G8J0
+        userId: usr_01J8ZQ4H9K2M3N4P5R6S7T8V9W
+        assessmentId: rsk_01J9X4D8Q3S5V7X9Z1B3D5F7H9
+        orderId: ord_01J9X6F0S5V7Y9A1C3E5G7J9L1
+        status: OPEN
+        resolution: null
+        resolvedBy: null
+        comment: null
+        slaHours: 24
+        createdAt: 2026-08-07T10:15:32.400Z
+        resolvedAt: null
+
+    RiskCaseResolved:
+      summary: Кейс разрешён положительно
+      description: |
+        Переход заявки `MANUAL_REVIEW` → `PENDING` находится **за границей скоупа
+        задания** (канон §1, §8).
+      value:
+        caseId: cas_01J9X5E9R4T6W8Y0A2C4E6G8J0
+        userId: usr_01J8ZQ4H9K2M3N4P5R6S7T8V9W
+        assessmentId: rsk_01J9X4D8Q3S5V7X9Z1B3D5F7H9
+        orderId: ord_01J9X6F0S5V7Y9A1C3E5G7J9L1
+        status: RESOLVED
+        resolution: APPROVED
+        resolvedBy: compliance.officer.42
+        comment: Source of funds documentation reviewed and accepted
+        slaHours: 24
+        createdAt: 2026-08-07T10:15:32.400Z
+        resolvedAt: 2026-08-08T08:02:19.775Z
+
+    WebhookCaseApproved:
+      summary: Кейс одобрен — заявка переходит в PENDING
+      value:
+        eventId: d8c3f105-49ab-4c72-9f61-3b0e7a25d914
+        eventType: risk.case.resolved
+        occurredAt: 2026-08-08T08:02:19.775Z
+        sequence: 3
+        caseId: cas_01J9X5E9R4T6W8Y0A2C4E6G8J0
+        userId: usr_01J8ZQ4H9K2M3N4P5R6S7T8V9W
+        orderId: ord_01J9X6F0S5V7Y9A1C3E5G7J9L1
+        resolution: APPROVED
+        resolvedBy: compliance.officer.42
+        comment: Source of funds documentation reviewed and accepted
+
+    WebhookCaseRejected:
+      summary: Кейс отклонён — заявка переходит в REJECTED, холд снимается
+      value:
+        eventId: 5ba0d726-71c8-4f3a-9e04-cc82f5b1e037
+        eventType: risk.case.resolved
+        occurredAt: 2026-08-08T09:31:04.212Z
+        sequence: 4
+        caseId: cas_01J9X5E9R4T6W8Y0A2C4E6G8J0
+        userId: usr_01J8ZQ4H9K2M3N4P5R6S7T8V9W
+        orderId: ord_01J9X6F0S5V7Y9A1C3E5G7J9L1
+        resolution: REJECTED
+        resolvedBy: compliance.officer.42
+        comment: Requested documentation was not provided within SLA
+
+    WebhookAckAccepted:
+      summary: Событие принято
+      value:
+        received: true
+        eventId: d8c3f105-49ab-4c72-9f61-3b0e7a25d914
+        duplicate: false
+        outOfOrderDiscarded: false
+
+    WebhookAckDuplicate:
+      summary: Повторная доставка того же eventId в окне 24 ч — no-op
+      value:
+        received: true
+        eventId: d8c3f105-49ab-4c72-9f61-3b0e7a25d914
+        duplicate: true
+        outOfOrderDiscarded: false
+
+    ErrorInvalidRequest:
+      summary: Сумма не в формате decimal-строки → VALIDATION_ERROR (400)
+      value:
+        error: INVALID_REQUEST
+        message: Request body failed schema validation
+        traceId: e21f8b47c05a396d
+        timestamp: 2026-08-07T10:15:32.117Z
+        correlationId: 01J9X2C4K7QF8N3M5T6V7W8Y9Z
+        retryable: false
+        details:
+          - field: amount
+            issue: does not match decimal-string pattern ^(0|[1-9]\d{0,18})(\.\d{1,18})?$
+
+    ErrorUnauthorized:
+      summary: Невалидный service JWT → EXCHANGE_SERVICE_UNAVAILABLE (503)
+      value:
+        error: UNAUTHORIZED
+        message: Service token is expired or signature verification failed
+        traceId: 8b1e07c4aa9f42d1
+        timestamp: 2026-08-07T10:15:32.117Z
+        correlationId: 01J9X2C4K7QF8N3M5T6V7W8Y9Z
+        retryable: false
+        details: []
+
+    ErrorForbidden:
+      summary: Недостаточный scope → EXCHANGE_SERVICE_UNAVAILABLE (503)
+      value:
+        error: FORBIDDEN
+        message: Caller lacks required scope risk:assessments:write
+        traceId: 4c7e1a09d3b58f26
+        timestamp: 2026-08-07T10:15:32.117Z
+        correlationId: 01J9X2C4K7QF8N3M5T6V7W8Y9Z
+        retryable: false
+        details: []
+
+    ErrorAssessmentNotFound:
+      summary: Оценка не найдена → VALIDATION_ERROR (400)
+      value:
+        error: ASSESSMENT_NOT_FOUND
+        message: Risk assessment does not exist
+        traceId: 1a2b3c4d5e6f7081
+        timestamp: 2026-08-07T10:15:32.117Z
+        correlationId: 01J9X2C4K7QF8N3M5T6V7W8Y9Z
+        retryable: false
+        details: []
+
+    ErrorCaseNotFound:
+      summary: Кейс не найден → VALIDATION_ERROR (400)
+      value:
+        error: CASE_NOT_FOUND
+        message: Manual review case does not exist
+        traceId: 92e5c1b78d0a4e36
+        timestamp: 2026-08-07T10:15:32.117Z
+        correlationId: 01J9X2C4K7QF8N3M5T6V7W8Y9Z
+        retryable: false
+        details: []
+
+    ErrorAssessmentExpired:
+      summary: Решение просрочено → EXCHANGE_SERVICE_UNAVAILABLE (503), нужна новая оценка
+      description: |
+        Stale-решение допустимо только в пределах `ttlSeconds`. За `expiresAt`
+        переиспользование запрещено — действует fail-closed.
+      value:
+        error: ASSESSMENT_EXPIRED
+        message: Risk assessment expired at 2026-08-07T10:20:32.117Z and cannot be reused
+        traceId: 7b3f0e2c94a16d58
+        timestamp: 2026-08-07T10:22:01.640Z
+        correlationId: 01J9X2C4K7QF8N3M5T6V7W8Y9Z
+        retryable: false
+        details:
+          - field: expiresAt
+            issue: 2026-08-07T10:20:32.117Z is in the past
+
+    ErrorUnsupportedOperation:
+      summary: Тип операции не поддерживается моделью → VALIDATION_ERROR (400)
+      value:
+        error: UNSUPPORTED_OPERATION
+        message: Operation type is not supported by the current model version
+        traceId: 6d90a4f2c7b31e85
+        timestamp: 2026-08-07T10:15:32.117Z
+        correlationId: 01J9X2C4K7QF8N3M5T6V7W8Y9Z
+        retryable: false
+        details:
+          - field: operationType
+            issue: only EXCHANGE is supported by aml-gbm-2026.07.3
+
+    ErrorIdempotencyConflict:
+      summary: Тот же Idempotency-Key с другим телом → IDEMPOTENCY_CONFLICT (409)
+      value:
+        error: IDEMPOTENCY_CONFLICT
+        message: Idempotency-Key was already used with a different request body
+        traceId: 30c5f7a9e1b64d82
+        timestamp: 2026-08-07T10:15:32.117Z
+        correlationId: 01J9X2C4K7QF8N3M5T6V7W8Y9Z
+        retryable: false
+        details:
+          - field: Idempotency-Key
+            issue: 7c1d9b34-8f52-4a6e-b0c7-2e15d3f49a88 bound to a different payload hash
+
+    ErrorRateLimited:
+      summary: Превышен лимит обращений → RATE_LIMITED (429)
+      value:
+        error: RATE_LIMITED
+        message: Too many requests from exchange-bff, quota exceeded for the current window
+        traceId: 7f2a4c6e8d0b1359
+        timestamp: 2026-08-07T10:15:32.117Z
+        correlationId: 01J9X2C4K7QF8N3M5T6V7W8Y9Z
+        retryable: true
+        details: []
+
+    ErrorModelUnavailable:
+      summary: Модель недоступна → EXCHANGE_SERVICE_UNAVAILABLE (503), fail-closed
+      description: |
+        Дефолтное «разрешить» не применяется: пропустить операцию без оценки —
+        регуляторный риск, несопоставимый с неудобством отказа.
+      value:
+        error: MODEL_UNAVAILABLE
+        message: Scoring model is not available, failing closed
+        traceId: e21f8b47c05a396d
+        timestamp: 2026-08-07T10:15:32.117Z
+        correlationId: 01J9X2C4K7QF8N3M5T6V7W8Y9Z
+        retryable: true
+        details: []
+
+    ErrorInternal:
+      summary: Внутренняя ошибка → EXCHANGE_SERVICE_UNAVAILABLE (503)
+      value:
+        error: INTERNAL_ERROR
+        message: Unexpected internal error while evaluating risk
+        traceId: 0a9b8c7d6e5f4321
+        timestamp: 2026-08-07T10:15:32.117Z
+        correlationId: 01J9X2C4K7QF8N3M5T6V7W8Y9Z
+        retryable: true
+        details: []
+
+    ErrorServiceUnavailable:
+      summary: Сервис недоступен → EXCHANGE_SERVICE_UNAVAILABLE (503), fail-closed
+      value:
+        error: SERVICE_UNAVAILABLE
+        message: Scoring service is temporarily unavailable, operation must not be created
+        traceId: 5e6f7a8b9c0d1e2f
+        timestamp: 2026-08-07T10:15:32.117Z
+        correlationId: 01J9X2C4K7QF8N3M5T6V7W8Y9Z
+        retryable: true
+        details: []
+
+    ErrorUpstreamTimeout:
+      summary: Таймаут 1000 мс → UPSTREAM_TIMEOUT (504), fail-closed
+      value:
+        error: UPSTREAM_TIMEOUT
+        message: Scoring service did not respond within the configured deadline
+        traceId: 3b2a1908f7e6d5c4
+        timestamp: 2026-08-07T10:15:32.117Z
+        correlationId: 01J9X2C4K7QF8N3M5T6V7W8Y9Z
+        retryable: true
+        details: []
+
+    ErrorWebhookInvalidPayload:
+      summary: Невалидный payload webhook — отправитель не ретраит
+      value:
+        error: INVALID_REQUEST
+        message: Webhook payload failed schema validation
+        traceId: a1b2c3d4e5f60718
+        timestamp: 2026-08-08T08:02:20.010Z
+        correlationId: 01J9X2C4K7QF8N3M5T6V7W8Y9Z
+        retryable: false
+        details:
+          - field: resolution
+            issue: must be one of APPROVED, REJECTED
+
+    ErrorWebhookBadSignature:
+      summary: Подпись невалидна или timestamp вне окна 300 с
+      value:
+        error: INVALID_SIGNATURE
+        message: X-Scoring-Signature verification failed or timestamp is outside the 300s window
+        traceId: f0e1d2c3b4a59687
+        timestamp: 2026-08-08T08:02:20.010Z
+        correlationId: 01J9X2C4K7QF8N3M5T6V7W8Y9Z
+        retryable: false
+        details:
+          - field: X-Scoring-Signature
+            issue: timestamp skew 812s exceeds the 300s tolerance window
