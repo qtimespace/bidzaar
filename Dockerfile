@@ -153,6 +153,23 @@ RUN sed -i 's/\r$//' /docker-entrypoint.d/40-render-port.sh \
  && chmod +x /docker-entrypoint.d/40-render-port.sh \
  && rm -f /etc/nginx/conf.d/default.conf
 
+# Защита от регрессии, которая уже один раз положила стенд.
+#
+# Блок `types { … }` на уровне server НЕ дополняет унаследованный mime.types,
+# а ЗАМЕНЯЕТ его целиком: всё, кроме перечисленных внутри расширений, начинает
+# отдаваться как application/octet-stream. Браузер такой ответ не рендерит,
+# а предлагает скачать, и подресурсы страницы вообще не запрашиваются — снаружи
+# это выглядит как пустая страница при полностью живом контейнере.
+#
+# Отлаживать это дорого: nginx стартует без ошибок, логи чистые, health-check
+# зелёный. Поэтому проверка стоит здесь и роняет СБОРКУ, а не деплой.
+# MIME-типам место в `default_type` внутри конкретного location.
+RUN if grep -qE '^[[:space:]]*types[[:space:]]*\{' /etc/nginx/bidzaar/default.conf.template; then \
+        echo "ОШИБКА: в конфиге nginx есть блок types { } на уровне server." >&2; \
+        echo "Он заменяет mime.types целиком. Используйте default_type в location." >&2; \
+        exit 1; \
+    fi
+
 # Значение по умолчанию для локального запуска; на Railway PORT приходит извне.
 ENV PORT=8080
 EXPOSE 8080
