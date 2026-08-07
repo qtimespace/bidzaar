@@ -6,8 +6,17 @@
 #   /docs/          вики                     (MkDocs Material)
 #   /docs/swagger/  Swagger UI               (OpenAPI 3.1, 10 спецификаций)
 #
-# Три стадии. Первые две — тулчейн (Node, Python, node_modules, venv),
+# Четыре стадии. Первые три — тулчейн (Node, Python, node_modules),
 # в финальный образ из них уезжает только содержимое dist/.
+#
+#   1   prototype-build   node    → prototype/dist
+#   2a  portal-vendor     node    → node_modules портала (нужны 2 поддерева)
+#   2b  portal-build      python  → portal/dist
+#   3   runtime           nginx   → образ
+#
+# Python берётся официальным образом, а не доустанавливается в образ Node
+# через apt: та стадия тянула около 150 МБ пакетов и была самым медленным
+# и самым сетезависимым шагом всей сборки.
 # ═══════════════════════════════════════════════════════════════════════════
 
 
@@ -38,30 +47,38 @@ RUN npm run build \
 
 
 # ───────────────────────────────────────────────────────────────────────────
-# Стадия 2. Портал: Node + Python.
+# Стадия 2a. Вендоринг: только node_modules портала.
 #
-# Node нужен ради node_modules/swagger-ui-dist и node_modules/mermaid —
-# portal/tools/sync.py вендорит их в статику. Python — ради самого MkDocs.
-# Берём образ Node и доставляем Python из apt: в bookworm это 3.11, а весь
-# набор зависимостей портала требует максимум 3.10 (см. portal/requirements.txt).
+# Из всего дерева зависимостей порталу нужны ровно две вещи —
+# swagger-ui-dist (офлайн Swagger UI) и mermaid.min.js (офлайн диаграммы).
+# Их забирает следующая стадия; сам Node в сборке документации не участвует.
 # ───────────────────────────────────────────────────────────────────────────
-FROM node:22.17.1-bookworm-slim AS portal-build
+FROM node:22.17.1-bookworm-slim AS portal-vendor
+
+WORKDIR /build/portal
+COPY portal/package.json portal/package-lock.json ./
+RUN npm ci --no-audit --no-fund
+
+
+# ───────────────────────────────────────────────────────────────────────────
+# Стадия 2b. Портал: MkDocs Material.
+#
+# Берём официальный образ Python, а НЕ образ Node с доустановкой python3
+# через apt. Причина практическая: apt-стадия тянула около 150 МБ пакетов,
+# была самым медленным и самым сетезависимым шагом всей сборки и требовала
+# возни с venv из-за PEP 668 (externally-managed) в Debian 12. Здесь ничего
+# этого нет: pip ставит в системный python образа штатно.
+#
+# Цена решения: node_modules приходится переносить между стадиями явным COPY,
+# и если sync.py начнёт читать из node_modules что-то ещё, этот COPY придётся
+# дополнить руками. Список читаемых путей — в sync.py, функция vendor_assets().
+# ───────────────────────────────────────────────────────────────────────────
+FROM python:3.12-slim-bookworm AS portal-build
 
 ENV PIP_DISABLE_PIP_VERSION_CHECK=1 \
     PIP_NO_CACHE_DIR=1 \
-    PYTHONDONTWRITEBYTECODE=1
-
-RUN apt-get update \
- && apt-get install -y --no-install-recommends python3 python3-venv \
- && rm -rf /var/lib/apt/lists/*
-
-# venv, а не системный python: Debian 12 помечен PEP 668 (externally-managed),
-# и pip в системное окружение без --break-system-packages не пустит.
-# Заодно `python` (без тройки) внутри venv существует — а именно так его
-# зовёт portal/package.json.
-ENV VIRTUAL_ENV=/opt/venv
-ENV PATH="$VIRTUAL_ENV/bin:$PATH"
-RUN python3 -m venv "$VIRTUAL_ENV"
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
 
 WORKDIR /build/portal
 
@@ -69,8 +86,10 @@ COPY portal/requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt \
  && python -m mkdocs --version
 
-COPY portal/package.json portal/package-lock.json ./
-RUN npm ci --no-audit --no-fund
+# Ровно те два поддерева, которые читает vendor_assets(). Копировать
+# node_modules целиком незачем: 14.6 МБ против сотен.
+COPY --from=portal-vendor /build/portal/node_modules/swagger-ui-dist ./node_modules/swagger-ui-dist
+COPY --from=portal-vendor /build/portal/node_modules/mermaid/dist/mermaid.min.js ./node_modules/mermaid/dist/mermaid.min.js
 
 # Ключевой момент сборки портала: в контекст нужен ВЕСЬ репозиторий.
 # portal/wiki/mkdocs.yml подключает исходные документы напрямую из корня
@@ -79,6 +98,12 @@ RUN npm ci --no-audit --no-fund
 # Скопировать только portal/ = гарантированное падение mkdocs --strict.
 WORKDIR /build
 COPY . ./
+
+# node_modules исключён в .dockerignore, поэтому COPY . ./ выше не затирает
+# вендоринг. Проверяем это явно: иначе поломка всплыла бы поздно и невнятно —
+# mermaid молча заменился бы заглушкой, а диаграммы ушли бы на CDN.
+RUN test -f portal/node_modules/mermaid/dist/mermaid.min.js \
+ && test -d portal/node_modules/swagger-ui-dist
 
 # site_url нужен ровно для одного файла — 404.html. MkDocs строит все обычные
 # страницы на относительных ссылках (работают на любой глубине монтирования),
@@ -91,11 +116,13 @@ COPY . ./
 ARG PORTAL_SITE_URL=http://localhost:8080/docs/
 ENV PORTAL_SITE_URL=$PORTAL_SITE_URL
 
-# npm run build = python tools/sync.py && cd wiki && mkdocs build --strict --clean
+# Здесь НЕ `npm run build`: npm в этом образе нет. Тот скрипт — это ровно две
+# команды ниже, и они обязаны оставаться синхронными с portal/package.json.
 # --strict превращает любое предупреждение (битая ссылка, потерянный сниппет)
 # в ненулевой код возврата, то есть в упавшую сборку образа. Это то, что нужно.
 RUN cd portal \
- && npm run build \
+ && python tools/sync.py \
+ && python -m mkdocs build --strict --clean --config-file wiki/mkdocs.yml \
  && test -f dist/index.html \
  && test -f dist/swagger/index.html \
  && test -f dist/swagger/specs/exchange-orders.openapi.yaml \
