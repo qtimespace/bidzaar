@@ -236,6 +236,42 @@ for (const value of ['25450.00', '135.270000', '0.01420000', '0.86000000', '0.01
 check('ETH held balance is non-zero in both', canon.includes('0.10000000') && fixtures.includes("held: '0.10000000'"))
 
 // ---------------------------------------------------------------------------
+// 6b. The RATE_CHANGED example is arithmetically consistent
+// ---------------------------------------------------------------------------
+
+section('RATE_CHANGED example agrees with the pair threshold')
+
+// Flagged by the tech lead: this is the one place where drift numbers are
+// hand-written. `verify:money` checks amounts, not drift, so if the RUB→USDT
+// threshold is ever retuned the example would diverge in silence and start
+// teaching readers a rule the system no longer follows.
+{
+  const example = mainYaml.match(/driftPercent:\s*'([\d.]+)'[\s\S]{0,120}?thresholdPercent:\s*'([\d.]+)'/)
+  check('spec carries a RATE_CHANGED drift example', Boolean(example))
+
+  if (example) {
+    const [, drift, threshold] = example
+    check(
+      'the example drift actually exceeds the example threshold',
+      Number(drift) > Number(threshold),
+      `drift ${drift} vs threshold ${threshold} — the example would not raise RATE_CHANGED at all`,
+    )
+
+    const pairThreshold = fixtures.match(
+      /fromAssetId:\s*'RUB',\s*toAssetId:\s*'USDT'[\s\S]{0,400}?driftThresholdPercent:\s*'([\d.]+)'/,
+    )
+    check('prototype pins a RUB/USDT drift threshold', Boolean(pairThreshold))
+    if (pairThreshold) {
+      check(
+        'example threshold matches the RUB/USDT pair fixture',
+        Number(pairThreshold[1]) === Number(threshold),
+        `spec ${threshold} vs fixture ${pairThreshold[1]}`,
+      )
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
 // 7. Mermaid diagrams use latin node ids
 // ---------------------------------------------------------------------------
 

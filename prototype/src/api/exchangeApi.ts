@@ -20,7 +20,7 @@ import {
   isValidMoney,
   isZero,
   lt,
-  rateDriftPercent,
+  adverseRateDriftPercent,
 } from '@/domain/money'
 import type {
   Asset,
@@ -32,11 +32,12 @@ import type {
   OrderStatus,
   PairConfig,
   Quote,
+  QuoteSide,
   Rate,
   Timestamp,
   UserProfile,
 } from '@/domain/types'
-import { ApiError } from '@/domain/errors'
+import { ApiError, LIMIT_CODE_BY_PERIOD } from '@/domain/errors'
 import { ASSETS, DEFAULT_FROM_ASSET, DEFAULT_TO_ASSET, helpers } from './fixtures'
 import { delay, fail, newCorrelationId, nowIso, uuidv4 } from './transport'
 import * as accounting from './services/accountingService'
@@ -51,8 +52,30 @@ import * as users from './services/usersService'
 
 /** Canonical §2 — rate lock TTL. */
 export const RATE_LOCK_TTL_MS = 15_000
-/** Canonical §11 — below this, a rate move is noise and is absorbed silently. */
-export const RATE_DRIFT_THRESHOLD_PERCENT = 0.2
+/**
+ * Canonical §11 — fallback drift threshold, in percent.
+ *
+ * Decision O-8 made the threshold a property of the PAIR, supplied by S4. This
+ * constant is now only the fallback for a pair that carries no value of its
+ * own: an unknown threshold must not be treated as infinite, and an exchange
+ * must not be blocked over a parameter that has a safe default. Read the
+ * effective value through `driftThresholdFor(pair)`, never directly.
+ */
+export const DEFAULT_RATE_DRIFT_THRESHOLD_PERCENT = 0.2
+
+/**
+ * Effective drift threshold for a pair, in percent.
+ *
+ * Falling back is a degraded state, not a normal one: the caller marks the
+ * quote `degraded` so a broken S4 integration cannot hide behind behaviour that
+ * looks entirely normal.
+ */
+export function driftThresholdFor(pair: Pick<PairConfig, 'driftThresholdPercent'>): number {
+  const configured = pair.driftThresholdPercent
+  if (configured === undefined) return DEFAULT_RATE_DRIFT_THRESHOLD_PERCENT
+  const parsed = Number(configured)
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : DEFAULT_RATE_DRIFT_THRESHOLD_PERCENT
+}
 
 // ---------------------------------------------------------------------------
 // Server-side state (in the real system: Quote Store + Idempotency Store)
@@ -150,7 +173,16 @@ export async function getIndicativeRate(fromAssetId: string, toAssetId: string):
 export interface CreateQuoteRequest {
   fromAsset: AssetRef
   toAsset: AssetRef
-  fromAmount: string
+  /**
+   * Which side the caller is fixing (decision O-9). Optional and defaulting to
+   * `SELL`, which is exactly the previous behaviour — that is what keeps the
+   * change compatible for callers written before it existed.
+   */
+  side?: QuoteSide
+  /** Required when side is SELL, forbidden when side is BUY. */
+  fromAmount?: string
+  /** Required when side is BUY, forbidden when side is SELL. */
+  toAmount?: string
 }
 
 export interface QuoteResult {
@@ -160,7 +192,48 @@ export interface QuoteResult {
 
 export async function createQuote(request: CreateQuoteRequest): Promise<QuoteResult> {
   const instance = '/v1/exchange/quotes'
-  const { fromAsset, toAsset, fromAmount } = request
+  const { fromAsset, toAsset } = request
+  const side: QuoteSide = request.side ?? 'SELL'
+
+  // ---- Step 1: exactly one amount, on the side the request declares --------
+  if (side === 'BUY') {
+    if (request.fromAmount !== undefined) {
+      fail('VALIDATION_ERROR', 'fromAmount must not be sent when side is BUY', {
+        instance,
+        params: { field: '/fromAmount', reason: 'NOT_ALLOWED_FOR_SIDE' },
+      })
+    }
+    if (request.toAmount === undefined) {
+      fail('VALIDATION_ERROR', 'toAmount is required when side is BUY', {
+        instance,
+        params: { field: '/toAmount', reason: 'REQUIRED' },
+      })
+    }
+    // The contract defines the reverse calculation; this prototype does not
+    // implement it. Canonical §5.4 makes it a search, not a formula: minFee and
+    // maxFee split the equation into branches, so every candidate has to be
+    // verified by a forward pass. A hurried approximation here would round the
+    // derived debit the wrong way and quietly break invariant I2 — a stub that
+    // states its own absence is the honest option until the UI needs the mode.
+    fail('VALIDATION_ERROR', 'Reverse calculation (side=BUY) is defined by the contract but not implemented in this prototype', {
+      instance,
+      params: { field: '/side', reason: 'NOT_IMPLEMENTED_IN_PROTOTYPE' },
+    })
+  }
+
+  if (request.toAmount !== undefined) {
+    fail('VALIDATION_ERROR', 'toAmount must not be sent when side is SELL', {
+      instance,
+      params: { field: '/toAmount', reason: 'NOT_ALLOWED_FOR_SIDE' },
+    })
+  }
+  const fromAmount = request.fromAmount
+  if (fromAmount === undefined) {
+    fail('VALIDATION_ERROR', 'fromAmount is required when side is SELL', {
+      instance,
+      params: { field: '/fromAmount', reason: 'REQUIRED' },
+    })
+  }
 
   // Steps 1, 3, 4, 5 of the chain — cheap and deterministic, run before any
   // network call so a malformed request never costs an upstream round trip.
@@ -228,6 +301,11 @@ export async function createQuote(request: CreateQuoteRequest): Promise<QuoteRes
   const quotedAt = Date.now()
   const quote: Quote = {
     quoteId: uuidv4(),
+    side,
+    // SELL fixes the debit side, so the requested amount IS fromAmount. Stored
+    // explicitly rather than inferred, because under BUY the two differ and a
+    // reader must not have to know the side to interpret the field.
+    requestedAmount: fromAmount,
     fromAsset: { assetId: from.assetId, network: from.network },
     toAsset: { assetId: to.assetId, network: to.network },
     fromAmount: amounts.fromAmount,
@@ -240,7 +318,10 @@ export async function createQuote(request: CreateQuoteRequest): Promise<QuoteRes
     rateSource: rateQuote.source,
     quotedAt: new Date(quotedAt).toISOString(),
     expiresAt: new Date(quotedAt + RATE_LOCK_TTL_MS).toISOString(),
-    degraded: rateQuote.stale,
+    // A pair with no threshold of its own means S4 did not supply one and the
+    // default was applied — decision O-8 requires that to be visible rather
+    // than silently normal.
+    degraded: rateQuote.stale || pair.driftThresholdPercent === undefined,
   }
 
   // Evict what can no longer be used. Without this the store grows by one entry
@@ -267,15 +348,24 @@ export interface CreateOrderRequest {
   expectedToAmount: string
   expectedRate: string
   /**
-   * Pre-authorises a rate move **within** the 0.20 % threshold.
+   * "Do not credit me less than X" — the lower bound on the credited amount,
+   * in the target asset (decision O-16).
    *
-   * It cannot authorise more than that, by construction. A boolean cannot
-   * express "how much worse am I willing to accept", so treating it as consent
-   * to any rate would be consent that is not informed — the OpenAPI description
-   * says so in as many words. Beyond the threshold the request always fails
-   * with `RATE_CHANGED` and the user confirms a fresh quote.
+   * Consent is expressed as an AMOUNT, not a rate, and not a boolean. A boolean
+   * cannot say how much worse the user will accept; a rate bound is a trap,
+   * because in the canonical direction a worse deal means a SMALLER rate, so
+   * the guard is a lower bound while the obvious name reads as an upper one.
+   * The user decides on the sum they see, so that is the unit the contract
+   * takes. Valid only for a SELL-side quote, where the credit is derived.
    */
-  acceptRateChange: boolean
+  minAcceptableToAmount?: string
+  /**
+   * "Do not debit me more than Y" — the upper bound on the debited amount, in
+   * the source asset. The mirror of the above, valid only for a BUY-side quote.
+   * Unreachable in this prototype while side=BUY is not implemented, but the
+   * field exists so the shape matches the contract.
+   */
+  maxAcceptableFromAmount?: string
   idempotencyKey: string
 }
 
@@ -317,7 +407,7 @@ export async function createOrder(request: CreateOrderRequest): Promise<CreateOr
     }
     // Same key, first attempt still running. Returning a second 201 would mean
     // two holds against one intent, so the duplicate is refused outright.
-    fail('IDEMPOTENCY_CONFLICT', 'A request with this idempotency key is already being processed', {
+    fail('REQUEST_IN_PROGRESS', 'A request with this idempotency key is already being processed', {
       instance,
       correlationId,
     })
@@ -378,39 +468,42 @@ async function processOrder(
   }
 
   // ---- 10. Rate drift ---------------------------------------------------
+  // Consent is evaluated on the recalculated AMOUNT, never on the rate or on a
+  // flag (decision O-16): "less was credited" is a comparison nobody can get
+  // backwards, whereas the direction of a rate bound depends on which way the
+  // pair is written.
   const liveRate = await rates.getRate(from.assetId, to.assetId)
-  const drift = rateDriftPercent(quote.rate, liveRate.rate)
+  const threshold = driftThresholdFor(pair)
+  // One-sided by design (decision O-18): only a move AGAINST the system can
+  // make the locked quote untenable. A favourable move is honoured at the
+  // locked rate like any other, the user receives exactly the sum they
+  // confirmed, and the difference stays with the system — that is what fixing
+  // a price means. Interrupting there would be noise.
+  const adverseDrift = adverseRateDriftPercent(quote.rate, liveRate.rate)
   let effectiveQuote = quote
 
-  if (drift > RATE_DRIFT_THRESHOLD_PERCENT) {
-    const recalculated = calculateQuoteAmounts({
-      rawFromAmount: quote.fromAmount,
-      rate: liveRate.rate,
-      policy: pair.feePolicy,
-      fromDecimals: from.decimals,
-      toDecimals: to.decimals,
-    })
-
-    // Unconditional, regardless of `acceptRateChange`. There is no upper bound
-    // on how far the rate may have moved, so honouring the flag here would
-    // execute a trade at a price the user never saw and never bounded.
-    fail('RATE_CHANGED', 'The rate moved beyond the accepted threshold while you were confirming', {
+  // Shape of the consent bound is checked whichever way the market moved. A
+  // defect that only surfaces on unlucky days is worse than one that always does.
+  if (request.maxAcceptableFromAmount !== undefined && quote.side === 'SELL') {
+    fail('VALIDATION_ERROR', 'maxAcceptableFromAmount applies to a BUY-side quote only', {
       instance,
       correlationId,
-      params: {
-        quotedRate: quote.rate,
-        currentRate: liveRate.rate,
-        quotedToAmount: quote.toAmount,
-        currentToAmount: recalculated.toAmount,
-        driftPercent: drift.toFixed(4),
-        thresholdPercent: String(RATE_DRIFT_THRESHOLD_PERCENT),
-      },
+      params: { field: '/maxAcceptableFromAmount', reason: 'NOT_ALLOWED_FOR_SIDE' },
+    })
+  }
+  if (request.minAcceptableToAmount !== undefined && !isValidMoney(request.minAcceptableToAmount)) {
+    fail('VALIDATION_ERROR', 'minAcceptableToAmount must be a valid decimal string', {
+      instance,
+      correlationId,
+      params: { field: '/minAcceptableToAmount', reason: 'PATTERN_MISMATCH' },
     })
   }
 
-  if (drift > 0 && request.acceptRateChange) {
-    // Inside the threshold and pre-authorised: re-price silently so the ledger
-    // and the order agree with the live market rather than a stale lock.
+  // Inside the tolerance, or moving our way: the quote is a COMMITMENT for its
+  // TTL and is honoured as issued. Re-pricing here would hand the user a
+  // different sum from the one they just confirmed, with no banner — exactly
+  // the silent divergence the expected* fields exist to catch.
+  if (adverseDrift > threshold) {
     const recalculated = calculateQuoteAmounts({
       rawFromAmount: quote.fromAmount,
       rate: liveRate.rate,
@@ -418,11 +511,43 @@ async function processOrder(
       fromDecimals: from.decimals,
       toDecimals: to.decimals,
     })
-    effectiveQuote = {
-      ...quote,
-      ...recalculated,
-      rate: liveRate.rate,
-      inverseRate: inverseRate(liveRate.rate, 2),
+
+    if (
+      request.minAcceptableToAmount !== undefined &&
+      !lt(recalculated.toAmount, request.minAcceptableToAmount)
+    ) {
+      // Beyond the pair's tolerance, but the user named a floor and the live
+      // market still clears it. THIS is what the bound buys: execution in a
+      // region that would otherwise be refused, limited by the user's own
+      // number rather than by an open-ended "yes". Re-price, because the user
+      // consented to a figure, not to the stale one.
+      effectiveQuote = {
+        ...quote,
+        ...recalculated,
+        rate: liveRate.rate,
+        inverseRate: inverseRate(liveRate.rate, 2),
+      }
+    } else {
+      fail('RATE_CHANGED', 'The rate moved beyond the accepted threshold while you were confirming', {
+        instance,
+        correlationId,
+        params: {
+          quotedRate: quote.rate,
+          currentRate: liveRate.rate,
+          quotedToAmount: quote.toAmount,
+          currentToAmount: recalculated.toAmount,
+          // The adverse magnitude — the number the threshold was compared
+          // against, not the raw distance between the two rates.
+          driftPercent: adverseDrift.toFixed(4),
+          // The threshold actually applied — the pair's own value, or the
+          // default when S4 supplied none. Never a hardcoded constant: the UI
+          // must explain the refusal with the same number the server used.
+          thresholdPercent: threshold.toFixed(2),
+          ...(request.minAcceptableToAmount === undefined
+            ? {}
+            : { minAcceptableToAmount: request.minAcceptableToAmount }),
+        },
+      })
     }
   }
 
@@ -485,10 +610,20 @@ async function processOrder(
   const amountInLimitCurrency = limitsFees.toLimitCurrency(from.assetId, effectiveQuote.fromAmount)
   for (const bucket of limits) {
     if (gt(amountInLimitCurrency, bucket.remaining)) {
-      fail(bucket.period === 'DAILY' ? 'LIMIT_EXCEEDED_DAILY' : 'LIMIT_EXCEEDED_MONTHLY', 'Turnover limit exceeded', {
+      // One code per window. Collapsing YEARLY into MONTHLY told the user about
+      // the wrong window — "Monthly limit reached" when the ANNUAL allowance is
+      // gone invites the false conclusion "I will wait until the 1st".
+      fail(LIMIT_CODE_BY_PERIOD[bucket.period], 'Turnover limit exceeded', {
         instance,
         correlationId,
-        params: { remaining: `${bucket.remaining} ${bucket.currency}`, period: bucket.period },
+        params: {
+          remaining: `${bucket.remaining} ${bucket.currency}`,
+          period: bucket.period,
+          resetAt: bucket.resetsAt,
+          // Without the zone the reset instant is a number the user cannot
+          // place on any clock they own (decision O-11).
+          resetTimeZone: bucket.resetTimeZone,
+        },
       })
     }
   }
@@ -566,6 +701,56 @@ export async function getOrder(orderId: string): Promise<ExchangeOrder> {
   fail('ORDER_NOT_FOUND', `Order ${orderId} does not exist or is not visible to this user`, {
     instance: `/v1/exchange-orders/${orderId}`,
   })
+}
+
+// ---------------------------------------------------------------------------
+// GET /v1/exchange-orders?idempotencyKey=… — state recovery (O-10, O-17)
+// ---------------------------------------------------------------------------
+
+/** Collection envelope. Zero or one element: the key is unique per user. */
+export interface OrderSearchResult {
+  items: ExchangeOrder[]
+  total: number
+}
+
+/**
+ * Finds the order created under an idempotency key.
+ *
+ * This is how a client that lost the response to `POST` learns the outcome
+ * without blindly retrying — after a page reload the key is the only handle it
+ * still has. It is a FILTER over a collection, not a lookup of a resource:
+ * no match is an empty collection, never a 404. A 404 would claim the
+ * collection itself does not exist, which is false.
+ *
+ * What actually stops key-guessing is that the search is scoped to the caller's
+ * own orders, not the choice of status code — the real service filters on
+ * `userId` from the token AND the key together. The prototype has a single
+ * hardcoded user (canonical §10.1), so the scope is implicit here; the
+ * constraint is stated because it is the security property, and an
+ * implementation that dropped it would look identical from the outside.
+ */
+export async function findOrderByIdempotencyKey(idempotencyKey: string): Promise<OrderSearchResult> {
+  const instance = '/v1/exchange-orders'
+  if (!idempotencyKey) {
+    fail('VALIDATION_ERROR', 'Query parameter idempotencyKey is required', {
+      instance,
+      params: { field: '/idempotencyKey', reason: 'REQUIRED' },
+    })
+  }
+
+  await delay(60)
+  const record = idempotencyStore.get(idempotencyKey)
+
+  // The first attempt is still running: there is no answer to give yet. Telling
+  // the client "nothing found" would be a lie that invites a second POST.
+  if (record && !record.order && record.inFlight) {
+    fail('REQUEST_IN_PROGRESS', 'A request with this idempotency key is still being processed', {
+      instance,
+      params: { reason: 'CLAIM_ACTIVE', retryAfterSeconds: '1' },
+    })
+  }
+
+  return record?.order ? { items: [record.order], total: 1 } : { items: [], total: 0 }
 }
 
 /** Test seam: clears server-side state so scenario switches start clean. */

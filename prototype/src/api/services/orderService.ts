@@ -36,6 +36,11 @@ export async function registerOrder(input: {
     orderId: `ord_${ulid(now)}`,
     status: input.status,
     quoteId: quote.quoteId,
+    // The order is the audit record: without the side and the originally
+    // requested amount the calculation can be reproduced two ways and neither
+    // can be shown to be the one that ran (canonical §5.4).
+    side: quote.side,
+    requestedAmount: quote.requestedAmount,
     fromAsset: quote.fromAsset,
     toAsset: quote.toAsset,
     fromAmount: quote.fromAmount,

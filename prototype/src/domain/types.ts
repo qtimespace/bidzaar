@@ -68,12 +68,41 @@ export interface PairConfig {
   maxAmount: Money
   feePolicy: FeePolicy
   enabled: boolean
+  /**
+   * Rate-drift tolerance for THIS pair, in percent ("0.20" means 0.20 %).
+   *
+   * Decision O-8: a single global threshold is sound for RUB→USDT and almost
+   * guarantees RATE_CHANGED on every confirmation for RUB→BTC, whose own
+   * volatility exceeds it — the guard rail turns into noise the user learns to
+   * click through. Supplied per pair by S4; when absent, the default applies.
+   */
+  driftThresholdPercent?: string
 }
 
 export type RateSource = 'AGGREGATED' | 'BINANCE' | 'CBR' | 'INTERNAL'
 
+/**
+ * Which side of the calculation the client fixed (decision O-9).
+ *
+ * `SELL` — the debit amount is given, the credit amount is derived.
+ * `BUY`  — the credit amount is given, the debit amount is derived.
+ *
+ * The given side is never rounded; the derived side is rounded in the system's
+ * favour (canonical §5.4).
+ */
+export type QuoteSide = 'SELL' | 'BUY'
+
 export interface Quote {
   quoteId: string
+  /** Which side the client fixed. `SELL` in this prototype — see createQuote. */
+  side: QuoteSide
+  /**
+   * The amount as originally requested: `fromAmount` when side is SELL,
+   * `toAmount` when side is BUY. Canonical §5.4 requires the snapshot to carry
+   * it — without the pair (side, requestedAmount) the calculation can be
+   * reproduced two different ways and stops being auditable.
+   */
+  requestedAmount: Money
   fromAsset: AssetRef
   toAsset: AssetRef
   /** Full debited amount, fee included. */
@@ -110,13 +139,17 @@ export interface ExchangeOrder {
   orderId: string
   status: OrderStatus
   quoteId: string
+  /** Copied from the quote — the order doubles as the audit record (§5.4). */
+  side: QuoteSide
+  requestedAmount: Money
   fromAsset: AssetRef
   toAsset: AssetRef
   fromAmount: Money
   feeAmount: Money
   toAmount: Money
   rate: Rate
-  holdId: string
+  /** `null` when no reserve exists: REJECTED, or the hold was already released. */
+  holdId: string | null
   createdAt: Timestamp
   estimatedCompletionAt: Timestamp
   idempotencyKey: string
@@ -140,13 +173,21 @@ export interface KycState {
   allowedOperations: string[]
 }
 
+export type LimitPeriod = 'DAILY' | 'MONTHLY' | 'YEARLY'
+
 export interface LimitBucket {
-  period: 'DAILY' | 'MONTHLY'
+  period: LimitPeriod
   /** Normalised to a single accounting currency (RUB in the fixtures). */
   limit: Money
   used: Money
   remaining: Money
   resetsAt: Timestamp
+  /**
+   * IANA zone the window is computed in (decision O-11). Accounting is UTC, so
+   * a resident of AE sees the daily window reset at 04:00 local — a number the
+   * user cannot explain unless we say which clock it is on.
+   */
+  resetTimeZone: string
   currency: string
 }
 

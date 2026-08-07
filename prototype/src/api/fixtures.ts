@@ -94,22 +94,38 @@ const feePolicy = (percent: string, minFee: string) =>
 /**
  * `EUR→*` is deliberately absent: it is the fixture that makes
  * PAIR_NOT_SUPPORTED reachable from the UI without a dev switch.
+ *
+ * `driftThresholdPercent` is per pair (decision O-8) and deliberately uneven:
+ * the volatile crypto legs get a wider band than RUB→USDT. Under one global
+ * 0.20 % the BTC legs would raise RATE_CHANGED on nearly every confirmation,
+ * which trains the user to dismiss the banner unread.
  */
 export const PAIRS: PairConfig[] = [
-  { fromAssetId: 'RUB', toAssetId: 'USDT', minAmount: '500.00', maxAmount: '1000000.00', feePolicy: feePolicy('0.35', '10.00'), enabled: true },
-  { fromAssetId: 'USDT', toAssetId: 'RUB', minAmount: '5.000000', maxAmount: '10000.000000', feePolicy: feePolicy('0.35', '0.50'), enabled: true },
-  { fromAssetId: 'RUB', toAssetId: 'BTC', minAmount: '1000.00', maxAmount: '1000000.00', feePolicy: feePolicy('0.50', '10.00'), enabled: true },
-  { fromAssetId: 'USDT', toAssetId: 'BTC', minAmount: '10.000000', maxAmount: '10000.000000', feePolicy: feePolicy('0.40', '0.50'), enabled: true },
-  { fromAssetId: 'USDT', toAssetId: 'ETH', minAmount: '10.000000', maxAmount: '10000.000000', feePolicy: feePolicy('0.40', '0.50'), enabled: true },
-  { fromAssetId: 'BTC', toAssetId: 'USDT', minAmount: '0.00020000', maxAmount: '2.00000000', feePolicy: feePolicy('0.40', '0.00005'), enabled: true },
-  { fromAssetId: 'ETH', toAssetId: 'USDT', minAmount: '0.00500000', maxAmount: '50.00000000', feePolicy: feePolicy('0.40', '0.0005'), enabled: true },
+  { fromAssetId: 'RUB', toAssetId: 'USDT', minAmount: '500.00', maxAmount: '1000000.00', feePolicy: feePolicy('0.35', '10.00'), enabled: true, driftThresholdPercent: '0.20' },
+  { fromAssetId: 'USDT', toAssetId: 'RUB', minAmount: '5.000000', maxAmount: '10000.000000', feePolicy: feePolicy('0.35', '0.50'), enabled: true, driftThresholdPercent: '0.20' },
+  { fromAssetId: 'RUB', toAssetId: 'BTC', minAmount: '1000.00', maxAmount: '1000000.00', feePolicy: feePolicy('0.50', '10.00'), enabled: true, driftThresholdPercent: '1.50' },
+  { fromAssetId: 'USDT', toAssetId: 'BTC', minAmount: '10.000000', maxAmount: '10000.000000', feePolicy: feePolicy('0.40', '0.50'), enabled: true, driftThresholdPercent: '1.20' },
+  { fromAssetId: 'USDT', toAssetId: 'ETH', minAmount: '10.000000', maxAmount: '10000.000000', feePolicy: feePolicy('0.40', '0.50'), enabled: true, driftThresholdPercent: '1.00' },
+  { fromAssetId: 'BTC', toAssetId: 'USDT', minAmount: '0.00020000', maxAmount: '2.00000000', feePolicy: feePolicy('0.40', '0.00005'), enabled: true, driftThresholdPercent: '1.20' },
+  { fromAssetId: 'ETH', toAssetId: 'USDT', minAmount: '0.00500000', maxAmount: '50.00000000', feePolicy: feePolicy('0.40', '0.0005'), enabled: true, driftThresholdPercent: '1.00' },
+  // No threshold on purpose: exercises the "S4 gave no value, fall back to the
+  // default" branch that decision O-8 requires to exist.
   { fromAssetId: 'RUB', toAssetId: 'EUR', minAmount: '1000.00', maxAmount: '500000.00', feePolicy: feePolicy('0.60', '20.00'), enabled: true },
 ]
 
-/** Limits are normalised to a single accounting currency (RUB), per canonical §10.5. */
+/**
+ * Limits are normalised to a single accounting currency (RUB), per canonical
+ * §10.5. The YEARLY window exists so LIMIT_EXCEEDED_YEARLY is reachable: a code
+ * in the catalogue that nothing can ever raise is a code that is not tested.
+ */
 export const LIMITS: LimitBucket[] = [
-  { period: 'DAILY', limit: '500000.00', used: '180000.00', remaining: '320000.00', resetsAt: '2026-08-08T00:00:00.000Z', currency: 'RUB' },
-  { period: 'MONTHLY', limit: '5000000.00', used: '1240000.00', remaining: '3760000.00', resetsAt: '2026-09-01T00:00:00.000Z', currency: 'RUB' },
+  { period: 'DAILY', limit: '500000.00', used: '180000.00', remaining: '320000.00', resetsAt: '2026-08-08T00:00:00.000Z', resetTimeZone: 'UTC', currency: 'RUB' },
+  { period: 'MONTHLY', limit: '5000000.00', used: '1240000.00', remaining: '3760000.00', resetsAt: '2026-09-01T00:00:00.000Z', resetTimeZone: 'UTC', currency: 'RUB' },
+  // Remaining is deliberately BELOW the daily allowance: the annual window is
+  // the binding constraint in the 250 000–320 000 RUB band, which is the only
+  // way LIMIT_EXCEEDED_YEARLY can be reached at all — the buckets are evaluated
+  // daily-first, so a roomier yearly window would be dead code.
+  { period: 'YEARLY', limit: '30000000.00', used: '29750000.00', remaining: '250000.00', resetsAt: '2027-01-01T00:00:00.000Z', resetTimeZone: 'UTC', currency: 'RUB' },
 ]
 
 /** Cross-rates to RUB, used to normalise a request against the RUB-denominated limits. */

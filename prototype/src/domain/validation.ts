@@ -11,9 +11,9 @@
  * for both sources of truth.
  */
 
-import { ERROR_CATALOG, type ErrorCode, type ErrorSurface } from './errors'
+import { ERROR_CATALOG, LIMIT_CODE_BY_PERIOD, type ErrorCode, type ErrorSurface } from './errors'
 import { gt, isValidMoney, isZero, lt, PARTIAL_INPUT_PATTERN } from './money'
-import type { Asset, Balance, Money, PairConfig } from './types'
+import type { Asset, Balance, LimitPeriod, Money, PairConfig } from './types'
 import { formatAmount } from './money'
 
 export interface LocalValidationIssue {
@@ -30,7 +30,7 @@ export interface LocalValidationInput {
   balance: Balance | undefined
   /** Turnover limits, already normalised to the accounting currency. Optional:
    *  when absent the check is simply skipped and the server still enforces it. */
-  limits?: { period: 'DAILY' | 'MONTHLY'; remaining: Money; currency: string }[]
+  limits?: { period: LimitPeriod; remaining: Money; currency: string }[]
   /** Converts `amount` from the source asset into the limits' currency. */
   toLimitCurrency?: (assetId: string, amount: Money) => Money
 }
@@ -99,7 +99,11 @@ export function validateLocally(input: LocalValidationInput): LocalValidationIss
     const normalised = toLimitCurrency(fromAsset.assetId, amount)
     for (const bucket of limits) {
       if (gt(normalised, bucket.remaining)) {
-        return issue(bucket.period === 'DAILY' ? 'LIMIT_EXCEEDED_DAILY' : 'LIMIT_EXCEEDED_MONTHLY', {
+        // Must name the window that actually ran out: "Monthly limit reached"
+        // on an exhausted ANNUAL allowance is a false statement the user acts
+        // on (decision O-12). Same mapping as the server, so the message does
+        // not change when the request reaches the backend.
+        return issue(LIMIT_CODE_BY_PERIOD[bucket.period], {
           remaining: `${bucket.remaining} ${bucket.currency}`,
         })
       }

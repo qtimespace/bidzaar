@@ -27,12 +27,20 @@ export const ERROR_CODES = [
   'KYC_EXPIRED',
   'LIMIT_EXCEEDED_DAILY',
   'LIMIT_EXCEEDED_MONTHLY',
+  // S4 really can return a yearly breach. Collapsing it into MONTHLY showed the
+  // user a message about the wrong window, so the code exists rather than the
+  // lie being convenient (decision O-12).
+  'LIMIT_EXCEEDED_YEARLY',
   'SCORING_DENIED',
   'SCORING_REVIEW_REQUIRED',
   'USER_BLOCKED',
   'WALLET_FROZEN',
   'HOLD_FAILED',
   'IDEMPOTENCY_CONFLICT',
+  // Same key, same body, first attempt still running. Distinct from
+  // IDEMPOTENCY_CONFLICT because there is no conflict of payloads and the
+  // client should wait and retry rather than stop (canon O-14).
+  'REQUEST_IN_PROGRESS',
   'ORDER_CREATION_FAILED',
   'RATE_SERVICE_UNAVAILABLE',
   'EXCHANGE_SERVICE_UNAVAILABLE',
@@ -45,6 +53,21 @@ export const ERROR_CODES = [
 ] as const
 
 export type ErrorCode = (typeof ERROR_CODES)[number]
+
+/**
+ * Turnover window → error code (decision O-12).
+ *
+ * Lives here, in the domain, because BOTH the client pre-validation and the
+ * mock server must map a window the same way: a user who sees one message
+ * inline and a different one after pressing the button learns to distrust both.
+ * Collapsing YEARLY into MONTHLY named the wrong window and invited the wrong
+ * conclusion ("I'll wait until the 1st").
+ */
+export const LIMIT_CODE_BY_PERIOD = {
+  DAILY: 'LIMIT_EXCEEDED_DAILY',
+  MONTHLY: 'LIMIT_EXCEEDED_MONTHLY',
+  YEARLY: 'LIMIT_EXCEEDED_YEARLY',
+} as const satisfies Record<'DAILY' | 'MONTHLY' | 'YEARLY', ErrorCode>
 
 /**
  * Where the message is rendered.
@@ -94,12 +117,14 @@ export const ERROR_CATALOG: Record<ErrorCode, ErrorMeta> = {
   KYC_EXPIRED: { status: 403, retryable: false, surface: 'banner', message: 'Your verification has expired' },
   LIMIT_EXCEEDED_DAILY: { status: 422, retryable: false, surface: 'field', message: 'Daily limit reached. Available today: {remaining}' },
   LIMIT_EXCEEDED_MONTHLY: { status: 422, retryable: false, surface: 'field', message: 'Monthly limit reached' },
+  LIMIT_EXCEEDED_YEARLY: { status: 422, retryable: false, surface: 'field', message: 'Yearly limit reached' },
   SCORING_DENIED: { status: 403, retryable: false, surface: 'banner', message: 'Operation declined. Contact support.' },
   SCORING_REVIEW_REQUIRED: { status: 202, retryable: false, surface: 'banner', message: 'Sent for manual review' },
   USER_BLOCKED: { status: 403, retryable: false, surface: 'banner', message: 'Account is restricted' },
   WALLET_FROZEN: { status: 403, retryable: false, surface: 'banner', message: 'Wallet is temporarily frozen' },
   HOLD_FAILED: { status: 409, retryable: true, surface: 'banner', message: 'Could not reserve funds. Try again.' },
   IDEMPOTENCY_CONFLICT: { status: 409, retryable: false, surface: 'banner', message: 'Conflicting request' },
+  REQUEST_IN_PROGRESS: { status: 409, retryable: true, surface: 'banner', message: 'Still processing your previous attempt' },
   ORDER_CREATION_FAILED: { status: 500, retryable: true, surface: 'banner', message: 'Something went wrong. Try again.' },
   RATE_SERVICE_UNAVAILABLE: { status: 503, retryable: true, surface: 'banner', message: 'Rates are temporarily unavailable' },
   EXCHANGE_SERVICE_UNAVAILABLE: { status: 503, retryable: true, surface: 'banner', message: 'Exchange is temporarily unavailable' },

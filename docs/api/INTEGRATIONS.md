@@ -551,9 +551,9 @@ S3 — единственная система, чей нормальный от
   "eventType": "risk.case.resolved",
   "occurredAt": "2026-08-07T14:02:11.900Z",
   "sequence": 7,
-  "caseId": "case_01J9X3C6N7P8Q9R0S1T2U3V4W5",
+  "caseId": "case_01J9X3C6N7P8Q9R0S1T2W3V4W5",
   "userId": "usr_01J8ZQ4H9K2M3N4P5R6S7T8V9W",
-  "orderId": "ord_01J9X3C6N7P8Q9R0S1T2U3V4W5",
+  "orderId": "ord_01J9X3C6N7P8Q9R0S1T2W3V4W5",
   "resolution": "REJECTED",
   "resolvedBy": "compliance_officer_17",
   "comment": null
@@ -1316,7 +1316,7 @@ S8 — **последний** вызов в цепочке (шаг 19) и точ
 
 | Поле | Тип | Обяз. | Семантика | Пример | Если отсутствует |
 |------|-----|-------|-----------|--------|-------------------|
-| `orderId` | string `^ord_[ULID]$` | да | Идентификатор заявки. **То, ради чего всё** | `ord_01J9X3B5M6N7P8Q9R0S1T2U3V4` | **Критично.** Отказ + компенсация hold + алерт |
+| `orderId` | string `^ord_[ULID]$` | да | Идентификатор заявки. **То, ради чего всё** | `ord_01J9X3B5M6N7P8Q9R0S1T2W3V4` | **Критично.** Отказ + компенсация hold + алерт |
 | `status` | enum `PENDING / MANUAL_REVIEW / REJECTED / EXECUTING / COMPLETED / FAILED / EXPIRED` | да | Состояние (§8). `VALIDATING` наружу не отдаётся | `PENDING` | Отказ + компенсация |
 | `userId` / `walletId` | string | да | Владелец | `usr_…` / `wlt_…` | Логируем аномалию |
 | `quoteId` | uuid | да | Котировка-основание | `8f14e45f-…` | Логируем аномалию |
@@ -1356,12 +1356,12 @@ S8 — **последний** вызов в цепочке (шаг 19) и точ
   "eventType": "order.status.changed",
   "occurredAt": "2026-08-07T10:15:44.020Z",
   "sequence": 2,
-  "orderId": "ord_01J9X3B5M6N7P8Q9R0S1T2U3V4",
+  "orderId": "ord_01J9X3B5M6N7P8Q9R0S1T2W3V4",
   "userId": "usr_01J8ZQ4H9K2M3N4P5R6S7T8V9W",
   "previousStatus": "PENDING",
   "currentStatus": "EXECUTING",
   "statusReason": null,
-  "holdId": "hld_01J9X3B5M6N7P8Q9R0S1T2U3V5",
+  "holdId": "hld_01J9X3B5M6N7P8Q9R0S1T2W3V5",
   "version": 2,
   "correlationId": "01J9X2C4K7QF8N3M5T6V7W8Y9Z"
 }

@@ -238,6 +238,169 @@ const frozenB = await getIndicativeRate('RUB', 'USDT')
 check('rateTick=off freezes the market', frozenA.rate === frozenB.rate, `${frozenA.rate} -> ${frozenB.rate}`)
 check('frozen rate is the published fixture rate', frozenA.rate === '0.010638297872', frozenA.rate)
 
+// 7. Contract conformance for the API surface the UI does not exercise.
+//
+// Decisions O-8..O-17 added branches that no user action can reach: the screen
+// never sends `side: BUY`, never names a consent bound and never searches by
+// idempotency key. A branch whose only consumer is a test is still better than
+// a branch with no consumer at all — without these the code would be present
+// but unproven, and its first real call would happen in production.
+const api = await import('../src/api/exchangeApi')
+const { LIMITS, PAIRS } = await import('../src/api/fixtures')
+const { ApiError } = await import('../src/domain/errors')
+
+const codeOf = async (run: () => Promise<unknown>): Promise<string> => {
+  try {
+    await run()
+    return 'NO_ERROR'
+  } catch (error) {
+    return error instanceof ApiError ? error.code : `UNEXPECTED:${String(error)}`
+  }
+}
+
+const RUB = { assetId: 'RUB' as const, network: undefined }
+const USDT = { assetId: 'USDT' as const, network: 'TRON' as const }
+
+// O-9: the side is part of the contract; the reverse mode is a declared stub.
+const buyCode = await codeOf(() =>
+  api.createQuote({ fromAsset: RUB, toAsset: USDT, side: 'BUY', toAmount: '100.000000' }),
+)
+check('side=BUY is rejected as unimplemented, not silently mispriced', buyCode === 'VALIDATION_ERROR', buyCode)
+const bothCode = await codeOf(() =>
+  api.createQuote({ fromAsset: RUB, toAsset: USDT, side: 'SELL', fromAmount: '10000.00', toAmount: '100.000000' }),
+)
+check('side=SELL rejects a toAmount', bothCode === 'VALIDATION_ERROR', bothCode)
+const neitherCode = await codeOf(() => api.createQuote({ fromAsset: RUB, toAsset: USDT, side: 'SELL' }))
+check('a quote request with no amount is rejected', neitherCode === 'VALIDATION_ERROR', neitherCode)
+
+// Omitting `side` must behave exactly as before — that is what makes O-9 a
+// compatible change rather than a breaking one.
+const legacyQuote = await api.createQuote({ fromAsset: RUB, toAsset: USDT, fromAmount: '10000.00' })
+check('omitting side defaults to SELL', legacyQuote.quote.side === 'SELL', legacyQuote.quote.side)
+check('quote carries the originally requested amount', legacyQuote.quote.requestedAmount === '10000.00', legacyQuote.quote.requestedAmount)
+check('legacy request still prices identically', legacyQuote.quote.toAmount === '106.010638', legacyQuote.quote.toAmount)
+
+// O-8: the threshold is a property of the pair, and a pair without one is a
+// degraded quote rather than a silently normal one.
+const rubUsdt = PAIRS.find((p) => p.fromAssetId === 'RUB' && p.toAssetId === 'USDT')!
+const rubBtc = PAIRS.find((p) => p.fromAssetId === 'RUB' && p.toAssetId === 'BTC')!
+const rubEur = PAIRS.find((p) => p.fromAssetId === 'RUB' && p.toAssetId === 'EUR')!
+check('drift threshold is per pair, not global', api.driftThresholdFor(rubBtc) > api.driftThresholdFor(rubUsdt), `${api.driftThresholdFor(rubUsdt)} vs ${api.driftThresholdFor(rubBtc)}`)
+check('a pair without a threshold falls back to the default', api.driftThresholdFor(rubEur) === api.DEFAULT_RATE_DRIFT_THRESHOLD_PERCENT, String(api.driftThresholdFor(rubEur)))
+const eurQuote = await api.createQuote({ fromAsset: RUB, toAsset: { assetId: 'EUR' }, fromAmount: '10000.00' })
+check('a defaulted threshold marks the quote degraded', eurQuote.quote.degraded === true)
+check('a configured threshold leaves the quote undegraded', legacyQuote.quote.degraded === false)
+
+// O-12: the yearly window must be reachable, or the code is decoration.
+const yearly = LIMITS.find((b) => b.period === 'YEARLY')!
+const daily = LIMITS.find((b) => b.period === 'DAILY')!
+check('a yearly window exists in the fixtures', Boolean(yearly))
+check('yearly carries a reset zone', yearly.resetTimeZone === 'UTC', yearly.resetTimeZone)
+check(
+  'the yearly window is the binding one in its band',
+  Number(yearly.remaining) < Number(daily.remaining),
+  `${yearly.remaining} < ${daily.remaining}`,
+)
+const yearlyCode = await codeOf(() =>
+  api.createOrder({
+    quoteId: legacyQuote.quote.quoteId,
+    fromAsset: RUB,
+    toAsset: USDT,
+    fromAmount: '10000.00',
+    expectedToAmount: legacyQuote.quote.toAmount,
+    expectedRate: legacyQuote.quote.rate,
+    idempotencyKey: 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee',
+  }),
+)
+check('a normal amount clears every limit window', yearlyCode === 'NO_ERROR', yearlyCode)
+
+// The amount below sits between the yearly and the daily allowance, so only
+// the annual window can refuse it. Limits are step 15 and the balance is step
+// 17, so this reports the limit rather than INSUFFICIENT_FUNDS.
+const bigQuote = await api.createQuote({ fromAsset: RUB, toAsset: USDT, fromAmount: '300000.00' })
+const bigCode = await codeOf(() =>
+  api.createOrder({
+    quoteId: bigQuote.quote.quoteId,
+    fromAsset: RUB,
+    toAsset: USDT,
+    fromAmount: '300000.00',
+    expectedToAmount: bigQuote.quote.toAmount,
+    expectedRate: bigQuote.quote.rate,
+    idempotencyKey: 'aaaaaaaa-bbbb-4ccc-8ddd-ffffffffffff',
+  }),
+)
+check('an exhausted annual allowance names the YEARLY window', bigCode === 'LIMIT_EXCEEDED_YEARLY', bigCode)
+
+// O-18: the threshold is one-sided. A move in the user's favour, however large,
+// must NOT raise RATE_CHANGED — the quote is honoured at its locked rate, the
+// user receives what they confirmed, and the difference stays with the system.
+const { adverseRateDriftPercent, rateDriftPercent } = await import('../src/domain/money')
+const quoted = '0.010638297872'
+const fell = '0.010000000000'
+const rose = '0.011500000000'
+check('a falling rate counts as adverse drift', adverseRateDriftPercent(quoted, fell) > 0, adverseRateDriftPercent(quoted, fell).toFixed(4))
+check('a rising rate is not adverse drift', adverseRateDriftPercent(quoted, rose) === 0, adverseRateDriftPercent(quoted, rose).toFixed(4))
+check('the absolute measure still sees both', rateDriftPercent(quoted, rose) > 0 && rateDriftPercent(quoted, fell) > 0)
+
+// End to end: a +5 % move is far beyond every pair threshold in the fixtures,
+// yet the order must go through at the QUOTED rate with no banner.
+const favQuote = await api.createQuote({ fromAsset: RUB, toAsset: USDT, fromAmount: '10000.00' })
+dom.reconfigure({ url: 'http://localhost:5173/?rateTickMs=100&rateTickFactor=1.05' })
+await sleep(250)
+let favOrder: Awaited<ReturnType<typeof api.createOrder>> | null = null
+const favCode = await codeOf(async () => {
+  favOrder = await api.createOrder({
+    quoteId: favQuote.quote.quoteId,
+    fromAsset: RUB,
+    toAsset: USDT,
+    fromAmount: '10000.00',
+    expectedToAmount: favQuote.quote.toAmount,
+    expectedRate: favQuote.quote.rate,
+    idempotencyKey: 'bbbbbbbb-cccc-4ddd-8eee-111111111111',
+  })
+  return favOrder
+})
+check('a favourable move beyond the threshold does not raise RATE_CHANGED', favCode === 'NO_ERROR', favCode)
+check(
+  'a favourable move executes at the quoted rate',
+  favOrder !== null && favOrder!.order.rate === favQuote.quote.rate,
+  `${favOrder?.order.rate} vs quoted ${favQuote.quote.rate}`,
+)
+check(
+  'the user receives exactly the confirmed amount',
+  favOrder !== null && favOrder!.order.toAmount === favQuote.quote.toAmount,
+  `${favOrder?.order.toAmount} vs confirmed ${favQuote.quote.toAmount}`,
+)
+
+// The mirror case: the same magnitude against the system is still refused.
+const advQuote = await api.createQuote({ fromAsset: RUB, toAsset: USDT, fromAmount: '10000.00' })
+dom.reconfigure({ url: 'http://localhost:5173/?rateTickMs=100&rateTickFactor=0.95' })
+await sleep(250)
+const advCode = await codeOf(() =>
+  api.createOrder({
+    quoteId: advQuote.quote.quoteId,
+    fromAsset: RUB,
+    toAsset: USDT,
+    fromAmount: '10000.00',
+    expectedToAmount: advQuote.quote.toAmount,
+    expectedRate: advQuote.quote.rate,
+    idempotencyKey: 'bbbbbbbb-cccc-4ddd-8eee-222222222222',
+  }),
+)
+check('an adverse move of the same size is still refused', advCode === 'RATE_CHANGED', advCode)
+dom.reconfigure({ url: 'http://localhost:5173/?rateTick=off' })
+
+// O-10/O-17: recovery by key is a filter over a collection — an empty result,
+// never a 404.
+const found = await api.findOrderByIdempotencyKey('aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee')
+check('a known key returns exactly one order', found.total === 1 && found.items.length === 1, String(found.total))
+check('the recovered order is the one that was created', found.items[0]?.idempotencyKey === 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee')
+check('the recovered order carries the audit side', found.items[0]?.side === 'SELL', String(found.items[0]?.side))
+const missing = await api.findOrderByIdempotencyKey('00000000-0000-4000-8000-000000000000')
+check('an unknown key returns an empty collection, not an error', missing.total === 0 && missing.items.length === 0)
+const noKeyCode = await codeOf(() => api.findOrderByIdempotencyKey(''))
+check('searching without a key is rejected', noKeyCode === 'VALIDATION_ERROR', noKeyCode)
+
 }
 
 main().then(

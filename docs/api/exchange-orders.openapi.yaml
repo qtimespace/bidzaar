@@ -5,178 +5,28 @@ info:
   version: 1.0.0
   summary: Создание заявки на обмен валют из внутреннего кошелька
   description: |
-    # Exchange BFF API
+    Backend-for-Frontend экрана «Обмен валют» внутреннего кошелька: от открытия экрана
+    до получения `orderId` в статусе `PENDING`. Фронтенд ходит **только** в этот API;
+    девять внешних систем (S1..S9) оркеструются на стороне BFF и наружу не видны.
 
-    Backend-for-Frontend экрана «Обмен валют» внутреннего кошелька. Фронтенд ходит
-    **только** в этот API; девять внешних систем (S1..S9) оркеструются на стороне BFF
-    и наружу не видны. Контракты внешних систем описаны в `docs/api/INTEGRATIONS.md`
-    и `docs/api/integrations/*.yaml`.
+    Создание заявки двухфазное: `POST /v1/exchange/quotes` фиксирует расчёт на TTL
+    котировки, `POST /v1/exchange-orders` подтверждает конкретный `quoteId`.
+    Все денежные величины и курсы — строки (`DecimalString`), `number` запрещён.
+    Все ошибки — `application/problem+json`, клиент ветвится только по `code`.
 
-    Нормативный источник имён, кодов ошибок, порядка валидации, правил денег и
-    округления — `docs/00-canonical-model.md`. Любое расхождение спецификации с
-    каноном считается дефектом спецификации.
+    Нормативные источники, расхождение с которыми считается дефектом этой
+    спецификации:
 
-    ## Скоуп
+    - `docs/00-canonical-model.md` — домен, денежная арифметика и округление (§5),
+      цепочка проверок (§6), каталог кодов ошибок (§7), НФТ и пороги (§11);
+    - `docs/api/API-Design.md` — обоснование контракта: почему поля устроены именно
+      так, правила выбора кода, политика версионирования и депрекации;
+    - `docs/api/INTEGRATIONS.md` и `docs/api/integrations/*.yaml` — контракты S1..S9;
+    - `docs/10-api-requirements.md` — реестр требований и классификация изменений.
 
-    От открытия экрана до получения `orderId` в статусе `PENDING`. Исполнение заявки,
-    matching, проводки, ончейн-транзакции, история операций — вне скоупа.
-
-    ## Модель quote → order
-
-    Создание заявки — **двухфазный** процесс, и это осознанное решение, а не лишний
-    round-trip:
-
-    1. `POST /v1/exchange/quotes` — сервер фиксирует курс, комиссию и обе суммы,
-       возвращает `quoteId` и `expiresAt` (**TTL = 15 секунд**). Котировка — отдельный
-       ресурс, её можно перечитать через `GET /v1/exchange/quotes/{quoteId}`.
-       Построение котировки **не резервирует средства** и **не создаёт заявку**.
-    2. `POST /v1/exchange-orders` — клиент подтверждает **конкретную** котировку по
-       `quoteId` и дублирует в теле то, что он показал пользователю: `expectedToAmount`
-       и `expectedRate`.
-
-    Дублирование ожидаемых значений — это защита от рассинхрона «то, что видел
-    пользователь» и «то, что посчитал сервер». Сервер пересчитывает всё заново и
-    сравнивает:
-
-    - параметры запроса не совпали с сохранённой котировкой → `QUOTE_MISMATCH` (409);
-    - котировка валидна, но живой курс уехал больше порога → `RATE_CHANGED` (409);
-    - `now >= expiresAt` → `QUOTE_EXPIRED` (409);
-    - котировка уже израсходована другой заявкой → `QUOTE_ALREADY_USED` (409).
-
-    Порог дрейфа курса — **0.20 %**. Флаг `acceptRateChange: true` означает, что
-    пользователь заранее согласился на дрейф **в пределах порога**: сервер применит
-    свежий курс молча. Дрейф **сверх** порога возвращает `RATE_CHANGED` независимо от
-    значения флага — согласие «на любой курс» не предусмотрено конструкцией.
-
-    ## Идемпотентность
-
-    `POST /v1/exchange-orders` требует заголовок `Idempotency-Key` (UUIDv4).
-    Окно хранения — 24 часа. Ключ хранится вместе с хешем канонизированного тела:
-
-    - повтор с **тем же** телом → тот же `201`/`202` и тот же `orderId`,
-      ответ помечается заголовком `X-Idempotent-Replay: true`;
-    - повтор с **другим** телом → `409 IDEMPOTENCY_CONFLICT`;
-    - параллельный повтор, пока первый запрос ещё в обработке → `409 IDEMPOTENCY_CONFLICT`
-      с `retryable: true` и `Retry-After`.
-
-    `POST /v1/exchange/quotes` идемпотентности не требует: котировка дешёвая,
-    побочных эффектов не создаёт, повтор безопасен.
-
-    ## Деньги и округление
-
-    Все денежные величины и курсы — **строки** с десятичной записью
-    (`"25450.00"`, `"0.010638297872"`). `number` в денежных полях **запрещён** на всём
-    пути: JSON, BFF, состояние фронтенда, отображение. Причина прозаична — IEEE-754
-    не представляет `0.1` точно, а расхождение в последнем знаке в финтехе это дефект.
-
-    Регулярное выражение валидации: `^(0|[1-9]\d{0,18})(\.\d{1,18})?$` (неотрицательное,
-    без ведущих нулей, без экспоненциальной записи, без знака).
-
-    Направление курса: `rate` = сколько единиц `toAsset` даётся за **одну** единицу
-    `fromAsset`. `inverseRate` считается BFF и служит **только** для отображения.
-
-    Режим комиссии — `INCLUDED_IN_SOURCE`: комиссия удерживается **внутри** введённой
-    суммы, а не сверху. Порядок расчёта:
-
-    ```
-    feeRaw        = fromAmount * percent / 100
-    feeAmount     = clamp(feeRaw, minFee, maxFee), ROUND_UP до decimals(fromAsset)
-    netFromAmount = fromAmount - feeAmount
-    toAmount      = netFromAmount * rate, ROUND_DOWN до decimals(toAsset)
-    ```
-
-    `ROUND_UP` для комиссии и `ROUND_DOWN` для суммы получения — детерминированно и
-    никогда не в убыток системе. Banker's rounding не применяется: он недетерминирован
-    для ревизии. Инварианты, проверяемые сервером:
-
-    ```
-    I1: feeAmount + netFromAmount == fromAmount   (точное равенство)
-    I2: toAmount <= netFromAmount * rate
-    I3: fromAmount <= balance.available(fromAsset)
-    I4: все величины >= 0
-    I5: decimals(value) <= decimals(asset)
-    ```
-
-    Обмен внутренний: активы перемещаются между балансами одного кошелька,
-    ончейн-транзакций нет, поэтому `networkFee` всегда `"0"`. Поле сохранено, потому
-    что сеть получения (`USDT@TRON` против `USDT@ETHEREUM`) определяет стоимость
-    будущего вывода — пользователь должен видеть выбор уже на обмене.
-
-    ## Порядок валидации
-
-    Сервер выполняет проверки строго по цепочке §6 канона, fail-fast. Порядок
-    нормативен: он делает ошибку **детерминированной**, когда нарушено несколько
-    условий сразу.
-
-    | # | Проверка | Код при провале |
-    |---|----------|-----------------|
-    | 1 | схема, формат сумм, обязательные поля | `VALIDATION_ERROR` |
-    | 2 | идемпотентность | `IDEMPOTENCY_CONFLICT` |
-    | 3 | активы существуют и включены | `ASSET_NOT_SUPPORTED` |
-    | 4 | `fromAsset != toAsset` с учётом сети | `SAME_ASSET_PAIR` |
-    | 5 | пара разрешена | `PAIR_NOT_SUPPORTED` |
-    | 6 | котировка существует | `QUOTE_NOT_FOUND` |
-    | 7 | котировка не использована | `QUOTE_ALREADY_USED` |
-    | 8 | котировка не истекла | `QUOTE_EXPIRED` |
-    | 9 | параметры совпадают с котировкой | `QUOTE_MISMATCH` |
-    | 10 | курс в пределах порога | `RATE_CHANGED` |
-    | 11 | `fromAmount >= minAmount` | `AMOUNT_BELOW_MINIMUM` |
-    | 12 | `fromAmount <= maxAmount` | `AMOUNT_ABOVE_MAXIMUM` |
-    | 13 | пользователь активен, кошелёк не заморожен | `USER_BLOCKED` / `WALLET_FROZEN` |
-    | 14 | KYC достаточен и не истёк | `KYC_*` |
-    | 15 | лимиты оборота | `LIMIT_EXCEEDED_DAILY` / `LIMIT_EXCEEDED_MONTHLY` |
-    | 16 | скоринг | `SCORING_DENIED` / `SCORING_REVIEW_REQUIRED` |
-    | 17 | достаточно available-баланса | `INSUFFICIENT_FUNDS` |
-    | 18 | резерв создан | `HOLD_FAILED` |
-    | 19 | заявка зарегистрирована | `ORDER_CREATION_FAILED` |
-
-    Проверки соответствия (13–16) идут **перед** проверкой баланса: неверифицированный
-    пользователь не должен по различию текстов ошибок узнавать состояние чужих лимитов
-    и балансов. Это утечка информации и вектор перебора.
-
-    ## Ошибки
-
-    Все ошибки — `application/problem+json` (RFC 9457, расширенный полями `code`,
-    `correlationId`, `timestamp`, `params`, `retryable`). Фронтенд ветвится **только**
-    по `code`, никогда по `title`/`detail` — они локализуемы и не являются контрактом.
-
-    `SCORING_REVIEW_REQUIRED` — единственный код каталога, который возвращается
-    **не как ошибка**: это `202 Accepted` с телом заявки в статусе `MANUAL_REVIEW`.
-
-    ## Версионирование
-
-    Версия в пути: `/v1`. Ломающее изменение (удаление поля, сужение типа, новый
-    обязательный параметр запроса, изменение семантики кода ошибки) = новый major
-    и новый путь `/v2`. Неломающие изменения выкатываются в `/v1`:
-    добавление необязательного поля запроса, добавление поля ответа, добавление
-    нового значения в enum **ответа** (клиент обязан обрабатывать неизвестные
-    значения `status` как «неизвестный, не терминальный»). Добавление нового значения
-    в enum **запроса** неломающее, в enum ответа `OrderStatus` — требует
-    предварительного объявления. Депрекация — минимум 90 дней, заголовки
-    `Deprecation` и `Sunset` (RFC 9745 / RFC 8594).
-
-    ## Rate limiting
-
-    Все ответы несут `X-RateLimit-Limit`, `X-RateLimit-Remaining`, `X-RateLimit-Reset`.
-    Превышение → `429 RATE_LIMITED` с `Retry-After`. Бюджеты (на пользователя):
-    `POST /v1/exchange/quotes` — 60 запросов в минуту (клиентский дебаунс ввода 300 мс
-    делает это достижимым только при аномальной активности);
-    `POST /v1/exchange-orders` — 10 запросов в минуту;
-    `GET`-эндпоинты — 120 запросов в минуту.
-
-    ## Бюджеты задержки
-
-    `POST /v1/exchange-orders`: p95 <= 900 мс, p99 <= 2000 мс.
-    `POST /v1/exchange/quotes`: p95 <= 300 мс.
-    Превышение бюджета вышестоящей системой отдаётся как `504 UPSTREAM_TIMEOUT`,
-    полный отказ — как `503`.
-
-    ## Аутентификация
-
-    В контракте описана (`Bearer` JWT + `X-User-Id` от gateway). **В прототипе не
-    используется** по требованию заказчика: mock-сервер принимает запросы без
-    заголовка `Authorization`. Схема оставлена в спецификации, чтобы контракт был
-    пригоден к передаче в разработку без переписывания.
+    Версия в пути: `/v1`; ломающее изменение = новый major. Депрекация — минимум
+    90 дней, заголовки `Deprecation` и `Sunset` (RFC 9745 / RFC 8594).
+    Обоснование — `docs/api/API-Design.md` §7.1.
   contact:
     name: Wallet Platform Team
     email: wallet-platform@example.internal
@@ -204,12 +54,14 @@ tags:
     description: Балансы внутреннего кошелька. Все проверки достаточности средств ведутся по `available`.
   - name: Quotes
     description: |
-      Котировки. Ресурс с коротким временем жизни (TTL 15 с), фиксирующий курс,
-      комиссию и обе суммы. Построение котировки не резервирует средства.
+      Котировки. Ресурс с TTL 15 с, фиксирующий курс, комиссию и обе суммы.
+      Построение котировки не резервирует средства.
+      См. `docs/api/API-Design.md` §1.1, §1.5.
   - name: Exchange Orders
     description: |
-      Заявки на обмен. Главный ресурс API. Создаются только на основании валидной
-      неиспользованной котировки. Терминальное состояние в рамках скоупа — `PENDING`.
+      Заявки на обмен. Создаются только на основании валидной неиспользованной
+      котировки. Терминальное состояние в рамках скоупа — `PENDING`.
+      См. `docs/api/API-Design.md` §1.1.
 
 paths:
 
@@ -218,14 +70,11 @@ paths:
       operationId: listExchangeAssets
       summary: Список активов, доступных для обмена
       description: |
-        Возвращает справочник активов кошелька: фиат и крипто. Для крипто-активов
-        `network` обязателен — `USDT@TRON` и `USDT@ETHEREUM` это **разные** активы
-        и разные балансы.
-
-        Данные агрегируются из S4 (Limits & Fees) и S7 (Crypto Provider).
-        Кешируются на 5 минут; при недоступности источника отдаётся устаревший
-        снимок (stale-while-revalidate) с `degraded: true` — список активов не
-        меняется часто, и блокировать из-за него экран нельзя.
+        Справочник активов кошелька. Для `type: CRYPTO` поле `network` обязательно:
+        `USDT@TRON` и `USDT@ETHEREUM` — разные активы и разные балансы.
+        Кеш 5 минут, при недоступности источника — устаревший снимок с
+        `degraded: true`.
+        Обоснование — `docs/api/API-Design.md` §3.5, §8.
       tags: [Assets]
       parameters:
         - $ref: '#/components/parameters/CorrelationIdHeader'
@@ -255,17 +104,11 @@ paths:
       operationId: listExchangePairs
       summary: Доступные пары обмена с лимитами и комиссиями
       description: |
-        Возвращает **направленные** пары: `RUB→USDT` и `USDT→RUB` конфигурируются
-        независимо и могут иметь разные комиссии, лимиты и статус включения.
-
-        Ответ содержит всё, что нужно клиенту для предвалидации без обращения к
-        серверу: `minAmount`, `maxAmount`, `feePolicy`, а также снимок лимитов
-        оборота пользователя (`userLimits`). Клиентская предвалидация **не заменяет**
-        серверную — сервер прогоняет всю цепочку §6 заново при создании заявки.
-
-        Источник: S4 (Limits & Fees). Кеш конфигурации пар 5 минут, схемы комиссий
-        60 секунд, оба допускают stale. Снимок `userLimits` персонален и не кешируется
-        между пользователями.
+        Направленные пары обмена с лимитами операции, комиссиями, порогом дрейфа
+        (`driftThresholdPercent`) и снимком лимитов оборота пользователя.
+        `RUB→USDT` и `USDT→RUB` конфигурируются независимо.
+        Клиентская предвалидация по этим данным **не заменяет** серверную.
+        Обоснование — `docs/api/API-Design.md` §1.6, §4.1, §5.
       tags: [Assets]
       parameters:
         - $ref: '#/components/parameters/CorrelationIdHeader'
@@ -297,17 +140,11 @@ paths:
       operationId: getWalletBalances
       summary: Балансы кошелька (total / held / available)
       description: |
-        Балансы текущего пользователя. `wallet` — singleton-ресурс: у пользователя
-        один внутренний кошелёк, поэтому идентификатор в пути не нужен и не
-        принимается (передача чужого `walletId` в путь — типовой вектор IDOR,
-        которого здесь просто нет).
-
-        Инвариант каждой строки: `available = total − held`, всегда `>= 0`.
-        **Все** проверки достаточности средств — и клиентские, и серверные — ведутся
-        только по `available`.
-
-        Источник: S6 (Accounting). Балансы **не кешируются**: устаревший баланс в
-        финтехе хуже, чем отсутствующий. При недоступности S6 возвращается `503`.
+        Балансы текущего пользователя. `wallet` — singleton-ресурс, идентификатор
+        кошелька в пути не принимается. Инвариант каждой строки:
+        `available = total − held`, всегда `>= 0`. Проверки достаточности средств
+        ведутся **только** по `available`. Балансы не кешируются.
+        Обоснование — `docs/api/API-Design.md` §7.5, §8.
       tags: [Wallet]
       parameters:
         - $ref: '#/components/parameters/CorrelationIdHeader'
@@ -337,28 +174,18 @@ paths:
       operationId: createQuote
       summary: Построить котировку (НЕ создаёт заявку)
       description: |
-        Строит котировку: фиксирует курс, комиссию, `netFromAmount` и `toAmount`
-        на **15 секунд** и возвращает `quoteId`.
+        Строит котировку на **15 секунд** и возвращает `quoteId`. Не создаёт заявку,
+        не резервирует средства, не расходует лимиты, не вызывает скоринг.
+        `Idempotency-Key` не требуется. Ответ `201 Created` с заголовком `Location`.
 
-        Это **не** создание заявки. Средства не резервируются, лимиты не
-        расходуются, скоринг не вызывается. Единственный побочный эффект —
-        появление короткоживущей записи в quote store, поэтому метод безопасно
-        повторять и он не требует `Idempotency-Key`.
+        Сторона расчёта задаётся полем `side` (решение O-9): `SELL` — задана сумма
+        списания `fromAmount`, `BUY` — задана сумма получения `toAmount`.
+        Клиент отображает возвращённые суммы как есть и **не** пересчитывает их.
 
-        Метод `POST`, а не `GET`, потому что котировка — **создаваемый ресурс** с
-        собственным идентификатором, сроком жизни и одноразовым расходованием.
-        Ответ `201 Created` с заголовком `Location`.
-
-        Расчёт ведётся строго по §5.3 канона (режим `INCLUDED_IN_SOURCE`).
-        Клиент **не должен** пересчитывать суммы самостоятельно для отображения
-        итога: он показывает то, что вернул сервер, иначе на границе округления
-        UI и сервер разойдутся.
-
-        Если S5 (Exchange Rate) отдал устаревший курс возрастом до 10 секунд,
-        котировка строится и помечается `degraded: true`; старше — `503
-        RATE_SERVICE_UNAVAILABLE`. Если недоступен S7 (Crypto Provider),
-        котировка строится без проверки проскальзывания и тоже помечается
-        `degraded: true` — S7 деградируемый и не блокирует обмен.
+        Устаревший курс от S5 возрастом до 10 с → котировка с `degraded: true`;
+        старше — `503 RATE_SERVICE_UNAVAILABLE`. Недоступность S7 → `degraded: true`
+        и `slippageWarning: null`, обмен не блокируется.
+        Обоснование — `docs/api/API-Design.md` §1.1, §1.3, §3.2, §8.
       tags: [Quotes]
       parameters:
         - $ref: '#/components/parameters/CorrelationIdHeader'
@@ -368,8 +195,10 @@ paths:
           application/json:
             schema: { $ref: '#/components/schemas/QuoteCreateRequest' }
             examples:
-              rubToUsdt:
+              sell:
                 $ref: '#/components/examples/QuoteCreateRequestExample'
+              buy:
+                $ref: '#/components/examples/QuoteCreateRequestBuyExample'
       responses:
         '201':
           description: Котировка построена.
@@ -384,7 +213,8 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/Quote' }
               examples:
-                rubToUsdt: { $ref: '#/components/examples/QuoteExample' }
+                sell: { $ref: '#/components/examples/QuoteExample' }
+                buy: { $ref: '#/components/examples/QuoteBuyExample' }
                 degraded: { $ref: '#/components/examples/QuoteDegradedExample' }
         '400': { $ref: '#/components/responses/BadRequest400' }
         '403': { $ref: '#/components/responses/Forbidden403' }
@@ -399,17 +229,11 @@ paths:
       operationId: getQuote
       summary: Получить котировку по идентификатору
       description: |
-        Возвращает ранее построенную котировку. Нужен, чтобы клиент мог
-        восстановить состояние после перезагрузки страницы или проверить
-        актуальность перед отправкой заявки, не строя новую котировку.
-
-        Котировка возвращается и после истечения `expiresAt` — с
-        `status: EXPIRED`, чтобы клиент мог отличить «истекла» от «не существует»
-        и показать корректный баннер. Через 5 минут после истечения запись
-        удаляется и метод отдаёт `404 QUOTE_NOT_FOUND`.
-
-        Котировка, принадлежащая другому пользователю, возвращает `404`, а не
-        `403`: наличие или отсутствие чужого `quoteId` не должно быть наблюдаемым.
+        Возвращает ранее построенную котировку, **включая истёкшую**
+        (`status: EXPIRED`), в течение 5 минут после `expiresAt`; дальше —
+        `404 QUOTE_NOT_FOUND`. Чтение не потребляет котировку.
+        Котировка другого пользователя даёт `404`, а не `403`.
+        Обоснование — `docs/api/API-Design.md` §1.5.
       tags: [Quotes]
       parameters:
         - $ref: '#/components/parameters/CorrelationIdHeader'
@@ -437,74 +261,83 @@ paths:
         '504': { $ref: '#/components/responses/GatewayTimeout504' }
 
   /v1/exchange-orders:
+
+    get:
+      operationId: findExchangeOrderByIdempotencyKey
+      summary: Найти заявку по ключу идемпотентности (восстановление состояния)
+      description: |
+        Восстановление состояния клиентом, потерявшим ответ на `POST` (решения O-10,
+        O-17). Фильтр над коллекцией заявок по ключу идемпотентности.
+
+        Ответ — **всегда `200`** с конвертом коллекции: ноль или один элемент.
+        Фильтр, не давший совпадений, — пустая коллекция (`total: 0`), а не
+        отсутствующий ресурс, поэтому `404` здесь не возвращается никогда.
+        Найденный элемент идентичен телу, которое вернул бы исходный `POST`.
+
+        Это **не** история операций: параметр `idempotencyKey` обязателен, других
+        фильтров, курсоров и пагинации нет, в коллекции не может быть больше одного
+        элемента.
+
+        **Область видимости.** Поиск выполняется только в пределах заявок
+        пользователя, определённого токеном: условие поиска — `userId` из токена
+        **и** `idempotencyKey` из запроса одновременно. Ключ, созданный другим
+        пользователем, не находится ни при каких условиях и отдаётся как пустая
+        коллекция. Именно это ограничение, а не выбор HTTP-статуса, делает перебор
+        ключей бессмысленным.
+
+        Rate limit на этот маршрут **строже** общего `GET`-бюджета. Ключ не должен
+        попадать в access-логи. Обоснование — `docs/api/API-Design.md` §2.6, §7.2.
+      tags: [Exchange Orders]
+      parameters:
+        - $ref: '#/components/parameters/CorrelationIdHeader'
+        - $ref: '#/components/parameters/IdempotencyKeyQuery'
+      responses:
+        '200':
+          description: |
+            Результат поиска: ноль или один элемент. Пустая коллекция означает,
+            что заявка по этому ключу этому пользователю не создавалась.
+          headers:
+            X-Correlation-Id: { $ref: '#/components/headers/XCorrelationId' }
+            X-RateLimit-Limit: { $ref: '#/components/headers/XRateLimitLimit' }
+            X-RateLimit-Remaining: { $ref: '#/components/headers/XRateLimitRemaining' }
+            X-RateLimit-Reset: { $ref: '#/components/headers/XRateLimitReset' }
+            Cache-Control: { $ref: '#/components/headers/CacheControlNoStore' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ExchangeOrderSearchResponse' }
+              examples:
+                found: { $ref: '#/components/examples/ExchangeOrderSearchFoundExample' }
+                empty: { $ref: '#/components/examples/ExchangeOrderSearchEmptyExample' }
+        '400': { $ref: '#/components/responses/BadRequest400' }
+        '409': { $ref: '#/components/responses/Conflict409RequestInProgress' }
+        '429': { $ref: '#/components/responses/TooManyRequests429' }
+        '500': { $ref: '#/components/responses/InternalServerError500' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable503' }
+        '504': { $ref: '#/components/responses/GatewayTimeout504' }
+
     post:
       operationId: createExchangeOrder
       summary: Создать заявку на обмен
       description: |
-        **Главный эндпоинт API.** Подтверждает ранее построенную котировку и создаёт
-        заявку на обмен: проверяет всю цепочку §6, резервирует средства (hold в S6)
-        и регистрирует заявку в S8.
+        Подтверждает ранее построенную котировку и создаёт заявку: прогоняет цепочку
+        проверок §6 канона, резервирует средства (hold в S6), регистрирует заявку в S8.
+        Требует заголовок `Idempotency-Key` (UUIDv4); запрос без него отклоняется
+        `400 VALIDATION_ERROR` до любых бизнес-проверок.
 
-        ## Обязательный заголовок Idempotency-Key
+        Исходы: `201` — статус `PENDING`, средства зарезервированы; `202` — статус
+        `MANUAL_REVIEW` (`review.code = SCORING_REVIEW_REQUIRED`), это успешный исход,
+        а не ошибка. Оба ответа содержат **фактически применённые** курс и суммы —
+        клиент отображает значения из ответа, а не из своего запроса.
 
-        UUIDv4, генерируется клиентом **один раз на попытку пользователя** и
-        переиспользуется при сетевых ретраях того же нажатия. Окно хранения 24 часа.
-        Повтор с тем же телом вернёт тот же ответ и тот же `orderId` с заголовком
-        `X-Idempotent-Replay: true`; с другим телом — `409 IDEMPOTENCY_CONFLICT`.
+        Согласие на ухудшение условий выражается суммой, а не курсом (решение O-16):
+        `minAcceptableToAmount` для котировки со `side: SELL`,
+        `maxAcceptableFromAmount` — со `side: BUY`. Порог дрейфа односторонний
+        (O-18): благоприятное движение и движение против системы в пределах
+        `driftThresholdPercent` пары исполняются по курсу котировки. Граница
+        согласия разрешает исполнение **за** порогом, но не дальше названной
+        пользователем суммы; без неё это безусловный `409 RATE_CHANGED`.
 
-        Без этого заголовка ретрай при таймауте означал бы двойное списание,
-        поэтому он **обязателен**, а не рекомендован: запрос без него отклоняется
-        с `400 VALIDATION_ERROR` до любых бизнес-проверок.
-
-        ## Защита от рассинхрона expectedToAmount / expectedRate
-
-        Клиент присылает не только `quoteId`, но и **то, что он показал
-        пользователю**. Сервер сравнивает присланное с сохранённой котировкой и с
-        живым курсом:
-
-        - расхождение `fromAmount`, `expectedToAmount`, `expectedRate` или пары
-          с сохранённой котировкой → `409 QUOTE_MISMATCH`, в `params`
-          возвращаются серверные значения, клиент показывает баннер
-          «Details changed. Please confirm again.» и перерисовывает сводку;
-        - котировка совпала, но живой курс уехал больше чем на **0.20 %** →
-          `409 RATE_CHANGED`, в `params` — `quotedRate`, `currentRate`,
-          `driftPercent` и новые суммы;
-        - дрейф в пределах 0.20 % и `acceptRateChange: true` → заявка создаётся
-          по свежему курсу молча;
-        - дрейф в пределах 0.20 % и `acceptRateChange: false` → `409 RATE_CHANGED`,
-          пользователь подтверждает повторно.
-
-        `acceptRateChange` — это согласие на дрейф **в пределах порога**, а не
-        «на любой курс». Отдать пользователю неограниченный проскок нельзя даже
-        с его согласия: это ровно тот случай, когда согласие не информированное.
-
-        ## Исходы
-
-        - `201 Created` — заявка принята, статус `PENDING`, средства зарезервированы,
-          `Location` указывает на ресурс заявки. Это терминальное состояние в рамках
-          скоупа задания.
-        - `202 Accepted` — скоринг потребовал ручной проверки, статус `MANUAL_REVIEW`,
-          средства **зарезервированы**, в теле `review.caseId` и `review.slaHours`.
-          Это **не ошибка**: `review.code` равен `SCORING_REVIEW_REQUIRED`.
-
-        ## Компенсации
-
-        Если hold создан (шаг 18), а регистрация заявки в S8 (шаг 19) провалилась,
-        BFF **обязан** снять hold компенсирующим `DELETE /v1/holds/{holdId}` в S6.
-        Если компенсация тоже не прошла, событие уходит в очередь компенсаций;
-        hold имеет собственный `expiresAt` и снимется по таймауту как последняя
-        линия защиты. Пользователю в обоих случаях возвращается
-        `500 ORDER_CREATION_FAILED` с `retryable: true`.
-
-        При таймауте S8 ретрай `POST` **запрещён** — вместо него BFF выполняет
-        сверку `GET /v1/orders?idempotencyKey=...` и, если заявка нашлась,
-        возвращает её как успех.
-
-        ## Что клиент делает перед вызовом
-
-        Клиентская предвалидация (шаги 1, 4, 11, 12, 17) выполняется inline и
-        немедленно — ради скорости отклика. Она **не заменяет** серверную и не
-        является контрактом: сервер прогоняет всю цепочку заново.
+        Обоснование — `docs/api/API-Design.md` §1.2, §1.7, §2, §4.2, §5, §6.4.
       tags: [Exchange Orders]
       parameters:
         - $ref: '#/components/parameters/IdempotencyKeyHeader'
@@ -516,8 +349,9 @@ paths:
           application/json:
             schema: { $ref: '#/components/schemas/ExchangeOrderCreateRequest' }
             examples:
-              rubToUsdt: { $ref: '#/components/examples/ExchangeOrderCreateRequestExample' }
-              acceptDrift: { $ref: '#/components/examples/ExchangeOrderCreateRequestAcceptDriftExample' }
+              plain: { $ref: '#/components/examples/ExchangeOrderCreateRequestExample' }
+              withMinAcceptableToAmount: { $ref: '#/components/examples/ExchangeOrderCreateRequestAcceptDriftExample' }
+              buySide: { $ref: '#/components/examples/ExchangeOrderCreateRequestBuyExample' }
       responses:
         '201':
           description: Заявка создана, статус `PENDING`, средства зарезервированы.
@@ -566,18 +400,10 @@ paths:
       operationId: getExchangeOrder
       summary: Статус заявки на обмен
       description: |
-        Возвращает текущее состояние заявки. Используется экраном подтверждения
-        (опрос не чаще одного раза в 2 секунды) и при восстановлении состояния
-        после перезагрузки.
-
-        Наружу отдаются статусы `PENDING`, `MANUAL_REVIEW`, `REJECTED`, `EXECUTING`,
-        `COMPLETED`, `FAILED`, `EXPIRED`. Внутренний статус `VALIDATING` наружу
-        не отдаётся никогда. Статусы за границей скоупа задания (`EXECUTING` и
-        далее) присутствуют в enum, чтобы клиент, написанный сейчас, не сломался
-        после выхода исполнения заявки за пределы этого проекта — клиент обязан
-        трактовать неизвестное значение как «нетерминальное, продолжать опрос».
-
-        Заявка другого пользователя возвращает `404`, а не `403`.
+        Текущее состояние заявки. Опрос не чаще одного раза в 2 секунды.
+        Неизвестное значение `status` клиент обязан трактовать как «нетерминальное,
+        продолжать опрос». Заявка другого пользователя даёт `404`, а не `403`.
+        Обоснование — `docs/api/API-Design.md` §7.1.
       tags: [Exchange Orders]
       parameters:
         - $ref: '#/components/parameters/CorrelationIdHeader'
@@ -614,25 +440,18 @@ components:
       scheme: bearer
       bearerFormat: JWT
       description: |
-        JWT, выданный сервисом аутентификации и проверенный API-gateway.
-        Claim `sub` содержит `userId`, `scope` обязан включать `wallet:exchange`.
-
-        **В прототипе не используется** по требованию заказчика: mock-сервер
-        принимает запросы без заголовка `Authorization`. Схема описана, чтобы
-        контракт был пригоден к передаче в разработку без переписывания.
+        JWT от сервиса аутентификации: claim `sub` содержит `userId`, `scope` обязан
+        включать `wallet:exchange`. **В прототипе не используется.**
+        Обоснование — `docs/api/API-Design.md` §7.5.
 
     gatewayUserId:
       type: apiKey
       in: header
       name: X-User-Id
       description: |
-        Идентификатор пользователя, **проставляемый API-gateway** после проверки
-        JWT. Приложение доверяет этому заголовку только потому, что gateway
-        безусловно перезаписывает его на входе из внешнего периметра.
-
-        Заголовок, пришедший от клиента напрямую (в обход gateway), обязан
-        отбрасываться — иначе это тривиальный обход авторизации.
-        **В прототипе не используется.**
+        `userId`, проставляемый API-gateway после проверки JWT. Заголовок, пришедший
+        от клиента в обход gateway, обязан отбрасываться.
+        **В прототипе не используется.** Обоснование — `docs/api/API-Design.md` §7.5.
 
   parameters:
 
@@ -641,13 +460,22 @@ components:
       in: header
       required: true
       description: |
-        Ключ идемпотентности, UUIDv4. Генерируется клиентом **один раз на попытку
-        пользователя** (одно нажатие «Обменять») и переиспользуется при сетевых
-        ретраях этой же попытки. Новая попытка — новый ключ.
+        Ключ идемпотентности, UUIDv4, один на попытку пользователя. Окно хранения
+        24 часа. Повтор с тем же телом → тот же ответ и `X-Idempotent-Replay: true`;
+        с другим телом → `409 IDEMPOTENCY_CONFLICT`; пока первая попытка выполняется →
+        `409 REQUEST_IN_PROGRESS`. Отсутствие заголовка → `400 VALIDATION_ERROR`.
+        Обоснование — `docs/api/API-Design.md` §2.1–2.4.
+      schema:
+        $ref: '#/components/schemas/IdempotencyKey'
 
-        Окно хранения 24 часа. Повтор с тем же телом → тот же ответ и заголовок
-        `X-Idempotent-Replay: true`. Повтор с другим телом → `409
-        IDEMPOTENCY_CONFLICT`. Отсутствие заголовка → `400 VALIDATION_ERROR`.
+    IdempotencyKeyQuery:
+      name: idempotencyKey
+      in: query
+      required: true
+      description: |
+        Ключ идемпотентности, по которому ищется ранее созданная заявка (решение O-10).
+        Обязателен: запрос без него — `400 VALIDATION_ERROR`. Других фильтров эндпоинт
+        не принимает. Обоснование — `docs/api/API-Design.md` §2.6.
       schema:
         $ref: '#/components/schemas/IdempotencyKey'
 
@@ -743,7 +571,7 @@ components:
         format: uri-reference
         maxLength: 512
         examples:
-          - /v1/exchange-orders/ord_01J9X3B5M6N7P8Q9R0S1T2U3V4
+          - /v1/exchange-orders/ord_01J9X3B5M6N7P8Q9R0S1T2W3V4
           - /v1/exchange/quotes/8f14e45f-ceea-4e0a-9d5b-6b7c8d9e0f11
 
     XCorrelationId:
@@ -833,17 +661,10 @@ components:
       type: string
       title: DecimalString
       description: |
-        Денежная величина или курс в виде **строки** с десятичной записью.
-        Неотрицательная, без ведущих нулей, без знака, без экспоненциальной
-        формы, десятичный разделитель — точка.
-
-        Регулярное выражение нормативно (§5.1 канона):
-        `^(0|[1-9]\d{0,18})(\.\d{1,18})?$`
-
-        Тип `string`, а не `number`, потому что IEEE-754 не представляет `0.1`
-        точно; в JSON-числе `25450.00` неотличимо от `25450`, и на границе
-        округления клиент и сервер разойдутся. Клиент обязан работать с этими
-        значениями через `decimal.js` либо целочисленные minor units.
+        Денежная величина или курс **строкой** с десятичной записью: неотрицательная,
+        без ведущих нулей, без знака, без экспоненциальной формы, разделитель — точка.
+        Регулярное выражение нормативно (канон §5.1). `number` в денежных полях
+        запрещён на всём пути. Обоснование — `docs/api/API-Design.md` §3.1.
       pattern: '^(0|[1-9]\d{0,18})(\.\d{1,18})?$'
       minLength: 1
       maxLength: 40
@@ -926,7 +747,7 @@ components:
       pattern: '^ord_[0-9A-HJKMNP-TV-Z]{26}$'
       minLength: 30
       maxLength: 30
-      examples: ['ord_01J9X3B5M6N7P8Q9R0S1T2U3V4']
+      examples: ['ord_01J9X3B5M6N7P8Q9R0S1T2W3V4']
 
     HoldId:
       type: string
@@ -938,7 +759,7 @@ components:
       pattern: '^hld_[0-9A-HJKMNP-TV-Z]{26}$'
       minLength: 30
       maxLength: 30
-      examples: ['hld_01J9X3B5M6N7P8Q9R0S1T2U3V5']
+      examples: ['hld_01J9X3B5M6N7P8Q9R0S1T2W3V5']
 
     AssetId:
       type: string
@@ -1177,13 +998,9 @@ components:
       type: string
       title: FeeMode
       description: |
-        Режим удержания комиссии. Единственное значение — `INCLUDED_IN_SOURCE`:
-        комиссия удерживается **внутри** введённой суммы, а не сверху.
-
-        Enum из одного значения оставлен намеренно: при режиме `ON_TOP` кнопка
-        `MAX` и чип `100 %` всегда приводили бы к `INSUFFICIENT_FUNDS`, потому
-        что `fromAmount + fee > available`. Поле сохраняет форму контракта на
-        случай, если режим когда-нибудь станет конфигурируемым.
+        Режим удержания комиссии. `INCLUDED_IN_SOURCE` — комиссия удерживается
+        **внутри** суммы списания, а не сверху. Других значений контракт не допускает.
+        Обоснование — `docs/api/API-Design.md` §3.3.
       enum: [INCLUDED_IN_SOURCE]
       examples: ['INCLUDED_IN_SOURCE']
 
@@ -1216,19 +1033,15 @@ components:
           allOf:
             - $ref: '#/components/schemas/DecimalString'
           description: |
-            Сетевая комиссия. Всегда `"0"`: обмен внутренний, активы
-            перемещаются между балансами одного кошелька, ончейн-транзакции
-            не выполняются (§5.5 канона). Поле сохранено, потому что при
-            последующем **выводе** сеть определяет реальную стоимость, и
-            пользователь должен осознавать выбор сети уже на этапе обмена.
+            Сетевая комиссия. Всегда `"0"`: обмен внутренний (канон §5.5).
+            Обоснование — `docs/api/API-Design.md` §3.5.
           examples: ['0']
         roundingMode:
           type: string
           enum: [ROUND_UP]
           description: |
-            Округление комиссии — всегда вверх до `decimals(fromAsset)`.
-            Детерминированно и не в убыток системе. Banker's rounding не
-            применяется: он недетерминирован для ревизии.
+            Округление комиссии — вверх до `decimals(fromAsset)`, в обоих режимах
+            расчёта (канон §5.4). Обоснование — `docs/api/API-Design.md` §3.2.
           examples: ['ROUND_UP']
         promoApplied:
           type: [string, 'null']
@@ -1267,8 +1080,8 @@ components:
       title: ExchangePair
       description: |
         **Направленная** пара обмена. `RUB→USDT` и `USDT→RUB` конфигурируются
-        независимо: у них разные комиссии, разные лимиты и независимый признак
-        включения. Обратный курс не равен `1/rate` — в нём заложен спред.
+        независимо; обратный курс не равен `1/rate`.
+        Обоснование — `docs/api/API-Design.md` §1.6.
       required: [pairId, fromAsset, toAsset, enabled, limits, feePolicy]
       additionalProperties: false
       properties:
@@ -1304,10 +1117,25 @@ components:
             - $ref: '#/components/schemas/DecimalString'
             - type: 'null'
           description: |
-            **Индикативный** курс для предпросмотра в селекторе. Не является
-            обязательством и не годится для расчёта: обязывающий курс
-            существует только внутри котировки с `quoteId` и `expiresAt`.
+            **Индикативный** курс для предпросмотра. Не обязательство, для расчёта
+            не годится. Обоснование — `docs/api/API-Design.md` §1.4.
           examples: ['0.010638297872', null]
+        driftThresholdPercent:
+          allOf:
+            - $ref: '#/components/schemas/PercentString'
+          description: |
+            Порог допустимого дрейфа курса **для этой пары**, в процентах
+            (решение O-8). Порог **односторонний**: применяется только к движению
+            против системы — уменьшению `rate` (решение O-8 и O-18, канон §6.1).
+            Превышение при подтверждении заявки → `409 RATE_CHANGED`; это же
+            значение возвращается в `params.thresholdPercent`.
+
+            Поле необязательное: при его отсутствии применяется
+            `PairsResponse.rateDriftThresholdPercent`. Если S4 недоступен и порог
+            не получен, применяется дефолт `0.20`, а ответ помечается
+            `degraded: true` (`degradationReasons: [PAIR_CONFIG_CACHED]` в котировке).
+            Обоснование — `docs/api/API-Design.md` §4.1.
+          examples: ['0.20', '1.50']
         settlementMode:
           type: string
           enum: [INTERNAL]
@@ -1319,18 +1147,19 @@ components:
     LimitPeriod:
       type: string
       title: LimitPeriod
-      description: Окно лимита оборота.
+      description: |
+        Окно лимита оборота. `YEARLY` добавлено решением O-12: S4 возвращает годовое
+        превышение отдельно, схлопывание его в `MONTHLY` показывало пользователю
+        не то окно. Обоснование — `docs/api/API-Design.md` §6.8.
       enum: [PER_TRANSACTION, DAILY, MONTHLY, YEARLY]
-      examples: ['DAILY', 'MONTHLY']
+      examples: ['DAILY', 'MONTHLY', 'YEARLY']
 
     TurnoverLimitWindow:
       type: object
       title: TurnoverLimitWindow
       description: |
-        Состояние одного окна лимита оборота. Все величины выражены в **валюте
-        нормализации** (`RUB`): лимит применяется к суммарному обороту по всем
-        активам, поэтому суммы приводятся к единой базе по курсу на момент
-        операции.
+        Состояние одного окна лимита оборота. Все величины — в валюте нормализации
+        (`RUB`). Обоснование — `docs/api/API-Design.md` §7.7.
       required: [period, limit, used, remaining, currency]
       additionalProperties: false
       properties:
@@ -1350,7 +1179,7 @@ components:
           allOf:
             - $ref: '#/components/schemas/DecimalString'
           description: |
-            Остаток. Именно это значение подставляется в текст
+            Остаток. Подставляется в текст
             `Daily limit reached. Available today: {remaining}`.
           examples: ['320000.00']
         currency:
@@ -1358,8 +1187,31 @@ components:
             - $ref: '#/components/schemas/AssetId'
           description: Валюта нормализации лимита. Всегда `RUB`.
           examples: ['RUB']
+        resetsAt:
+          allOf:
+            - $ref: '#/components/schemas/Timestamp'
+          description: |
+            Момент обнуления окна (решение O-11). Отдаётся всегда и совпадает с
+            `params.resetAt` в `LIMIT_EXCEEDED_*`. Показывать пользователю это
+            значение без `resetTimeZone` нельзя — цифра станет необъяснимой.
+          examples: ['2026-08-08T00:00:00.000Z']
+        resetTimeZone:
+          type: string
+          minLength: 1
+          maxLength: 64
+          description: |
+            Идентификатор часового пояса IANA, в котором рассчитано окно
+            (решение O-11). При текущем правиле учёта — `UTC`. Клиент обязан
+            показывать пояс рядом с `resetsAt`.
+            Обоснование — `docs/api/API-Design.md` §7.7.
+          examples: ['UTC', 'Asia/Dubai']
         resetAt:
-          $ref: '#/components/schemas/Timestamp'
+          allOf:
+            - $ref: '#/components/schemas/Timestamp'
+          deprecated: true
+          description: |
+            **Устарело**, заменено на `resetsAt`. Отдаётся с тем же значением на время
+            миграции (минимум 90 дней) и будет удалено в следующем major.
 
     UserTurnoverLimits:
       type: object
@@ -1414,17 +1266,17 @@ components:
           minimum: 1
           maximum: 300
           description: |
-            Время жизни котировки в секундах. Отдаётся сервером, а не
-            зашивается в клиент: иначе таймер на экране и реальный `expiresAt`
-            разойдутся при изменении политики.
+            TTL котировки в секундах. Отдаётся сервером, не зашивается в клиент.
+            Обоснование — `docs/api/API-Design.md` §1.5.
           examples: [15]
         rateDriftThresholdPercent:
           allOf:
             - $ref: '#/components/schemas/PercentString'
           description: |
-            Порог дрейфа курса в процентах. Превышение при подтверждении →
-            `RATE_CHANGED`. Отдаётся клиенту, чтобы UI мог объяснить причину
-            отказа теми же числами, что использовал сервер.
+            Порог дрейфа **по умолчанию**, применяемый к парам без собственного
+            значения. Пара переопределяет его полем
+            `ExchangePair.driftThresholdPercent` (решение O-8).
+            Обоснование — `docs/api/API-Design.md` §4.1.
           examples: ['0.20']
         generatedAt:
           $ref: '#/components/schemas/Timestamp'
@@ -1438,9 +1290,8 @@ components:
       type: string
       title: RateSource
       description: |
-        Источник цены, из которого получен курс. Отдаётся пользователю и
-        пишется в заявку: при разборе спора нужно знать не только курс, но и
-        откуда он взялся.
+        Источник цены, из которого получен курс. Пишется в заявку и в аудит.
+        Обоснование — `docs/api/API-Design.md` §1.6.
       enum: [AGGREGATED, BINANCE, CBR, INTERNAL]
       examples: ['AGGREGATED']
 
@@ -1448,13 +1299,9 @@ components:
       type: object
       title: ClientMeta
       description: |
-        Необязательный контекст клиента. Используется скорингом (S3) как
-        сигналы (новое устройство, смена канала) и аналитикой.
-
-        **Ограничение по данным:** сюда запрещено класть персональные данные,
-        токены, номера счетов и любые секреты. Поля этого объекта попадают в
-        S3 и в аналитику и не подлежат удалению по запросу пользователя как
-        часть аудиторского следа.
+        Необязательный контекст клиента, используемый скорингом (S3) как сигналы.
+        **Персональные данные, токены, номера счетов и любые секреты здесь
+        запрещены.** Обоснование — `docs/api/API-Design.md` §7.6.
       additionalProperties: false
       properties:
         source:
@@ -1468,9 +1315,9 @@ components:
           minLength: 8
           maxLength: 64
           description: |
-            Псевдонимный идентификатор устройства. **Не** IMEI, **не** серийный
-            номер, **не** рекламный идентификатор — непрозрачный
-            псевдослучайный токен, стабильный в пределах установки приложения.
+            Псевдонимный непрозрачный идентификатор устройства, стабильный в пределах
+            установки. **Не** IMEI, **не** серийный номер, **не** рекламный
+            идентификатор. Обоснование — `docs/api/API-Design.md` §7.6.
           examples: ['dvc_7f3a9b1c2d4e5f60']
         locale:
           type: string
@@ -1491,23 +1338,50 @@ components:
       title: QuoteStatus
       description: |
         Состояние котировки. `ACTIVE` — можно подтверждать; `EXPIRED` — истекла
-        по времени; `CONSUMED` — уже израсходована созданной заявкой.
-
-        Истёкшая котировка возвращается методом `GET` ещё 5 минут именно ради
-        различия `EXPIRED` и `404`: пользователю нужно показать разные баннеры.
+        по времени; `CONSUMED` — израсходована созданной заявкой.
+        Обоснование — `docs/api/API-Design.md` §1.5.
       enum: [ACTIVE, EXPIRED, CONSUMED]
       examples: ['ACTIVE']
+
+    QuoteSide:
+      type: string
+      title: QuoteSide
+      description: |
+        Сторона расчёта — какую из двух сумм задал клиент (решение O-9).
+
+        - `SELL` — задана сумма списания `fromAmount`; сервер выводит `feeAmount`,
+          `netFromAmount` и `toAmount`;
+        - `BUY` — задана сумма получения `toAmount`; сервер выводит `netFromAmount`,
+          `feeAmount` и `fromAmount`.
+
+        Заданная сторона не округляется и обязана приходить нормализованной до
+        `decimals` своего актива; производная округляется в пользу системы
+        (канон §5.4). Обоснование — `docs/api/API-Design.md` §1.3, §3.4.
+      enum: [SELL, BUY]
+      default: SELL
+      examples: ['SELL', 'BUY']
 
     QuoteCreateRequest:
       type: object
       title: QuoteCreateRequest
       description: |
-        Запрос на построение котировки. Сумма задаётся **только** со стороны
-        списания: поле «Получаю» на экране недоступно для ручного ввода
-        (Design Brief), поэтому обратный расчёт в контракте не предусмотрен —
-        не поддерживаем то, чего нет в интерфейсе.
-      required: [fromAsset, toAsset, fromAmount]
+        Запрос котировки. Сторона расчёта задаётся полем `side`; в запросе
+        присутствует **ровно одна** из сумм — `fromAmount` при `side: SELL`,
+        `toAmount` при `side: BUY`. Обе суммы или ни одной → `VALIDATION_ERROR`.
+        Обоснование — `docs/api/API-Design.md` §1.3.
+      required: [fromAsset, toAsset]
       additionalProperties: false
+      allOf:
+        - if:
+            required: [side]
+            properties:
+              side: { const: BUY }
+          then:
+            required: [toAmount]
+            not: { required: [fromAmount] }
+          else:
+            required: [fromAmount]
+            not: { required: [toAmount] }
       properties:
         fromAsset:
           allOf:
@@ -1517,17 +1391,32 @@ components:
           allOf:
             - $ref: '#/components/schemas/AssetRef'
           description: |
-            Актив получения. Должен отличаться от `fromAsset` **с учётом сети**:
-            `USDT@TRON → USDT@ETHEREUM` это не обмен, а перевод между сетями,
-            и он вне скоупа — такой запрос отклоняется как `SAME_ASSET_PAIR`.
+            Актив получения. Обязан отличаться от `fromAsset` **с учётом сети**:
+            `USDT@TRON → USDT@ETHEREUM` отклоняется как `SAME_ASSET_PAIR`.
+        side:
+          allOf:
+            - $ref: '#/components/schemas/QuoteSide'
+          description: |
+            Сторона расчёта. При отсутствии поля применяется `SELL` — прежнее
+            поведение контракта.
+          examples: ['SELL']
         fromAmount:
           allOf:
             - $ref: '#/components/schemas/DecimalString'
           description: |
-            Полная сумма списания, **включая** комиссию (режим
-            `INCLUDED_IN_SOURCE`). Число знаков после запятой не должно
-            превышать `decimals(fromAsset)` — иначе `VALIDATION_ERROR`.
+            Полная сумма списания, **включая** комиссию. Обязательна и допустима
+            только при `side: SELL`. Число знаков не должно превышать
+            `decimals(fromAsset)` — иначе `VALIDATION_ERROR`.
           examples: ['10000.00']
+        toAmount:
+          allOf:
+            - $ref: '#/components/schemas/DecimalString'
+          description: |
+            Желаемая сумма получения. Обязательна и допустима только при
+            `side: BUY`. Число знаков не должно превышать `decimals(toAsset)` —
+            иначе `VALIDATION_ERROR`. Точное попадание в это значение достижимо
+            не всегда: см. `Quote.toAmount`.
+          examples: ['100.000000']
         clientMeta:
           $ref: '#/components/schemas/ClientMeta'
 
@@ -1535,12 +1424,16 @@ components:
       type: object
       title: Quote
       description: |
-        Котировка: зафиксированный на 15 секунд расчёт. Все суммы посчитаны
-        сервером по §5.3 канона; клиент отображает их как есть и **не**
-        пересчитывает самостоятельно.
+        Котировка: зафиксированный на 15 секунд расчёт. Клиент отображает суммы как
+        есть и **не** пересчитывает их. Снапшот обязан содержать заданную сторону
+        (`side`) и исходно запрошенную величину (`requestedAmount`) — без них расчёт
+        невоспроизводим (канон §5.4).
+        Обоснование — `docs/api/API-Design.md` §3.2, §3.4.
       required:
         - quoteId
         - status
+        - side
+        - requestedAmount
         - fromAsset
         - toAsset
         - fromAmount
@@ -1560,6 +1453,23 @@ components:
           $ref: '#/components/schemas/QuoteId'
         status:
           $ref: '#/components/schemas/QuoteStatus'
+        side:
+          allOf:
+            - $ref: '#/components/schemas/QuoteSide'
+          description: |
+            Сторона, заданная клиентом в `QuoteCreateRequest`. Определяет, какая из
+            сумм не округлялась, и какое поле согласия допустимо при подтверждении
+            (`minAcceptableToAmount` при `SELL`, `maxAcceptableFromAmount` при `BUY`).
+          examples: ['SELL']
+        requestedAmount:
+          allOf:
+            - $ref: '#/components/schemas/DecimalString'
+          description: |
+            Исходно запрошенная величина: значение `fromAmount` при `side: SELL`
+            (в валюте `fromAsset`) либо `toAmount` при `side: BUY` (в валюте
+            `toAsset`). При `side: BUY` может отличаться от возвращённого
+            `toAmount` — см. описание этого поля.
+          examples: ['10000.00', '100.000000']
         fromAsset:
           $ref: '#/components/schemas/AssetRef'
         toAsset:
@@ -1567,46 +1477,54 @@ components:
         fromAmount:
           allOf:
             - $ref: '#/components/schemas/DecimalString'
-          description: Полная сумма списания, включая комиссию.
+          description: |
+            Полная сумма списания, включая комиссию. При `side: BUY` — производная
+            величина, округлённая **вверх** до `decimals(fromAsset)`.
           examples: ['10000.00']
         feeAmount:
           allOf:
             - $ref: '#/components/schemas/DecimalString'
           description: |
-            Комиссия в валюте списания, `clamp(fromAmount × percent / 100,
-            minFee, maxFee)` с округлением **вверх** до `decimals(fromAsset)`.
+            Комиссия в валюте списания: `clamp(fromAmount × percent / 100, minFee,
+            maxFee)`, округление **вверх** до `decimals(fromAsset)` в обоих режимах.
           examples: ['35.00']
         netFromAmount:
           allOf:
             - $ref: '#/components/schemas/DecimalString'
           description: |
-            `fromAmount − feeAmount` — сумма, реально уходящая в конвертацию.
-            Инвариант I1 требует **точного** равенства
-            `feeAmount + netFromAmount == fromAmount`.
+            `fromAmount − feeAmount` — сумма, уходящая в конвертацию. Инвариант I1
+            требует **точного** равенства `feeAmount + netFromAmount == fromAmount`.
           examples: ['9965.00']
         toAmount:
           allOf:
             - $ref: '#/components/schemas/DecimalString'
           description: |
-            Сумма получения: `netFromAmount × rate` с округлением **вниз** до
-            `decimals(toAsset)`. Вниз, потому что система никогда не обещает
-            пользователю больше, чем сможет выдать.
+            Сумма получения.
+
+            При `side: SELL` — производная: `netFromAmount × rate` с округлением
+            **вниз** до `decimals(toAsset)`.
+
+            При `side: BUY` — **ближайшая достижимая величина не меньше
+            запрошенной**. Точное попадание в запрошенное значение в большинстве
+            случаев невозможно: отображение «списание → получение» ступенчато
+            (плато и разрывы зависят от соотношения `decimals` пары), поэтому
+            `toAmount` может превышать `requestedAmount`. Именно возвращённое
+            значение, а не `requestedAmount`, участвует в сверке на шаге 9 цепочки
+            (канон §5.4; `docs/SDD.md` §3.1).
           examples: ['106.010638']
         rate:
           allOf:
             - $ref: '#/components/schemas/DecimalString'
           description: |
             Сколько единиц `toAsset` даётся за **одну** единицу `fromAsset`.
-            Передаётся без округления, ровно как получен от S5: округление
-            курса ломает воспроизводимость расчёта.
+            Без округления, ровно как получен от S5.
           examples: ['0.010638297872']
         inverseRate:
           allOf:
             - $ref: '#/components/schemas/DecimalString'
           description: |
-            Обратный курс, `ROUND_HALF_UP` до 2 знаков. **Только для
-            отображения**: «1 USDT = 94.00 RUB» читается человеком легче, чем
-            «1 RUB = 0.010638297872 USDT». В расчётах не участвует.
+            Обратный курс, `ROUND_HALF_UP` до 2 знаков. **Только для отображения**,
+            в расчётах не участвует. Обоснование — `docs/api/API-Design.md` §1.6.
           examples: ['94.00']
         feePolicy:
           $ref: '#/components/schemas/FeePolicy'
@@ -1620,9 +1538,8 @@ components:
           allOf:
             - $ref: '#/components/schemas/Timestamp'
           description: |
-            `quotedAt + 15 секунд`. Клиент строит обратный отсчёт от этого
-            значения, а не от локального таймера, — иначе расхождение часов
-            клиента и сервера даёт отказ на видимо ещё живой котировке.
+            `quotedAt + ttlSeconds`. Клиент строит обратный отсчёт от этого значения,
+            а не от локального таймера. Обоснование — `docs/api/API-Design.md` §1.5.
         ttlSeconds:
           type: integer
           format: int32
@@ -1633,25 +1550,26 @@ components:
         degraded:
           type: boolean
           description: |
-            `true`, если при построении котировки использованы кешированные или
-            неполные данные: устаревший курс от S5 (возраст до 10 с) либо
-            отсутствие данных о ликвидности от S7. Котировка остаётся
-            обязывающей; UI показывает ненавязчивую отметку.
+            `true`, если использованы кешированные или неполные данные; конкретные
+            причины — в `degradationReasons`. Котировка остаётся обязывающей.
+            Обоснование — `docs/api/API-Design.md` §8.
           examples: [false, true]
         degradationReasons:
           type: array
           maxItems: 8
-          description: Машиночитаемые причины деградации. Пустой массив при `degraded = false`.
+          description: |
+            Машиночитаемые причины деградации. Пустой массив при `degraded = false`.
+            `PAIR_CONFIG_CACHED` покрывает и случай, когда S4 не отдал
+            `driftThresholdPercent` и применён дефолт `0.20` (решение O-8).
           items:
             type: string
             enum: [STALE_RATE, LIQUIDITY_UNAVAILABLE, FEE_SCHEDULE_CACHED, PAIR_CONFIG_CACHED]
-          examples: [[], ['STALE_RATE']]
+          examples: [[], ['STALE_RATE'], ['PAIR_CONFIG_CACHED']]
         slippageWarning:
           type: [boolean, 'null']
           description: |
-            `true`, если S7 оценил проскальзывание для этой суммы как высокое.
-            `null`, если S7 недоступен и оценка не выполнялась. Предупреждение
-            не блокирует создание заявки — S7 деградируемый.
+            `true` — S7 оценил проскальзывание как высокое; `null` — S7 недоступен и
+            оценка не выполнялась. Создание заявки не блокирует.
           examples: [false, null]
         estimatedCompletionSeconds:
           type: integer
@@ -1665,26 +1583,14 @@ components:
       type: string
       title: OrderStatus
       description: |
-        Статус заявки, отдаваемый наружу.
-
-        В скоупе задания достижимы `PENDING`, `MANUAL_REVIEW` и `REJECTED`.
-        Остальные значения относятся к исполнению заявки (вне скоупа) и
-        присутствуют в enum, чтобы клиент, написанный сейчас, не сломался
-        позже.
-
-        Внутренний статус `VALIDATING` наружу **не отдаётся** и в enum
-        отсутствует. Клиент обязан трактовать неизвестное значение как
+        Статус заявки, отдаваемый наружу. В скоупе задания достижимы `PENDING`,
+        `MANUAL_REVIEW` и `REJECTED`; остальные значения относятся к исполнению
+        заявки. Внутренний статус `VALIDATING` наружу **не отдаётся** и в enum
+        отсутствует. Неизвестное значение клиент обязан трактовать как
         «нетерминальное, продолжать опрос».
 
-        | Статус | Средства | Терминальный |
-        |--------|----------|--------------|
-        | `PENDING` | зарезервированы | нет |
-        | `MANUAL_REVIEW` | зарезервированы | нет |
-        | `REJECTED` | не тронуты / hold снят | да |
-        | `EXECUTING` | зарезервированы | нет |
-        | `COMPLETED` | списаны и зачислены | да |
-        | `FAILED` | hold снят | да |
-        | `EXPIRED` | hold снят | да |
+        Соответствие «статус → состояние средств → терминальность» — канон §8.
+        Обоснование — `docs/api/API-Design.md` §7.1.
       enum: [PENDING, MANUAL_REVIEW, REJECTED, EXECUTING, COMPLETED, FAILED, EXPIRED]
       examples: ['PENDING', 'MANUAL_REVIEW']
 
@@ -1692,10 +1598,9 @@ components:
       type: object
       title: ManualReview
       description: |
-        Блок ручной проверки. Присутствует **только** при статусе
-        `MANUAL_REVIEW` (ответ `202`). Средства при этом зарезервированы:
-        отпускать их до решения комплаенса нельзя, иначе решение окажется
-        неисполнимым.
+        Блок ручной проверки. Присутствует **только** при `status: MANUAL_REVIEW`
+        (ответ `202`); средства при этом зарезервированы.
+        Обоснование — `docs/api/API-Design.md` §6.4.
       required: [code, caseId, submittedAt]
       additionalProperties: false
       properties:
@@ -1703,9 +1608,8 @@ components:
           type: string
           const: SCORING_REVIEW_REQUIRED
           description: |
-            Код каталога §7, объясняющий причину. Единственный код каталога,
-            который приходит **не** в конверте `ProblemDetails`: это не ошибка,
-            а альтернативный успешный исход.
+            Код каталога §7. Единственный код каталога, приходящий **не** в конверте
+            `ProblemDetails`: это успешный исход, а не ошибка.
           examples: ['SCORING_REVIEW_REQUIRED']
         caseId:
           type: string
@@ -1713,7 +1617,7 @@ components:
           minLength: 31
           maxLength: 31
           description: Идентификатор кейса комплаенса. Пользователь называет его в поддержке.
-          examples: ['case_01J9X3C6N7P8Q9R0S1T2U3V4W5']
+          examples: ['case_01J9X3C6N7P8Q9R0S1T2W3V4W5']
         slaHours:
           type: integer
           format: int32
@@ -1728,14 +1632,15 @@ components:
       type: object
       title: ExchangeOrderCreateRequest
       description: |
-        Подтверждение котировки. Клиент присылает `quoteId` **и** дублирует
-        показанные пользователю значения — сервер сверяет их со своим расчётом
-        и с живым курсом.
+        Подтверждение котировки с продублированными ожидаемыми значениями: сервер
+        сверяет их со своим расчётом и с живым курсом. Расхождение →
+        `409 QUOTE_MISMATCH`.
 
-        Дублирование выглядит избыточным ровно до первого инцидента, когда
-        клиент показал одну сумму, а сервер списал другую. Без него разойтись
-        можно тихо; с ним расхождение превращается в детерминированный
-        `QUOTE_MISMATCH`.
+        Согласие на ухудшение условий (решение O-16) выражается **суммой**:
+        `minAcceptableToAmount` при котировке со `side: SELL`,
+        `maxAcceptableFromAmount` при `side: BUY`. Допустимо **ровно одно** поле,
+        и только то, которое относится к производной стороне котировки; иное —
+        `400 VALIDATION_ERROR`. Обоснование — `docs/api/API-Design.md` §1.2, §4.2.
       required:
         - quoteId
         - fromAsset
@@ -1744,14 +1649,15 @@ components:
         - expectedToAmount
         - expectedRate
       additionalProperties: false
+      not:
+        required: [minAcceptableToAmount, maxAcceptableFromAmount]
       properties:
         quoteId:
           allOf:
             - $ref: '#/components/schemas/QuoteId'
           description: |
-            Идентификатор ранее построенной котировки. Котировка обязана
-            существовать (шаг 6), быть неиспользованной (шаг 7) и не истёкшей
-            (шаг 8).
+            Идентификатор ранее построенной котировки: обязана существовать (шаг 6),
+            быть неиспользованной (шаг 7) и не истёкшей (шаг 8).
         fromAsset:
           allOf:
             - $ref: '#/components/schemas/AssetRef'
@@ -1772,43 +1678,96 @@ components:
           allOf:
             - $ref: '#/components/schemas/DecimalString'
           description: |
-            Сумма получения, **показанная пользователю**. Расхождение с
-            серверным расчётом → `409 QUOTE_MISMATCH` с серверными значениями
-            в `params`.
+            Сумма получения, **показанная пользователю**. Расхождение с котировкой →
+            `409 QUOTE_MISMATCH` с серверными значениями в `params`.
           examples: ['106.010638']
         expectedRate:
           allOf:
             - $ref: '#/components/schemas/DecimalString'
           description: |
-            Курс, **показанный пользователю** (в направлении `to` за 1 `from`,
-            не обратный). Расхождение с зафиксированным в котировке →
-            `QUOTE_MISMATCH`; расхождение живого курса с котировкой сверх
-            0.20 % → `RATE_CHANGED`.
+            Курс, **показанный пользователю**, в направлении `to` за 1 `from`.
+            Расхождение с котировкой → `QUOTE_MISMATCH`; дрейф живого курса сверх
+            `driftThresholdPercent` пары → `RATE_CHANGED`.
           examples: ['0.010638297872']
         expectedFeeAmount:
           oneOf:
             - $ref: '#/components/schemas/DecimalString'
             - type: 'null'
           description: |
-            Комиссия, показанная пользователю. Необязательно, но настоятельно
-            рекомендуется: комиссия — самая частая причина расхождения
-            «ожидал одно, списали другое», а строка `Fee` в сводке обмена
-            обязательна по Design Brief.
+            Комиссия, показанная пользователю. Необязательна, но рекомендуется:
+            расхождение по ней → `QUOTE_MISMATCH`.
           examples: ['35.00', null]
+        minAcceptableToAmount:
+          allOf:
+            - $ref: '#/components/schemas/DecimalString'
+          description: |
+            «Не зачисляйте меньше, чем X» — нижняя граница суммы получения,
+            в валюте `toAsset` (решение O-16).
+
+            Допустимо **только** для котировки со `side: SELL`, где сумма получения
+            производная. Присутствие вместе с `maxAcceptableFromAmount` или при
+            котировке со `side: BUY` → `400 VALIDATION_ERROR`.
+
+            Правило применения на шаге 10 (канон §6.1):
+
+            | Движение курса | Граница | Исход |
+            |----------------|---------|-------|
+            | в пользу пользователя, любой величины | любая | заявка по **курсу котировки** |
+            | против системы `<= driftThresholdPercent` пары | любая | заявка по **курсу котировки** |
+            | против системы `> driftThresholdPercent` | не задана | `409 RATE_CHANGED` |
+            | против системы `> driftThresholdPercent` | пересчитанная сумма `>= границы` | заявка по **живому курсу** |
+            | против системы `> driftThresholdPercent` | пересчитанная сумма `< границы` | `409 RATE_CHANGED` |
+
+            **Порог односторонний** (решение O-18). Сравнивается только движение
+            против системы — в записи §5.2 это **уменьшение** `rate`. Благоприятное
+            движение любой величины исполняется по зафиксированному курсу: сумма
+            к получению не меняется, пользователь получает ровно то, что подтвердил,
+            **а разница остаётся у системы** — это и есть цена фиксации курса.
+            Прерывать баннером «курс изменился» там, где для пользователя ничего
+            не изменилось, значит приучать закрывать баннер не читая.
+
+            Внутри порога котировка также исполняется по **зафиксированному** курсу:
+            она — обязательство на время TTL, и пересчёт выдал бы пользователю сумму,
+            отличную от подтверждённой, без предупреждения. Граница нужна не здесь,
+            а чтобы разрешить исполнение **за** порогом пары — в зоне, где иначе был
+            бы безусловный отказ.
+
+            Верхняя граница самого значения сохраняется: величина, требующая условий
+            лучше зафиксированных в котировке, отклоняется как `VALIDATION_ERROR`.
+            Обоснование — `docs/api/API-Design.md` §4.2.
+          examples: ['105.500000']
+        maxAcceptableFromAmount:
+          allOf:
+            - $ref: '#/components/schemas/DecimalString'
+          description: |
+            «Не списывайте больше, чем Y» — верхняя граница суммы списания,
+            в валюте `fromAsset` (решение O-16).
+
+            Допустимо **только** для котировки со `side: BUY`, где сумма списания
+            производная. Присутствие вместе с `minAcceptableToAmount` или при
+            котировке со `side: SELL` → `400 VALIDATION_ERROR`.
+
+            Правило применения на шаге 10 зеркально `minAcceptableToAmount`: при
+            благоприятном движении и внутри `driftThresholdPercent` пары заявка
+            исполняется по курсу котировки; при движении против системы за порогом —
+            по живому курсу, если пересчитанная сумма списания
+            `<= maxAcceptableFromAmount`, иначе `409 RATE_CHANGED`.
+            Обоснование — `docs/api/API-Design.md` §4.2.
+          examples: ['10100.00']
         acceptRateChange:
           type: boolean
-          default: false
+          deprecated: true
           description: |
-            Пользователь заранее согласен на дрейф курса **в пределах порога
-            0.20 %**.
+            **Устарело и игнорируется.** Заменено полями `minAcceptableToAmount` /
+            `maxAcceptableFromAmount` (решения O-7, O-16): булев флаг не выражает,
+            насколько хуже пользователь готов принять условия.
 
-            - `true` + дрейф `<= 0.20 %` → заявка создаётся по свежему курсу,
-              суммы пересчитываются сервером, ошибки нет.
-            - `true` + дрейф `> 0.20 %` → `409 RATE_CHANGED`. Согласие «на
-              любой курс» контрактом не предусмотрено: неограниченный проскок
-              нельзя считать информированным согласием.
-            - `false` + любой дрейф → `409 RATE_CHANGED`, повторное
-              подтверждение пользователем.
+            Поле принимается один major-цикл (минимум 90 дней, заголовки
+            `Deprecation` / `Sunset`) и **не влияет на исход**: при любом его значении
+            благоприятное движение и дрейф в пределах `driftThresholdPercent` пары
+            исполняются по курсу котировки, а дрейф против системы сверх порога без
+            явной границы согласия даёт `409 RATE_CHANGED`.
+            План миграции — `docs/10-api-requirements.md` §8.
           examples: [false, true]
         clientMeta:
           $ref: '#/components/schemas/ClientMeta'
@@ -1817,9 +1776,15 @@ components:
       type: object
       title: ExchangeOrder
       description: |
-        Заявка на обмен. Возвращается при создании (`201`/`202`) и при чтении
-        статуса. Содержит **фактически применённые** сервером значения —
-        именно они, а не то, что прислал клиент, являются истиной.
+        Заявка на обмен. Возвращается при создании (`201`/`202`) и при чтении статуса.
+
+        Содержит **фактически применённые** курс исполнения (`rate`) и суммы
+        (`fromAmount`, `feeAmount`, `netFromAmount`, `toAmount`) — истиной являются
+        они, а не присланные клиентом `expected*` (решение O-16). Клиент обязан
+        отобразить значения из ответа.
+
+        Как запись аудита содержит заданную сторону расчёта (`side`) и исходно
+        запрошенную величину (`requestedAmount`) — канон §5.4.
       required:
         - orderId
         - status
@@ -1843,6 +1808,20 @@ components:
           allOf:
             - $ref: '#/components/schemas/QuoteId'
           description: Котировка, на основании которой создана заявка. Помечена как `CONSUMED`.
+        side:
+          allOf:
+            - $ref: '#/components/schemas/QuoteSide'
+          description: |
+            Сторона расчёта, заданная при построении котировки. Копируется из
+            `Quote.side` и не меняется в течение жизни заявки.
+          examples: ['SELL']
+        requestedAmount:
+          allOf:
+            - $ref: '#/components/schemas/DecimalString'
+          description: |
+            Исходно запрошенная величина из `Quote.requestedAmount`. Вместе с `side`
+            делает расчёт воспроизводимым при разборе спора (канон §5.4).
+          examples: ['10000.00']
         fromAsset:
           $ref: '#/components/schemas/AssetRef'
         toAsset:
@@ -1871,9 +1850,11 @@ components:
           allOf:
             - $ref: '#/components/schemas/DecimalString'
           description: |
-            Фактически применённый курс. При `acceptRateChange: true` и дрейфе
-            в пределах порога он может отличаться от `expectedRate` в запросе —
-            клиент обязан отобразить значение **из ответа**.
+            **Фактический курс исполнения.** Равен курсу котировки при благоприятном
+            движении и при дрейфе против системы в пределах `driftThresholdPercent`
+            пары; живому курсу — когда заявка прошла по присланной границе согласия.
+            В последнем случае отличается от `expectedRate` запроса, поэтому клиент
+            обязан отображать значение **из ответа** (решения O-16, O-18).
           examples: ['0.010638297872']
         inverseRate:
           allOf:
@@ -1891,7 +1872,7 @@ components:
           description: |
             Идентификатор резерва средств в Accounting (S6). `null` при
             `REJECTED`, когда резерв не создавался или уже снят.
-          examples: ['hld_01J9X3B5M6N7P8Q9R0S1T2U3V5', null]
+          examples: ['hld_01J9X3B5M6N7P8Q9R0S1T2W3V5', null]
         review:
           oneOf:
             - $ref: '#/components/schemas/ManualReview'
@@ -1901,9 +1882,8 @@ components:
           type: [string, 'null']
           maxLength: 256
           description: |
-            Машиночитаемая причина текущего статуса для `REJECTED`, `FAILED`,
-            `EXPIRED`. Совпадает с `code` каталога §7, если отказ вызван
-            бизнес-проверкой.
+            Машиночитаемая причина статуса для `REJECTED`, `FAILED`, `EXPIRED`.
+            Совпадает с `code` каталога §7, если отказ вызван бизнес-проверкой.
           examples: [null, 'SCORING_DENIED']
         createdAt:
           $ref: '#/components/schemas/Timestamp'
@@ -1917,8 +1897,9 @@ components:
           allOf:
             - $ref: '#/components/schemas/IdempotencyKey'
           description: |
-            Ключ, которым была создана заявка. Возвращается, чтобы клиент мог
-            сопоставить ответ со своей попыткой после переподключения.
+            Ключ, которым создана заявка. Тот же ключ принимает
+            `GET /v1/exchange-orders?idempotencyKey=…` (решение O-10).
+            Обоснование — `docs/api/API-Design.md` §2.6.
         correlationId:
           $ref: '#/components/schemas/CorrelationId'
         version:
@@ -1926,59 +1907,55 @@ components:
           format: int32
           minimum: 1
           description: |
-            Версия заявки, инкрементируется при каждой смене статуса.
-            Позволяет клиенту отбросить пришедшее «из прошлого» состояние при
-            гонке между ответом на опрос и push-уведомлением.
+            Версия заявки, инкрементируется при каждой смене статуса. Позволяет
+            отбросить состояние «из прошлого» при гонке опроса и уведомления.
           examples: [1]
+
+    ExchangeOrderSearchResponse:
+      type: object
+      title: ExchangeOrderSearchResponse
+      description: |
+        Конверт результата поиска заявки по ключу идемпотентности (решение O-17).
+        Коллекция содержит ноль или один элемент: ключ уникален в пределах
+        пользователя. Пустая коллекция — валидный результат, а не ошибка.
+      required: [items, total]
+      additionalProperties: false
+      properties:
+        items:
+          type: array
+          minItems: 0
+          maxItems: 1
+          description: |
+            Найденная заявка или пустой массив. Элемент идентичен телу, которое
+            вернул бы исходный `POST /v1/exchange-orders` с этим ключом.
+          items:
+            $ref: '#/components/schemas/ExchangeOrder'
+        total:
+          type: integer
+          format: int32
+          minimum: 0
+          maximum: 1
+          description: |
+            Число найденных заявок: `0` или `1`. Это счётчик, а не денежная
+            величина. Всегда равен длине `items`.
+          examples: [0, 1]
 
     ErrorCode:
       type: string
       title: ErrorCode
       description: |
-        Каталог кодов ошибок §7 канона. **Стабильный машиночитаемый контракт**:
-        фронтенд ветвится только по `code` и никогда по `title`/`detail` —
-        последние локализуемы и меняются без предупреждения.
+        Каталог кодов ошибок. **Нормативный источник — канон §7**: там заданы
+        HTTP-статус, `retryable`, место крепления в UI и текст для пользователя;
+        здесь эти сведения не дублируются.
 
-        Перечень закрыт: коды вне этого списка приложением не порождаются.
-        Ошибки внешних систем маппятся в эти коды на границе BFF
-        (таблица маппинга — в `docs/api/INTEGRATIONS.md`).
+        Перечень **закрыт**: коды вне этого enum приложением не порождаются, ошибки
+        внешних систем маппятся в них на границе BFF (`docs/api/INTEGRATIONS.md`).
+        Фронтенд ветвится только по `code`, никогда по `title`/`detail`.
 
-        | code | HTTP | retryable | шаг §6 |
-        |------|------|-----------|--------|
-        | `VALIDATION_ERROR` | 400 | нет | 1 |
-        | `IDEMPOTENCY_CONFLICT` | 409 | нет | 2 |
-        | `ASSET_NOT_SUPPORTED` | 422 | нет | 3 |
-        | `SAME_ASSET_PAIR` | 422 | нет | 4 |
-        | `PAIR_NOT_SUPPORTED` | 422 | нет | 5 |
-        | `QUOTE_NOT_FOUND` | 404 | да | 6 |
-        | `QUOTE_ALREADY_USED` | 409 | нет | 7 |
-        | `QUOTE_EXPIRED` | 409 | да | 8 |
-        | `QUOTE_MISMATCH` | 409 | да | 9 |
-        | `RATE_CHANGED` | 409 | да | 10 |
-        | `AMOUNT_BELOW_MINIMUM` | 422 | нет | 11 |
-        | `AMOUNT_ABOVE_MAXIMUM` | 422 | нет | 12 |
-        | `USER_BLOCKED` | 403 | нет | 13 |
-        | `WALLET_FROZEN` | 403 | нет | 13 |
-        | `KYC_REQUIRED` | 403 | нет | 14 |
-        | `KYC_LEVEL_INSUFFICIENT` | 403 | нет | 14 |
-        | `KYC_PENDING` | 403 | да | 14 |
-        | `KYC_EXPIRED` | 403 | нет | 14 |
-        | `LIMIT_EXCEEDED_DAILY` | 422 | нет | 15 |
-        | `LIMIT_EXCEEDED_MONTHLY` | 422 | нет | 15 |
-        | `SCORING_DENIED` | 403 | нет | 16 |
-        | `SCORING_REVIEW_REQUIRED` | 202 | — | 16 |
-        | `INSUFFICIENT_FUNDS` | 422 | нет | 17 |
-        | `HOLD_FAILED` | 409 | да | 18 |
-        | `ORDER_CREATION_FAILED` | 500 | да | 19 |
-        | `RATE_SERVICE_UNAVAILABLE` | 503 | да | 6, 10 |
-        | `EXCHANGE_SERVICE_UNAVAILABLE` | 503 | да | любой |
-        | `UPSTREAM_TIMEOUT` | 504 | да | любой |
-        | `RATE_LIMITED` | 429 | да | до цепочки |
-        | `ORDER_NOT_FOUND` | 404 | нет | вне цепочки |
-
-        `SCORING_REVIEW_REQUIRED` перечислен здесь для полноты каталога, но
-        **никогда не приходит в конверте `ProblemDetails`**: он возвращается с
-        `202 Accepted` в поле `review.code` успешного тела `ExchangeOrder`.
+        `SCORING_REVIEW_REQUIRED` перечислен для полноты каталога, но **никогда не
+        приходит в конверте `ProblemDetails`**: он возвращается с `202 Accepted`
+        в поле `review.code` успешного тела `ExchangeOrder`.
+        Правила выбора кода — `docs/api/API-Design.md` §6.1.
       enum:
         - VALIDATION_ERROR
         - ASSET_NOT_SUPPORTED
@@ -2004,28 +1981,24 @@ components:
         - WALLET_FROZEN
         - HOLD_FAILED
         - IDEMPOTENCY_CONFLICT
+        - REQUEST_IN_PROGRESS
         - ORDER_CREATION_FAILED
         - RATE_SERVICE_UNAVAILABLE
         - EXCHANGE_SERVICE_UNAVAILABLE
         - UPSTREAM_TIMEOUT
         - RATE_LIMITED
         - ORDER_NOT_FOUND
+        - LIMIT_EXCEEDED_YEARLY
       examples: ['INSUFFICIENT_FUNDS', 'RATE_CHANGED']
 
     ProblemParams:
       type: object
       title: ProblemParams
       description: |
-        Машиночитаемые параметры ошибки для подстановки в локализованный текст
-        на клиенте. Набор ключей зависит от `code`; клиент обязан переносить
-        отсутствие ожидаемого ключа без падения (показать сообщение без
-        подстановки).
-
-        **Денежные значения здесь — тоже строки.** Ошибка не повод переключаться
-        на `number`.
-
-        Персональные данные в `params` **запрещены**: тело ошибки попадает в
-        клиентские логи и в системы мониторинга ошибок.
+        Параметры ошибки для подстановки в локализованный текст на клиенте. Набор
+        ключей зависит от `code`; клиент обязан переносить отсутствие ожидаемого
+        ключа без падения. Денежные значения здесь — тоже строки. Персональные
+        данные **запрещены**. Обоснование — `docs/api/API-Design.md` §6.3.
       additionalProperties: true
       properties:
         field:
@@ -2076,7 +2049,19 @@ components:
           description: Значение лимита оборота.
           examples: ['500000.00']
         resetAt:
-          $ref: '#/components/schemas/Timestamp'
+          allOf:
+            - $ref: '#/components/schemas/Timestamp'
+          description: |
+            Момент обнуления окна лимита. Для `LIMIT_EXCEEDED_*`. Совпадает с
+            `TurnoverLimitWindow.resetsAt` того же окна (решение O-11).
+          examples: ['2026-08-08T00:00:00.000Z']
+        resetTimeZone:
+          type: string
+          maxLength: 64
+          description: |
+            Пояс IANA, в котором рассчитано окно лимита. Для `LIMIT_EXCEEDED_*`.
+            Без него `resetAt` необъясним пользователю (решение O-11).
+          examples: ['UTC']
         quotedRate:
           allOf:
             - $ref: '#/components/schemas/DecimalString'
@@ -2091,14 +2076,8 @@ components:
           allOf:
             - $ref: '#/components/schemas/DecimalString'
           description: |
-            Сумма получения, которая была показана пользователю в котировке.
-            Для `RATE_CHANGED`.
-
-            Обязательна вместе с `currentToAmount`: баннер «курс изменился»
-            строится по паре «было → стало». Одних курсов недостаточно —
-            пользователь принимает решение по сумме, а не по коэффициенту, и
-            заставлять его пересчитывать разницу в уме на экране с 15-секундным
-            таймером недопустимо.
+            Сумма получения из котировки. Для `RATE_CHANGED`; обязательна вместе
+            с `currentToAmount`. Обоснование — `docs/api/API-Design.md` §4.4.
           examples: ['106.010638']
         currentToAmount:
           allOf:
@@ -2108,21 +2087,29 @@ components:
         driftPercent:
           allOf:
             - $ref: '#/components/schemas/PercentString'
-          description: Абсолютный дрейф курса в процентах. Для `RATE_CHANGED`.
+          description: |
+            Дрейф курса **против системы** в процентах — величина, с которой
+            сравнивался `thresholdPercent` (решение O-18). Благоприятное движение
+            сюда не попадает: оно не порождает `RATE_CHANGED`. Для `RATE_CHANGED`.
           examples: ['0.2470']
         thresholdPercent:
           allOf:
             - $ref: '#/components/schemas/PercentString'
-          description: Порог допустимого дрейфа. Для `RATE_CHANGED`.
-          examples: ['0.20']
+          description: |
+            **Фактически применённый** порог дрейфа — значение
+            `ExchangePair.driftThresholdPercent` этой пары, а не глобальная константа
+            (решение O-8). Если порог от S4 не получен, здесь возвращается
+            применённый дефолт `0.20`. Для `RATE_CHANGED`.
+            Обоснование — `docs/api/API-Design.md` §4.1.
+          examples: ['0.20', '1.50']
         newQuoteId:
           oneOf:
             - $ref: '#/components/schemas/QuoteId'
             - type: 'null'
           description: |
-            Идентификатор автоматически построенной **новой** котировки.
-            Отдаётся при `QUOTE_EXPIRED` и `RATE_CHANGED`, чтобы клиент
-            обновил сводку одним ответом, без дополнительного round-trip.
+            Идентификатор автоматически построенной новой котировки. Отдаётся при
+            `QUOTE_EXPIRED` и `RATE_CHANGED`.
+            Обоснование — `docs/api/API-Design.md` §4.4.
           examples: ['9a25f56f-cefa-4e0a-8d5b-6b7c8d9e0f22']
         expiresAt:
           $ref: '#/components/schemas/Timestamp'
@@ -2160,24 +2147,21 @@ components:
           type: [string, 'null']
           maxLength: 64
           description: Идентификатор кейса комплаенса, если он заведён.
-          examples: ['case_01J9X3C6N7P8Q9R0S1T2U3V4W5']
+          examples: ['case_01J9X3C6N7P8Q9R0S1T2W3V4W5']
         orderId:
           oneOf:
             - $ref: '#/components/schemas/OrderId'
             - type: 'null'
           description: |
-            Идентификатор ранее созданной заявки. Для `QUOTE_ALREADY_USED` —
-            позволяет клиенту показать «уже отправлено» и увести пользователя
-            на существующую заявку вместо повторной попытки.
-          examples: ['ord_01J9X3B5M6N7P8Q9R0S1T2U3V4']
+            Идентификатор ранее созданной заявки. Для `QUOTE_ALREADY_USED` и
+            `IDEMPOTENCY_CONFLICT`. Обоснование — `docs/api/API-Design.md` §6.3.
+          examples: ['ord_01J9X3B5M6N7P8Q9R0S1T2W3V4']
         service:
           type: string
           enum: [USERS, KYC, SCORING, LIMITS_FEES, RATES, ACCOUNTING, CRYPTO_PROVIDER, ORDER, NOTIFICATIONS]
           description: |
-            Какая внешняя система отказала. Для `*_UNAVAILABLE` и
-            `UPSTREAM_TIMEOUT`. Отдаётся клиенту намеренно: имена внутренних
-            сервисов не являются секретом, а без них диагностика инцидента
-            по обращению пользователя невозможна.
+            Какая внешняя система отказала. Для `*_UNAVAILABLE` и `UPSTREAM_TIMEOUT`.
+            Обоснование — `docs/api/API-Design.md` §6.3, §6.6.
           examples: ['RATES']
         timeoutMs:
           type: integer
@@ -2196,14 +2180,9 @@ components:
       type: object
       title: ProblemDetails
       description: |
-        Единая обёртка ошибки: RFC 9457 Problem Details, расширенный полями
-        `code`, `correlationId`, `timestamp`, `params`, `retryable`.
-        Content-Type — `application/problem+json`.
-
-        Расширение стандарта осознанное: чистый RFC 9457 предлагает ветвиться
-        по `type` (URI), но URI неудобен как ключ в `switch` на клиенте и
-        провоцирует опечатки. `code` из закрытого enum решает это, `type`
-        сохраняется для совместимости и как ссылка на документацию.
+        Единая обёртка ошибки: RFC 9457 Problem Details, расширенный полями `code`,
+        `correlationId`, `timestamp`, `params`, `retryable`. Content-Type —
+        `application/problem+json`. Обоснование — `docs/api/API-Design.md` §6.2.
       required: [type, title, status, code, correlationId, timestamp, retryable]
       additionalProperties: false
       properties:
@@ -2221,9 +2200,8 @@ components:
           minLength: 1
           maxLength: 128
           description: |
-            Краткое человекочитаемое название проблемы на английском.
-            **Не контракт**: может меняться без версионирования. Ветвиться по
-            нему запрещено.
+            Краткое название проблемы на английском. **Не контракт**: локализуемо,
+            меняется без версионирования, ветвиться по нему запрещено.
           examples: ['Insufficient funds']
         status:
           type: integer
@@ -2238,9 +2216,9 @@ components:
           type: string
           maxLength: 1024
           description: |
-            Развёрнутое пояснение на английском. Диагностическое, для
-            разработчика и логов. **Не показывается пользователю как есть** —
-            текст для пользователя собирается клиентом по `code` и `params`.
+            Диагностическое пояснение для разработчика и логов. **Не контракт** и
+            не показывается пользователю: текст для пользователя клиент собирает
+            по `code` и `params`.
           examples: ['Available balance 25450.00 RUB is less than requested 30000.00 RUB']
         instance:
           type: string
@@ -2257,10 +2235,9 @@ components:
         retryable:
           type: boolean
           description: |
-            Имеет ли смысл автоматический повтор. `true` — клиент вправе
-            повторить (с тем же `Idempotency-Key`, если это `POST
-            /v1/exchange-orders`). `false` — повтор гарантированно даст тот же
-            результат, повторять нельзя.
+            Имеет ли смысл повтор. `true` — повторять с тем же `Idempotency-Key`,
+            если это `POST /v1/exchange-orders`; `false` — повтор даст тот же
+            результат. Значение по каждому коду нормативно задано в каноне §7.
           examples: [false, true]
         retryAfterSeconds:
           type: [integer, 'null']
@@ -2274,18 +2251,9 @@ components:
       type: object
       title: ProblemDetailsOrderNotFound
       description: |
-        Отдельная схема для «заявка не найдена».
-
-        Каталог §7 изначально не содержал кода для ненайденной заявки:
-        `QUOTE_NOT_FOUND` относится к котировке, `VALIDATION_ERROR` привязан к
-        `400`. Использовать любой из них означало бы соврать в машиночитаемом
-        контракте.
-
-        Пробел закрыт: `ORDER_NOT_FOUND` **ратифицирован** оркестратором
-        (`promtlog.md` §9, решение O-1) и внесён в каталог §7 канона и в enum
-        `ErrorCode`. Эта схема сохранена как суженный вариант `ProblemDetails`
-        с `const` на `status` и `code` — она делает контракт `404` точным, а не
-        «одним из двадцати девяти возможных кодов».
+        Суженный вариант `ProblemDetails` для `404 ORDER_NOT_FOUND`: `status` и `code`
+        зафиксированы через `const`, потому что другой код на этом ответе невозможен.
+        История кода — `docs/api/API-Design.md` §6.5.
       required: [type, title, status, code, correlationId, timestamp, retryable]
       additionalProperties: false
       properties:
@@ -2308,21 +2276,19 @@ components:
         code:
           type: string
           const: ORDER_NOT_FOUND
-          description: |
-            Ратифицированный код каталога §7. Здесь сужен до `const`, поскольку
-            на этом ответе никакой другой код невозможен.
+          description: Код каталога §7, сужённый до `const`.
           examples: ['ORDER_NOT_FOUND']
         detail:
           type: string
           maxLength: 1024
           description: Пояснение для разработчика.
-          examples: ['Order ord_01J9X3B5M6N7P8Q9R0S1T2U3V4 does not exist or is not visible to this user']
+          examples: ['Order ord_01J9X3B5M6N7P8Q9R0S1T2W3V4 does not exist or is not visible to this user']
         instance:
           type: string
           format: uri-reference
           maxLength: 512
           description: Путь запроса.
-          examples: ['/v1/exchange-orders/ord_01J9X3B5M6N7P8Q9R0S1T2U3V4']
+          examples: ['/v1/exchange-orders/ord_01J9X3B5M6N7P8Q9R0S1T2W3V4']
         correlationId:
           $ref: '#/components/schemas/CorrelationId'
         timestamp:
@@ -2356,12 +2322,9 @@ components:
 
     Forbidden403:
       description: |
-        Операция запрещена по причинам соответствия: статус пользователя,
-        состояние кошелька, KYC или решение скоринга (шаги 13, 14, 16).
-
-        Проверки соответствия идут **перед** проверкой баланса намеренно:
-        иначе по различию сообщений можно было бы определять состояние чужих
-        лимитов и балансов.
+        Запрещено по соответствию: статус пользователя, состояние кошелька, KYC или
+        решение скоринга (шаги 13, 14, 16).
+        Обоснование порядка проверок — `docs/api/API-Design.md` §5.
       headers:
         X-Correlation-Id: { $ref: '#/components/headers/XCorrelationId' }
         X-RateLimit-Limit: { $ref: '#/components/headers/XRateLimitLimit' }
@@ -2382,9 +2345,8 @@ components:
 
     NotFound404Quote:
       description: |
-        Котировка не существует, удалена по истечении окна хранения либо
-        принадлежит другому пользователю (шаг 6). Чужая котировка даёт `404`,
-        а не `403`: существование чужого `quoteId` не должно быть наблюдаемым.
+        Котировка не существует, удалена по истечении окна хранения либо принадлежит
+        другому пользователю (шаг 6). Обоснование — `docs/api/API-Design.md` §1.5.
       headers:
         X-Correlation-Id: { $ref: '#/components/headers/XCorrelationId' }
         X-RateLimit-Limit: { $ref: '#/components/headers/XRateLimitLimit' }
@@ -2398,10 +2360,10 @@ components:
 
     NotFound404Order:
       description: |
-        Заявка не существует или не видна этому пользователю.
-
-        Код в теле — `ORDER_NOT_FOUND`, ратифицированный код каталога §7
-        (внесён по решению O-1, см. `promtlog.md` §9).
+        Заявка не существует или не видна этому пользователю. Код в теле —
+        `ORDER_NOT_FOUND`. Относится к чтению заявки по `orderId`; к поиску по
+        ключу идемпотентности **не применяется** — там пустой результат
+        выражается пустой коллекцией (решение O-17).
       headers:
         X-Correlation-Id: { $ref: '#/components/headers/XCorrelationId' }
         X-RateLimit-Limit: { $ref: '#/components/headers/XRateLimitLimit' }
@@ -2415,13 +2377,15 @@ components:
 
     Conflict409:
       description: |
-        Конфликт состояния: котировка истекла или израсходована, параметры
-        разошлись с котировкой, курс уехал сверх порога, не удалось создать
-        резерв, конфликт ключа идемпотентности (шаги 2, 7, 8, 9, 10, 18).
+        Конфликт состояния: котировка истекла или израсходована, параметры разошлись
+        с котировкой, курс уехал сверх порога пары, не удалось создать резерв,
+        конфликт ключа идемпотентности, попытка с тем же ключом ещё выполняется
+        (шаги 2, 7, 8, 9, 10, 18).
 
-        Часть кодов помечена `retryable: true` — но повтор должен идти с
-        **тем же** `Idempotency-Key` и, для `QUOTE_EXPIRED`/`RATE_CHANGED`,
-        с новым `quoteId` из `params.newQuoteId`.
+        При `retryable: true` повтор идёт с **тем же** `Idempotency-Key` и, для
+        `QUOTE_EXPIRED`/`RATE_CHANGED`, с новым `quoteId` из `params.newQuoteId`.
+        `Retry-After` обязателен для `REQUEST_IN_PROGRESS`.
+        Обоснование — `docs/api/API-Design.md` §2.3, §4.3, §6.6.
       headers:
         X-Correlation-Id: { $ref: '#/components/headers/XCorrelationId' }
         X-RateLimit-Limit: { $ref: '#/components/headers/XRateLimitLimit' }
@@ -2438,16 +2402,35 @@ components:
             rateChanged: { $ref: '#/components/examples/ErrRateChanged' }
             holdFailed: { $ref: '#/components/examples/ErrHoldFailed' }
             idempotencyConflict: { $ref: '#/components/examples/ErrIdempotencyConflict' }
+            requestInProgress: { $ref: '#/components/examples/ErrRequestInProgress' }
+
+    Conflict409RequestInProgress:
+      description: |
+        Попытка с этим ключом идемпотентности ещё выполняется — ответа пока нет
+        (решение O-14). `retryable: true`, заголовок `Retry-After` **обязателен**:
+        клиент повторяет **чтение**, а не `POST`.
+
+        Отличие от `IDEMPOTENCY_CONFLICT`: там ключ переиспользован с **другим**
+        телом и повтор бессмыслен (`retryable: false`); здесь конфликта тел нет.
+        Обоснование — `docs/api/API-Design.md` §2.3, §2.6.
+      headers:
+        X-Correlation-Id: { $ref: '#/components/headers/XCorrelationId' }
+        X-RateLimit-Limit: { $ref: '#/components/headers/XRateLimitLimit' }
+        X-RateLimit-Remaining: { $ref: '#/components/headers/XRateLimitRemaining' }
+        X-RateLimit-Reset: { $ref: '#/components/headers/XRateLimitReset' }
+        Retry-After: { $ref: '#/components/headers/RetryAfter' }
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/ProblemDetails' }
+          examples:
+            requestInProgress: { $ref: '#/components/examples/ErrRequestInProgress' }
 
     UnprocessableEntity422:
       description: |
-        Запрос синтаксически корректен, но нарушает бизнес-правила: актив или
-        пара недоступны, суммы вне лимитов операции, исчерпан лимит оборота,
-        недостаточно доступного баланса (шаги 3, 4, 5, 11, 12, 15, 17).
-
-        `422`, а не `400`: синтаксис в порядке, отказывает бизнес-логика.
-        Различие существенно для клиента — `400` означает «клиент собрал
-        запрос неправильно», `422` означает «запрос правильный, но так нельзя».
+        Запрос синтаксически корректен, но нарушает бизнес-правила: актив или пара
+        недоступны, суммы вне лимитов операции, исчерпан лимит оборота, недостаточно
+        доступного баланса (шаги 3, 4, 5, 11, 12, 15, 17).
+        Обоснование выбора `422` против `400` — `docs/api/API-Design.md` §6.1.
       headers:
         X-Correlation-Id: { $ref: '#/components/headers/XCorrelationId' }
         X-RateLimit-Limit: { $ref: '#/components/headers/XRateLimitLimit' }
@@ -2465,11 +2448,13 @@ components:
             insufficientFunds: { $ref: '#/components/examples/ErrInsufficientFunds' }
             limitExceededDaily: { $ref: '#/components/examples/ErrLimitExceededDaily' }
             limitExceededMonthly: { $ref: '#/components/examples/ErrLimitExceededMonthly' }
+            limitExceededYearly: { $ref: '#/components/examples/ErrLimitExceededYearly' }
 
     TooManyRequests429:
       description: |
-        Превышен лимит частоты запросов. Заголовок `Retry-After` обязателен:
-        клиент без него уйдёт в busy-loop и усугубит перегрузку.
+        Превышен лимит частоты запросов. Заголовок `Retry-After` **обязателен**.
+        Бюджеты — `docs/api/API-Design.md` §7.2; для
+        `GET /v1/exchange-orders?idempotencyKey=…` бюджет строже общего `GET`.
       headers:
         X-Correlation-Id: { $ref: '#/components/headers/XCorrelationId' }
         X-RateLimit-Limit: { $ref: '#/components/headers/XRateLimitLimit' }
@@ -2484,12 +2469,10 @@ components:
 
     InternalServerError500:
       description: |
-        Внутренняя ошибка. Для `POST /v1/exchange-orders` это, как правило,
-        провал регистрации заявки в S8 после успешного резерва (шаг 19);
-        компенсирующее снятие hold выполняется автоматически.
-
-        Тело ошибки **не содержит** стек-трейсов, имён классов и SQL:
-        диагностика ведётся по `correlationId`.
+        Внутренняя ошибка. Для `POST /v1/exchange-orders` — как правило, провал
+        регистрации заявки в S8 после успешного резерва (шаг 19); компенсирующее
+        снятие hold выполняется автоматически. Тело **не содержит** стек-трейсов,
+        имён классов и SQL. Обоснование — `docs/api/API-Design.md` §1.7, §6.7.
       headers:
         X-Correlation-Id: { $ref: '#/components/headers/XCorrelationId' }
         X-RateLimit-Limit: { $ref: '#/components/headers/XRateLimitLimit' }
@@ -2503,13 +2486,10 @@ components:
 
     ServiceUnavailable503:
       description: |
-        Блокирующая внешняя система недоступна либо её circuit breaker открыт
-        (порог 50 % ошибок на окне 20 запросов, open 30 с).
-
-        `RATE_SERVICE_UNAVAILABLE` — отдельный код от общего
-        `EXCHANGE_SERVICE_UNAVAILABLE`, потому что сценарий отказа курсов
-        имеет собственный UX: экран остаётся живым, суммы не пересчитываются,
-        кнопка блокируется, а не «всё сломалось».
+        Блокирующая внешняя система недоступна либо её circuit breaker открыт.
+        Конкретная система — в `params.service`.
+        Обоснование разделения `RATE_SERVICE_UNAVAILABLE` и
+        `EXCHANGE_SERVICE_UNAVAILABLE` — `docs/api/API-Design.md` §6.6, §8.
       headers:
         X-Correlation-Id: { $ref: '#/components/headers/XCorrelationId' }
         X-RateLimit-Limit: { $ref: '#/components/headers/XRateLimitLimit' }
@@ -2525,13 +2505,10 @@ components:
 
     GatewayTimeout504:
       description: |
-        Вышестоящая система не ответила в отведённое время (§11 канона:
-        S5 — 800 мс, S1/S2/S3/S4 — 1000 мс, S6 — 1500 мс, S8 — 2000 мс).
-
-        Для мутирующих вызовов таймаут **не означает** «не выполнено»: BFF
-        выполняет сверку по ключу идемпотентности, прежде чем сообщить об
-        ошибке. Клиент, получивший `504`, обязан повторять только с тем же
-        `Idempotency-Key`.
+        Вышестоящая система не ответила в отведённое время (таймауты — канон §11).
+        Для мутирующих вызовов таймаут **не означает** «не выполнено»: BFF выполняет
+        сверку по ключу идемпотентности до возврата ошибки. Повтор — только с тем же
+        `Idempotency-Key`. Обоснование — `docs/api/API-Design.md` §2.5, §7.3.
       headers:
         X-Correlation-Id: { $ref: '#/components/headers/XCorrelationId' }
         X-RateLimit-Limit: { $ref: '#/components/headers/XRateLimitLimit' }
@@ -2630,6 +2607,7 @@ components:
               roundingMode: ROUND_UP
               promoApplied: null
             indicativeRate: '0.010638297872'
+            driftThresholdPercent: '0.20'
             settlementMode: INTERNAL
             updatedAt: '2026-08-07T10:10:00.000Z'
           - pairId: USDT@TRON-RUB
@@ -2650,6 +2628,7 @@ components:
               roundingMode: ROUND_UP
               promoApplied: null
             indicativeRate: '93.60'
+            driftThresholdPercent: '0.20'
             settlementMode: INTERNAL
             updatedAt: '2026-08-07T10:10:00.000Z'
           - pairId: RUB-EUR
@@ -2670,6 +2649,7 @@ components:
               roundingMode: ROUND_UP
               promoApplied: null
             indicativeRate: '0.0098'
+            driftThresholdPercent: '0.60'
             settlementMode: INTERNAL
             updatedAt: '2026-08-07T10:10:00.000Z'
         defaultPairId: RUB-USDT@TRON
@@ -2681,12 +2661,16 @@ components:
               used: '180000.00'
               remaining: '320000.00'
               currency: RUB
+              resetsAt: '2026-08-08T00:00:00.000Z'
+              resetTimeZone: UTC
               resetAt: '2026-08-08T00:00:00.000Z'
             - period: MONTHLY
               limit: '5000000.00'
               used: '1240000.00'
               remaining: '3760000.00'
               currency: RUB
+              resetsAt: '2026-09-01T00:00:00.000Z'
+              resetTimeZone: UTC
               resetAt: '2026-09-01T00:00:00.000Z'
           evaluatedAt: '2026-08-07T10:15:30.010Z'
         rateLockTtlSeconds: 15
@@ -2740,11 +2724,29 @@ components:
         generatedAt: '2026-08-07T10:15:29.900Z'
 
     QuoteCreateRequestExample:
-      summary: Запрос котировки RUB → USDT@TRON на 10 000 RUB
+      summary: 'side: SELL — задана сумма списания 10 000 RUB'
       value:
         fromAsset: { assetId: RUB, network: null }
         toAsset: { assetId: USDT, network: TRON }
+        side: SELL
         fromAmount: '10000.00'
+        clientMeta:
+          source: WEB
+          deviceId: dvc_7f3a9b1c2d4e5f60
+          locale: en-US
+          appVersion: '1.4.12'
+
+    QuoteCreateRequestBuyExample:
+      summary: 'side: BUY — задана сумма получения 100 USDT'
+      description: |
+        Обратный расчёт (решение O-9). `fromAmount` в запросе **отсутствует** —
+        его выводит сервер. Возвращённый `toAmount` может оказаться больше
+        запрошенных `100.000000`: точное попадание достижимо не всегда.
+      value:
+        fromAsset: { assetId: RUB, network: null }
+        toAsset: { assetId: USDT, network: TRON }
+        side: BUY
+        toAmount: '100.000000'
         clientMeta:
           source: WEB
           deviceId: dvc_7f3a9b1c2d4e5f60
@@ -2754,7 +2756,7 @@ components:
     QuoteExample:
       summary: Активная котировка RUB → USDT@TRON
       description: |
-        Полный разбор расчёта по §5.3 канона:
+        Разбор расчёта (формулы — канон §5.3):
         `feeRaw = 10000.00 × 0.35 / 100 = 35.00`;
         `feeAmount = clamp(35.00, 10.00, ∞) = 35.00` (ROUND_UP до 2 знаков);
         `netFromAmount = 10000.00 − 35.00 = 9965.00`;
@@ -2764,6 +2766,8 @@ components:
       value:
         quoteId: 8f14e45f-ceea-4e0a-9d5b-6b7c8d9e0f11
         status: ACTIVE
+        side: SELL
+        requestedAmount: '10000.00'
         fromAsset: { assetId: RUB, network: null }
         toAsset: { assetId: USDT, network: TRON }
         fromAmount: '10000.00'
@@ -2798,6 +2802,8 @@ components:
       value:
         quoteId: 7c02a34d-11ab-4c3e-9f10-2233445566aa
         status: ACTIVE
+        side: SELL
+        requestedAmount: '10000.00'
         fromAsset: { assetId: RUB, network: null }
         toAsset: { assetId: USDT, network: TRON }
         fromAmount: '10000.00'
@@ -2832,6 +2838,8 @@ components:
       value:
         quoteId: 8f14e45f-ceea-4e0a-9d5b-6b7c8d9e0f11
         status: EXPIRED
+        side: SELL
+        requestedAmount: '10000.00'
         fromAsset: { assetId: RUB, network: null }
         toAsset: { assetId: USDT, network: TRON }
         fromAmount: '10000.00'
@@ -2857,11 +2865,51 @@ components:
         slippageWarning: false
         estimatedCompletionSeconds: 5
 
-    ExchangeOrderCreateRequestExample:
-      summary: Подтверждение котировки без согласия на дрейф курса
+    QuoteBuyExample:
+      summary: 'Котировка обратного расчёта (side: BUY), запрошено 100 USDT'
       description: |
-        Значения `expectedToAmount`, `expectedRate` и `expectedFeeAmount` —
-        ровно то, что было показано пользователю в сводке обмена.
+        Ступенчатость отображения (канон §5.4): при `fromAmount = 9433.02` получилось
+        бы `99.999999` — меньше запрошенного, поэтому возвращается ближайшая
+        достижимая величина **не меньше** цели: `toAmount = 100.000106`.
+        `requestedAmount = 100.000000` сохранён, чтобы расчёт был воспроизводим.
+        Производная сумма списания округлена **вверх**, комиссия — тоже вверх;
+        инвариант I1 точен: `33.02 + 9400.01 = 9433.03`.
+      value:
+        quoteId: b4d1e77a-2c39-4f81-9a02-77e1c3d4b5f6
+        status: ACTIVE
+        side: BUY
+        requestedAmount: '100.000000'
+        fromAsset: { assetId: RUB, network: null }
+        toAsset: { assetId: USDT, network: TRON }
+        fromAmount: '9433.03'
+        feeAmount: '33.02'
+        netFromAmount: '9400.01'
+        toAmount: '100.000106'
+        rate: '0.010638297872'
+        inverseRate: '94.00'
+        feePolicy:
+          mode: INCLUDED_IN_SOURCE
+          percent: '0.35'
+          minFee: '10.00'
+          maxFee: null
+          networkFee: '0'
+          roundingMode: ROUND_UP
+          promoApplied: null
+        rateSource: AGGREGATED
+        quotedAt: '2026-08-07T10:15:32.117Z'
+        expiresAt: '2026-08-07T10:15:47.117Z'
+        ttlSeconds: 15
+        degraded: false
+        degradationReasons: []
+        slippageWarning: false
+        estimatedCompletionSeconds: 5
+
+    ExchangeOrderCreateRequestExample:
+      summary: Подтверждение котировки без границы согласия
+      description: |
+        Значения `expectedToAmount`, `expectedRate` и `expectedFeeAmount` — ровно то,
+        что показано пользователю в сводке. Границы согласия нет, поэтому дрейф сверх
+        `driftThresholdPercent` пары вернёт `RATE_CHANGED`.
       value:
         quoteId: 8f14e45f-ceea-4e0a-9d5b-6b7c8d9e0f11
         fromAsset: { assetId: RUB, network: null }
@@ -2870,7 +2918,6 @@ components:
         expectedToAmount: '106.010638'
         expectedRate: '0.010638297872'
         expectedFeeAmount: '35.00'
-        acceptRateChange: false
         clientMeta:
           source: WEB
           deviceId: dvc_7f3a9b1c2d4e5f60
@@ -2878,11 +2925,12 @@ components:
           appVersion: '1.4.12'
 
     ExchangeOrderCreateRequestAcceptDriftExample:
-      summary: Повторное подтверждение с согласием на дрейф в пределах порога
+      summary: 'Подтверждение с границей согласия (side: SELL)'
       description: |
-        Отправляется после того, как пользователь увидел баннер
-        «Rate changed. Calculation updated.» и нажал подтверждение повторно.
-        Дрейф сверх 0.20 % всё равно вернёт `RATE_CHANGED`.
+        Отправляется после баннера «Rate changed. Calculation updated.».
+        `minAcceptableToAmount: 105.500000` означает «не зачисляйте меньше 105.5 USDT»:
+        пока пересчитанная сумма получения не ниже этой границы, заявка создаётся
+        по живому курсу; ниже — `409 RATE_CHANGED` (решение O-16).
       value:
         quoteId: 9a25f56f-cefa-4e0a-8d5b-6b7c8d9e0f22
         fromAsset: { assetId: RUB, network: null }
@@ -2891,19 +2939,93 @@ components:
         expectedToAmount: '105.744680'
         expectedRate: '0.010612000000'
         expectedFeeAmount: '35.00'
-        acceptRateChange: true
+        minAcceptableToAmount: '105.500000'
         clientMeta:
           source: WEB
           deviceId: dvc_7f3a9b1c2d4e5f60
           locale: en-US
           appVersion: '1.4.12'
 
+    ExchangeOrderCreateRequestBuyExample:
+      summary: 'Подтверждение котировки обратного расчёта (side: BUY)'
+      description: |
+        Для котировки со `side: BUY` производной является сумма списания, поэтому
+        допустима граница `maxAcceptableFromAmount` — «не списывайте больше».
+        Присылать здесь `minAcceptableToAmount` запрещено: `400 VALIDATION_ERROR`.
+      value:
+        quoteId: b4d1e77a-2c39-4f81-9a02-77e1c3d4b5f6
+        fromAsset: { assetId: RUB, network: null }
+        toAsset: { assetId: USDT, network: TRON }
+        fromAmount: '9433.03'
+        expectedToAmount: '100.000106'
+        expectedRate: '0.010638297872'
+        expectedFeeAmount: '33.02'
+        maxAcceptableFromAmount: '9500.00'
+        clientMeta:
+          source: WEB
+          deviceId: dvc_7f3a9b1c2d4e5f60
+          locale: en-US
+          appVersion: '1.4.12'
+
+    ExchangeOrderSearchFoundExample:
+      summary: 200 — заявка по ключу найдена
+      description: |
+        Клиент потерял ответ на `POST` и восстановил состояние по своему ключу.
+        Элемент совпадает с телом исходного `201`.
+      value:
+        items:
+          - orderId: ord_01J9X3B5M6N7P8Q9R0S1T2W3V4
+            status: PENDING
+            quoteId: 8f14e45f-ceea-4e0a-9d5b-6b7c8d9e0f11
+            side: SELL
+            requestedAmount: '10000.00'
+            fromAsset: { assetId: RUB, network: null }
+            toAsset: { assetId: USDT, network: TRON }
+            fromAmount: '10000.00'
+            feeAmount: '35.00'
+            netFromAmount: '9965.00'
+            toAmount: '106.010638'
+            rate: '0.010638297872'
+            inverseRate: '94.00'
+            rateSource: AGGREGATED
+            feePolicy:
+              mode: INCLUDED_IN_SOURCE
+              percent: '0.35'
+              minFee: '10.00'
+              maxFee: null
+              networkFee: '0'
+              roundingMode: ROUND_UP
+              promoApplied: null
+            holdId: hld_01J9X3B5M6N7P8Q9R0S1T2W3V5
+            review: null
+            statusReason: null
+            createdAt: '2026-08-07T10:15:38.402Z'
+            updatedAt: '2026-08-07T10:15:38.402Z'
+            estimatedCompletionAt: '2026-08-07T10:15:43.402Z'
+            idempotencyKey: 3f2b8c1e-9a4d-4f7e-b2c6-5d8e0a1b2c3d
+            correlationId: 01J9X2C4K7QF8N3M5T6V7W8Y9Z
+            version: 1
+        total: 1
+
+    ExchangeOrderSearchEmptyExample:
+      summary: 200 — по ключу ничего не найдено
+      description: |
+        Заявка этим ключом не создавалась **либо** ключ принадлежит другому
+        пользователю — эти два случая неразличимы намеренно. Ответ `200`, а не
+        `404`: коллекция существует, совпадений в ней нет (решение O-17).
+        Клиенту следует построить новую котировку и новый ключ.
+      value:
+        items: []
+        total: 0
+
     ExchangeOrderPendingExample:
       summary: 201 — заявка создана, средства зарезервированы
       value:
-        orderId: ord_01J9X3B5M6N7P8Q9R0S1T2U3V4
+        orderId: ord_01J9X3B5M6N7P8Q9R0S1T2W3V4
         status: PENDING
         quoteId: 8f14e45f-ceea-4e0a-9d5b-6b7c8d9e0f11
+        side: SELL
+        requestedAmount: '10000.00'
         fromAsset: { assetId: RUB, network: null }
         toAsset: { assetId: USDT, network: TRON }
         fromAmount: '10000.00'
@@ -2921,7 +3043,7 @@ components:
           networkFee: '0'
           roundingMode: ROUND_UP
           promoApplied: null
-        holdId: hld_01J9X3B5M6N7P8Q9R0S1T2U3V5
+        holdId: hld_01J9X3B5M6N7P8Q9R0S1T2W3V5
         review: null
         statusReason: null
         createdAt: '2026-08-07T10:15:38.402Z'
@@ -2940,9 +3062,11 @@ components:
         Клиент показывает баннер «Sent for manual review» и опрашивает
         `GET /v1/exchange-orders/{orderId}`.
       value:
-        orderId: ord_01J9X3C6N7P8Q9R0S1T2U3V4W5
+        orderId: ord_01J9X3C6N7P8Q9R0S1T2W3V4W5
         status: MANUAL_REVIEW
         quoteId: 8f14e45f-ceea-4e0a-9d5b-6b7c8d9e0f11
+        side: SELL
+        requestedAmount: '10000.00'
         fromAsset: { assetId: RUB, network: null }
         toAsset: { assetId: USDT, network: TRON }
         fromAmount: '10000.00'
@@ -2960,10 +3084,10 @@ components:
           networkFee: '0'
           roundingMode: ROUND_UP
           promoApplied: null
-        holdId: hld_01J9X3C6N7P8Q9R0S1T2U3V4W6
+        holdId: hld_01J9X3C6N7P8Q9R0S1T2W3V4W6
         review:
           code: SCORING_REVIEW_REQUIRED
-          caseId: case_01J9X3C6N7P8Q9R0S1T2U3V4W5
+          caseId: case_01J9X3C6N7P8Q9R0S1T2W3V4W5
           slaHours: 24
           submittedAt: '2026-08-07T10:15:38.402Z'
         statusReason: null
@@ -2981,9 +3105,11 @@ components:
         Само решение находится **за границей скоупа** задания; пример приведён,
         чтобы клиент корректно отрисовывал терминальный отказ.
       value:
-        orderId: ord_01J9X3C6N7P8Q9R0S1T2U3V4W5
+        orderId: ord_01J9X3C6N7P8Q9R0S1T2W3V4W5
         status: REJECTED
         quoteId: 8f14e45f-ceea-4e0a-9d5b-6b7c8d9e0f11
+        side: SELL
+        requestedAmount: '10000.00'
         fromAsset: { assetId: RUB, network: null }
         toAsset: { assetId: USDT, network: TRON }
         fromAmount: '10000.00'
@@ -3241,12 +3367,12 @@ components:
         title: Quote already used
         status: 409
         code: QUOTE_ALREADY_USED
-        detail: Quote 8f14e45f-ceea-4e0a-9d5b-6b7c8d9e0f11 was already consumed by order ord_01J9X3B5M6N7P8Q9R0S1T2U3V4
+        detail: Quote 8f14e45f-ceea-4e0a-9d5b-6b7c8d9e0f11 was already consumed by order ord_01J9X3B5M6N7P8Q9R0S1T2W3V4
         instance: /v1/exchange-orders
         correlationId: 01J9X2C4K7QF8N3M5T6V7W8Y9Z
         timestamp: '2026-08-07T10:15:40.220Z'
         params:
-          orderId: ord_01J9X3B5M6N7P8Q9R0S1T2U3V4
+          orderId: ord_01J9X3B5M6N7P8Q9R0S1T2W3V4
         retryable: false
         retryAfterSeconds: null
 
@@ -3274,12 +3400,14 @@ components:
         retryAfterSeconds: 0
 
     ErrRateChanged:
-      summary: 'RATE_CHANGED (409) — курс уехал сверх порога 0.20 %'
+      summary: 'RATE_CHANGED (409) — курс уехал против системы сверх порога пары'
       description: |
-        Шаг 10. Дрейф 0.2470 % превышает порог 0.20 %, поэтому отказ приходит
-        даже при `acceptRateChange: true`. Новая котировка уже построена и
-        передана в `params.newQuoteId`.
-        UI: `Rate changed. Calculation updated.`
+        Шаг 10. Курс **упал** — движение против системы (решение O-18), — и дрейф
+        0.2470 % превышает `driftThresholdPercent` пары `RUB-USDT@TRON` (0.20 %).
+        Пересчитанная сумма получения 105.748680 ниже присланной границы
+        `minAcceptableToAmount`, поэтому исполнение не разрешено. Рост курса той же
+        величины этой ошибки бы не дал. Новая котировка уже построена и передана
+        в `params.newQuoteId`. UI: `Rate changed. Calculation updated.`
       value:
         type: https://api.wallet.internal/problems/rate-changed
         title: Rate changed
@@ -3422,6 +3550,33 @@ components:
         retryable: false
         retryAfterSeconds: null
 
+    ErrLimitExceededYearly:
+      summary: 'LIMIT_EXCEEDED_YEARLY (422) — исчерпан годовой лимит оборота'
+      description: |
+        Шаг 15, решение O-12. Отдельный код нужен, чтобы не показывать «Monthly limit
+        reached» при исчерпанном **годовом** окне: пользователь сделал бы из этого
+        неверный вывод «подожду до первого числа».
+        `params.resetTimeZone` объясняет, в каком поясе рассчитано окно (O-11).
+        UI: `Yearly limit reached`.
+      value:
+        type: https://api.wallet.internal/problems/limit-exceeded-yearly
+        title: Yearly limit exceeded
+        status: 422
+        code: LIMIT_EXCEEDED_YEARLY
+        detail: Yearly turnover limit reached, 1200000.00 RUB remaining
+        instance: /v1/exchange-orders
+        correlationId: 01J9X2C4K7QF8N3M5T6V7W8Y9Z
+        timestamp: '2026-08-07T10:15:32.117Z'
+        params:
+          limit: '30000000.00'
+          remaining: '1200000.00'
+          requested: '4000000.00'
+          assetId: RUB
+          resetAt: '2027-01-01T00:00:00.000Z'
+          resetTimeZone: UTC
+        retryable: false
+        retryAfterSeconds: null
+
     ErrScoringDenied:
       summary: 'SCORING_DENIED (403) — скоринг запретил операцию'
       description: |
@@ -3507,9 +3662,10 @@ components:
     ErrIdempotencyConflict:
       summary: 'IDEMPOTENCY_CONFLICT (409) — ключ переиспользован с другим телом'
       description: |
-        Шаг 2. Ключ уже связан с другим запросом в окне 24 часов. Клиент
-        обязан сгенерировать **новый** ключ, а не повторять с этим же — иначе
-        конфликт воспроизведётся. UI: `Conflicting request`.
+        Шаг 2. Ключ уже связан с **другим** телом запроса в окне 24 часов. Клиент
+        обязан сгенерировать новый ключ: повтор с этим же воспроизведёт конфликт.
+        Если тело **то же**, а первая попытка ещё выполняется, возвращается
+        `REQUEST_IN_PROGRESS`, а не этот код. UI: `Conflicting request`.
       value:
         type: https://api.wallet.internal/problems/idempotency-conflict
         title: Idempotency conflict
@@ -3521,9 +3677,36 @@ components:
         timestamp: '2026-08-07T10:15:33.500Z'
         params:
           reason: BODY_HASH_MISMATCH
-          orderId: ord_01J9X3B5M6N7P8Q9R0S1T2U3V4
+          orderId: ord_01J9X3B5M6N7P8Q9R0S1T2W3V4
         retryable: false
         retryAfterSeconds: null
+
+    ErrRequestInProgress:
+      summary: 'REQUEST_IN_PROGRESS (409) — предыдущая попытка ещё выполняется'
+      description: |
+        Решение O-14. Тот же `Idempotency-Key` и **то же** тело, но первая попытка
+        ещё не завершилась — ответа пока не существует.
+
+        Отличие от `IDEMPOTENCY_CONFLICT`: там ключ переиспользован с **другим**
+        телом, это дефект клиента и `retryable: false`. Здесь конфликта тел нет,
+        поэтому `retryable: true` и обязательный `Retry-After`: правильное действие
+        клиента — подождать и повторить **чтение**
+        (`GET /v1/exchange-orders?idempotencyKey=…`), а не отправлять `POST` заново.
+        UI: `Still processing your previous attempt`.
+      value:
+        type: https://api.wallet.internal/problems/request-in-progress
+        title: Request in progress
+        status: 409
+        code: REQUEST_IN_PROGRESS
+        detail: A request with Idempotency-Key 3f2b8c1e-9a4d-4f7e-b2c6-5d8e0a1b2c3d is still being processed
+        instance: /v1/exchange-orders
+        correlationId: 01J9X2C4K7QF8N3M5T6V7W8Y9Z
+        timestamp: '2026-08-07T10:15:33.900Z'
+        params:
+          reason: CLAIM_ACTIVE
+          retryAfterSeconds: 1
+        retryable: true
+        retryAfterSeconds: 1
 
     ErrOrderCreationFailed:
       summary: 'ORDER_CREATION_FAILED (500) — не удалось зарегистрировать заявку'
@@ -3647,8 +3830,8 @@ components:
         title: Order not found
         status: 404
         code: ORDER_NOT_FOUND
-        detail: Order ord_01J9X3B5M6N7P8Q9R0S1T2U3V4 does not exist or is not visible to this user
-        instance: /v1/exchange-orders/ord_01J9X3B5M6N7P8Q9R0S1T2U3V4
+        detail: Order ord_01J9X3B5M6N7P8Q9R0S1T2W3V4 does not exist or is not visible to this user
+        instance: /v1/exchange-orders/ord_01J9X3B5M6N7P8Q9R0S1T2W3V4
         correlationId: 01J9X2C4K7QF8N3M5T6V7W8Y9Z
         timestamp: '2026-08-07T10:15:32.117Z'
         params:

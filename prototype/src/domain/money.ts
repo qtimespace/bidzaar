@@ -67,7 +67,6 @@ export const sub = (a: Money, b: Money): Money => d(a).minus(d(b)).toString()
 export const mul = (a: Money, b: Money): Money => d(a).times(d(b)).toString()
 export const div = (a: Money, b: Money): Money => d(a).div(d(b)).toString()
 
-/** Number of fractional digits actually present in a decimal string. */
 /** Exact integer power. Used for the simulated market tick, where the rate is
  *  the base rate multiplied by a coefficient once per elapsed window. */
 export function pow(base: Money, exponent: number): Money {
@@ -75,6 +74,7 @@ export function pow(base: Money, exponent: number): Money {
   return d(base).pow(exponent).toString()
 }
 
+/** Number of fractional digits actually present in a decimal string. */
 export function decimalPlaces(value: Money): number {
   const dot = value.indexOf('.')
   return dot === -1 ? 0 : value.length - dot - 1
@@ -181,11 +181,44 @@ export function inverseRate(rate: Rate, displayDecimals = 2): Rate {
   return roundHalfUp(new Decimal(1).div(rate).toString(), displayDecimals)
 }
 
-/** Relative drift between two rates, as a percent string. Canonical §11 uses a
- *  0.20 % threshold to decide whether a change is worth interrupting the user. */
+/**
+ * Absolute relative drift between two rates, in percent.
+ *
+ * Magnitude only — use it to SHOW how far a rate moved. To decide whether a
+ * move is worth interrupting anyone, use `adverseRateDriftPercent`: direction
+ * matters there, and this function has thrown it away.
+ */
 export function rateDriftPercent(oldRate: Rate, newRate: Rate): number {
   if (d(oldRate).isZero()) return 0
   return d(newRate).minus(oldRate).div(oldRate).abs().times(100).toNumber()
+}
+
+/** Signed change of the rate, in percent. Negative means the rate fell. */
+export function rateChangePercent(quotedRate: Rate, liveRate: Rate): number {
+  if (d(quotedRate).isZero()) return 0
+  return d(liveRate).minus(quotedRate).div(quotedRate).times(100).toNumber()
+}
+
+/**
+ * Drift **against the system**, in percent. Zero when the market moved the
+ * other way (canonical §6.1, decision O-18).
+ *
+ * The threshold is one-sided on purpose. `rate` is units of toAsset per unit of
+ * fromAsset (§5.2), so a FALLING rate is the adverse direction: the quote still
+ * owes the user the amount it displayed, and the system now has to source it at
+ * a worse price. That is the only case where honouring the lock can become
+ * untenable, and the only case worth a banner.
+ *
+ * When the rate rises, the user receives exactly the sum they confirmed — the
+ * quote is honoured at the locked rate either way — and the difference stays
+ * with the system. Nothing about the user's outcome has changed, so raising
+ * "Rate changed" there would be noise, and noise is what teaches people to
+ * dismiss the banner that actually matters. Measuring with `.abs()` did exactly
+ * that half the time.
+ */
+export function adverseRateDriftPercent(quotedRate: Rate, liveRate: Rate): number {
+  const change = rateChangePercent(quotedRate, liveRate)
+  return change < 0 ? -change : 0
 }
 
 // ---------------------------------------------------------------------------

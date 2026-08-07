@@ -22,7 +22,7 @@ import {
   createOrder,
   createQuote,
   getIndicativeRate,
-  RATE_DRIFT_THRESHOLD_PERCENT,
+  driftThresholdFor,
   RATE_LOCK_TTL_MS,
   resetServerState,
   type IndicativeRate,
@@ -33,7 +33,7 @@ import { toLimitCurrency } from '@/api/services/limitsFeesService'
 import { rateTickPeriodMs } from '@/api/runtimeConfig'
 import { uuidv4 } from '@/api/transport'
 import { ApiError, ERROR_CATALOG, type ErrorCode } from '@/domain/errors'
-import { percentOfBalance, rateDriftPercent, sanitizeInput } from '@/domain/money'
+import { adverseRateDriftPercent, percentOfBalance, sanitizeInput } from '@/domain/money'
 import { validateLocally, type LocalValidationIssue } from '@/domain/validation'
 import type {
   Asset,
@@ -521,8 +521,13 @@ export function useExchangeScreen() {
         // warn and block, not just one that moves at submit time. Without this
         // the auto-refresh silently replaced the amount under the user's cursor.
         if (options.detectDrift && before) {
-          const drift = rateDriftPercent(before.rate, result.quote.rate)
-          if (drift > RATE_DRIFT_THRESHOLD_PERCENT) {
+          // Same rule as the server, in both respects: the pair's own tolerance
+          // rather than a global constant (O-8), and only movement against the
+          // system (O-18). Either mismatch would put a banner on screen that
+          // the server then declines to confirm — the user gets asked to accept
+          // conditions that were never in question.
+          const drift = adverseRateDriftPercent(before.rate, result.quote.rate)
+          if (drift > driftThresholdFor(pair ?? {})) {
             dispatch({
               type: 'RATE_CHANGE',
               notice: {
@@ -543,7 +548,7 @@ export function useExchangeScreen() {
         else throw error
       }
     },
-    [state.fromAssetId, state.toAssetId, fromAsset?.network, toAsset?.network],
+    [state.fromAssetId, state.toAssetId, fromAsset?.network, toAsset?.network, pair],
   )
 
   useEffect(() => {
@@ -672,7 +677,10 @@ export function useExchangeScreen() {
         fromAmount: state.quote.fromAmount,
         expectedToAmount: state.quote.toAmount,
         expectedRate: state.quote.rate,
-        acceptRateChange: false,
+        // No consent bound is sent (decision O-16). The UI has no control for
+        // naming one, and inventing a default here would be consent the user
+        // never gave. Without it the pair's own threshold is the only guard,
+        // which is exactly the intended behaviour for this screen.
         idempotencyKey: state.idempotencyKey,
       })
       dispatch({ type: 'SUBMIT_OK', order })
