@@ -73,6 +73,10 @@ SWAGGER_ASSETS = [
     "swagger-ui-bundle.js",
     "swagger-ui-standalone-preset.js",
     "oauth2-redirect.html",
+    # oauth2-redirect.html грузит этот файл тегом <script src="oauth2-redirect.js">.
+    # Без него страница возврата OAuth2 отдаёт 404 на собственный скрипт —
+    # единственная битая ссылка во всём собранном портале.
+    "oauth2-redirect.js",
 ]
 
 warnings: list[str] = []

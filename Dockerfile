@@ -118,7 +118,12 @@ COPY --from=portal-build    /build/portal/dist/    /srv/www/docs/
 # окружения, включая nginx'овые $uri и $host.
 COPY deploy/nginx/default.conf.template /etc/nginx/bidzaar/default.conf.template
 COPY deploy/nginx/40-render-port.sh     /docker-entrypoint.d/40-render-port.sh
-RUN chmod +x /docker-entrypoint.d/40-render-port.sh \
+# sed — страховка от CRLF: репозиторий разрабатывается на Windows с
+# core.autocrlf=true, а `#!/bin/sh` с \r в конце строки даёт в контейнере
+# «bad interpreter». .gitattributes это уже закрывает, но стоит одну строку.
+RUN sed -i 's/\r$//' /docker-entrypoint.d/40-render-port.sh \
+                     /etc/nginx/bidzaar/default.conf.template \
+ && chmod +x /docker-entrypoint.d/40-render-port.sh \
  && rm -f /etc/nginx/conf.d/default.conf
 
 # Значение по умолчанию для локального запуска; на Railway PORT приходит извне.

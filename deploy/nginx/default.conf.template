@@ -62,14 +62,6 @@ ${LISTEN_IPV6}
         application/xml
         image/svg+xml;
 
-    # nginx не знает про YAML, а Swagger UI раздаёт спецификации именно так.
-    # Без этого браузер получил бы application/octet-stream и предложил
-    # «скачать файл» вместо показа.
-    types {
-        text/yaml  yaml yml;
-        text/plain feature;
-    }
-
     server_tokens off;
 
     # Railway терминирует TLS у себя и проксирует на $PORT по HTTP.
@@ -140,6 +132,21 @@ ${LISTEN_IPV6}
     location ~ "^/docs/assets/.+\.[0-9a-f]{8}\.min\.(css|js)$" {
         access_log off;
         add_header Cache-Control          "public, max-age=31536000, immutable" always;
+        add_header X-Content-Type-Options nosniff always;
+        add_header Referrer-Policy        strict-origin-when-cross-origin always;
+        try_files $uri =404;
+    }
+
+    # ── OpenAPI-спецификации ─────────────────────────────────────────────────
+    # nginx не знает расширения .yaml и отдал бы application/octet-stream —
+    # браузер предложил бы «скачать файл» вместо показа. Правим через
+    # default_type, а НЕ через `types { … }` на уровне server: такой блок не
+    # дополняет унаследованный mime.types, а заменяет его целиком, и весь
+    # остальной сайт поехал бы в octet-stream.
+    # Спецификации меняются каждой сборкой — кешировать их нельзя.
+    location ~ "\.ya?ml$" {
+        default_type text/yaml;
+        add_header Cache-Control          "no-cache" always;
         add_header X-Content-Type-Options nosniff always;
         add_header Referrer-Policy        strict-origin-when-cross-origin always;
         try_files $uri =404;

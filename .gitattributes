@@ -1,0 +1,7 @@
+# Файлы, которые исполняются внутри Linux-контейнера, должны приезжать с LF
+# независимо от core.autocrlf на машине разработчика: shell-скрипт с CRLF даёт
+# в контейнере «/bin/sh^M: bad interpreter», а конфиг nginx — синтаксическую
+# ошибку на первой же директиве.
+Dockerfile   text eol=lf
+*.sh         text eol=lf
+*.template   text eol=lf
